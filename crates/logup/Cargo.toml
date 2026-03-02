@@ -1,0 +1,15 @@
+[package]
+name = "logup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3     = { workspace = true }
+field      = { path = "../field" }
+poly       = { path = "../poly" }
+sumcheck   = { path = "../sumcheck" }
+transcript = { path = "../transcript" }
+rand       = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

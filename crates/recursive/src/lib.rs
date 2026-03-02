@@ -10,5 +10,5 @@ pub mod verifier;
 
 pub use proof::{LevelProof, RecursiveProof};
 pub use prover::prove_recursive;
-pub use prover::prove_recursive_gpu;
-pub use verifier::{verify_recursive, RecursiveVerifyError};
+pub use prover::prove_recursive_par;
+pub use verifier::{RecursiveVerifyError, verify_recursive};

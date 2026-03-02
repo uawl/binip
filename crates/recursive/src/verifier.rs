@@ -30,7 +30,11 @@ pub enum RecursiveVerifyError {
   ClaimedSumMismatch { level: u32, node: u32 },
 
   #[error("level {level}: expected {expected} nodes, got {got}")]
-  NodeCountMismatch { level: u32, expected: usize, got: usize },
+  NodeCountMismatch {
+    level: u32,
+    expected: usize,
+    got: usize,
+  },
 
   #[error("inter-level claim mismatch at level {level}, position {pos}")]
   InterLevelMismatch { level: u32, pos: usize },
@@ -182,7 +186,12 @@ mod tests {
     total_vars: u32,
     shard_vars: u32,
     fan_in: u32,
-  ) -> (RecursiveConfig, Blake3Transcript, ShardProofBatch, RecursiveProof) {
+  ) -> (
+    RecursiveConfig,
+    Blake3Transcript,
+    ShardProofBatch,
+    RecursiveProof,
+  ) {
     let n = 1usize << total_vars;
     let evals: Vec<GF2_128> = (1..=(n as u64)).map(g).collect();
     let poly = MlePoly::new(evals);
@@ -226,7 +235,10 @@ mod tests {
     let (cfg, t, batch, mut rproof) = make_and_prove(4, 2, 2);
     rproof.root_claim = rproof.root_claim + g(1);
     let err = verify_recursive(&rproof, &batch, &cfg, &t).unwrap_err();
-    assert!(matches!(err, RecursiveVerifyError::RootClaimMismatch { .. }));
+    assert!(matches!(
+      err,
+      RecursiveVerifyError::RootClaimMismatch { .. }
+    ));
   }
 
   #[test]
@@ -235,6 +247,9 @@ mod tests {
     // Tamper with a child claim in level 0
     rproof.levels[0][0].child_claims[0] = g(999);
     let err = verify_recursive(&rproof, &batch, &cfg, &t).unwrap_err();
-    assert!(matches!(err, RecursiveVerifyError::InterLevelMismatch { .. }));
+    assert!(matches!(
+      err,
+      RecursiveVerifyError::InterLevelMismatch { .. }
+    ));
   }
 }

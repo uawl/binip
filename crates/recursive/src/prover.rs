@@ -11,8 +11,11 @@
 //! 5. Feed the aggregate claims into the next level.
 //! 6. Repeat until a single root claim remains.
 
+use std::sync::Mutex;
+
 use field::{FieldElem, GF2_128};
 use poly::MlePoly;
+use rayon::prelude::*;
 use shard::{RecursiveConfig, ShardProofBatch};
 use transcript::{Blake3Transcript, Transcript};
 
@@ -107,101 +110,137 @@ fn prove_level(
   (level_proofs, next_claims)
 }
 
-/// GPU-accelerated recursive aggregation.
+/// DAG-parallel variant of [`prove_recursive`].
 ///
-/// At each level, all node aggregation MLEs are concatenated into a single
-/// buffer and proved in parallel via [`sumcheck::prove_shards_gpu`].
-pub fn prove_recursive_gpu(
+/// Unlike the sequential version (or a level-barrier parallel version),
+/// this schedules each node as soon as **its own children** complete.
+/// A node at level L+1 can start while unrelated subtrees at level L are
+/// still running.
+///
+/// Implementation: A recursive function [`prove_dag_node`] is called from
+/// the root.  At each internal node, `rayon::par_iter` fans out to child
+/// nodes, which recursively fan out further.  Rayon's work-stealing
+/// scheduler automatically balances the load.
+pub fn prove_recursive_par(
   shard_batch: &ShardProofBatch,
   config: &RecursiveConfig,
   root_transcript: &Blake3Transcript,
-  ctx: &gpu::GpuContext,
-  cache: &mut gpu::PipelineCache,
 ) -> RecursiveProof {
   let depth = config.depth();
   let fan = config.fan_in as usize;
-  let padded_fan = fan.next_power_of_two();
-  let node_vars = (padded_fan.trailing_zeros()) as u32; // log2(padded_fan)
 
-  let mut current_claims: Vec<GF2_128> = shard_batch
+  if depth == 0 {
+    return RecursiveProof {
+      levels: vec![],
+      root_claim: shard_batch.shard_proofs[0].sumcheck.claimed_sum,
+    };
+  }
+
+  let shard_claims: Vec<GF2_128> = shard_batch
     .shard_proofs
     .iter()
     .map(|sp| sp.sumcheck.claimed_sum)
     .collect();
 
-  let mut levels = Vec::with_capacity(depth as usize);
-
-  for level in 0..depth {
-    let n_nodes = (current_claims.len() + fan - 1) / fan;
-
-    // Build per-node aggregation MLEs and concatenate.
-    let mut all_evals = Vec::with_capacity(n_nodes * padded_fan);
-    let mut child_claims_per_node: Vec<Vec<GF2_128>> = Vec::with_capacity(n_nodes);
-
-    for node_idx in 0..n_nodes {
-      let start = node_idx * fan;
-      let end = (start + fan).min(current_claims.len());
-      let child_claims = current_claims[start..end].to_vec();
-
-      let mut evals = child_claims.clone();
-      evals.resize(padded_fan, GF2_128::zero());
-      all_evals.extend_from_slice(&evals);
-
-      child_claims_per_node.push(child_claims);
-    }
-
-    let concat_mle = MlePoly::new(all_evals);
-
-    // Build per-node forked transcripts (matching CPU prover).
-    let mut transcripts: Vec<Blake3Transcript> = (0..n_nodes)
-      .map(|node_idx| {
-        let mut t = root_transcript.fork("recursive", level * 0x1_0000 + node_idx as u32);
-        t.absorb_bytes(&level.to_le_bytes());
-        t.absorb_bytes(&(node_idx as u32).to_le_bytes());
-        t
-      })
-      .collect();
-
-    // GPU: prove all nodes in parallel.
-    let proofs = sumcheck::prove_shards_gpu(
-      &concat_mle,
-      &mut transcripts,
-      node_vars,
-      ctx,
-      cache,
-    );
-
-    let mut level_proofs = Vec::with_capacity(n_nodes);
-    let mut next_claims = Vec::with_capacity(n_nodes);
-
-    for (node_idx, sumcheck) in proofs.into_iter().enumerate() {
-      let child = &child_claims_per_node[node_idx];
-      let aggregate_sum = child.iter().fold(GF2_128::zero(), |a, &b| a + b);
-
-      level_proofs.push(LevelProof {
-        level,
-        node_idx: node_idx as u32,
-        child_claims: child.clone(),
-        sumcheck,
-      });
-      next_claims.push(aggregate_sum);
-    }
-
-    levels.push(level_proofs);
-    current_claims = next_claims;
+  // Pre-compute number of nodes at each level for bounds checking.
+  let mut nodes_per_level = Vec::with_capacity(depth as usize);
+  let mut count = shard_claims.len();
+  for _ in 0..depth {
+    count = (count + fan - 1) / fan;
+    nodes_per_level.push(count);
   }
 
-  assert_eq!(
-    current_claims.len(),
-    1,
-    "recursive aggregation should produce exactly 1 root claim, got {}",
-    current_claims.len()
+  // Thread-safe collectors for level proofs.
+  let collectors: Vec<Mutex<Vec<LevelProof>>> =
+    (0..depth).map(|_| Mutex::new(Vec::new())).collect();
+
+  // Kick off from the root — it recursively spawns the whole tree.
+  let root_claim = prove_dag_node(
+    depth - 1,
+    0,
+    &shard_claims,
+    fan,
+    &nodes_per_level,
+    root_transcript,
+    &collectors,
   );
+
+  // Extract and sort proofs by node_idx within each level.
+  let levels: Vec<Vec<LevelProof>> = collectors
+    .into_iter()
+    .map(|m| {
+      let mut proofs = m.into_inner().unwrap();
+      proofs.sort_by_key(|p| p.node_idx);
+      proofs
+    })
+    .collect();
 
   RecursiveProof {
     levels,
-    root_claim: current_claims[0],
+    root_claim,
   }
+}
+
+/// Recursively prove a single DAG node.
+///
+/// - **Level 0** nodes take shard claims directly.
+/// - **Level > 0** nodes spawn children via `par_iter`, wait for them,
+///   then prove this node.  This means a parent starts the instant all
+///   its children finish — no level-wide barrier.
+fn prove_dag_node(
+  level: u32,
+  node_idx: usize,
+  shard_claims: &[GF2_128],
+  fan: usize,
+  nodes_per_level: &[usize],
+  root_transcript: &Blake3Transcript,
+  collectors: &[Mutex<Vec<LevelProof>>],
+) -> GF2_128 {
+  let child_claims: Vec<GF2_128> = if level == 0 {
+    // Leaf: slice shard claims.
+    let start = node_idx * fan;
+    let end = (start + fan).min(shard_claims.len());
+    shard_claims[start..end].to_vec()
+  } else {
+    // Internal: prove children in parallel, collect their aggregate sums.
+    let child_level = (level - 1) as usize;
+    let n_children_total = nodes_per_level[child_level];
+    let start = node_idx * fan;
+    let end = (start + fan).min(n_children_total);
+    (start..end)
+      .into_par_iter()
+      .map(|child_idx| {
+        prove_dag_node(
+          level - 1,
+          child_idx,
+          shard_claims,
+          fan,
+          nodes_per_level,
+          root_transcript,
+          collectors,
+        )
+      })
+      .collect()
+  };
+
+  // Prove this node.
+  let agg_mle = build_aggregation_mle(&child_claims);
+  let aggregate_sum = agg_mle.sum();
+
+  let mut t = root_transcript.fork("recursive", level * 0x1_0000 + node_idx as u32);
+  t.absorb_bytes(&level.to_le_bytes());
+  t.absorb_bytes(&(node_idx as u32).to_le_bytes());
+
+  let sumcheck = sumcheck::prove(&agg_mle, &mut t);
+
+  collectors[level as usize].lock().unwrap().push(LevelProof {
+    level,
+    node_idx: node_idx as u32,
+    child_claims,
+    sumcheck,
+  });
+
+  aggregate_sum
 }
 
 #[cfg(test)]
@@ -209,17 +248,25 @@ mod tests {
   use super::*;
   use field::GF2_128;
   use poly::MlePoly;
-  use shard::{prove_all, RecursiveConfig};
+  use shard::{RecursiveConfig, prove_all};
 
   fn g(v: u64) -> GF2_128 {
     GF2_128::from(v)
   }
 
-  fn make_shard_batch(total_vars: u32, shard_vars: u32, fan_in: u32) -> (MlePoly, RecursiveConfig, Blake3Transcript, ShardProofBatch) {
+  fn make_shard_batch(
+    total_vars: u32,
+    shard_vars: u32,
+    fan_in: u32,
+  ) -> (MlePoly, RecursiveConfig, Blake3Transcript, ShardProofBatch) {
     let n = 1usize << total_vars;
     let evals: Vec<GF2_128> = (1..=(n as u64)).map(g).collect();
     let poly = MlePoly::new(evals);
-    let cfg = RecursiveConfig { total_vars, shard_vars, fan_in };
+    let cfg = RecursiveConfig {
+      total_vars,
+      shard_vars,
+      fan_in,
+    };
     let root_t = Blake3Transcript::new();
     let batch = prove_all(&poly, &cfg, &root_t);
     (poly, cfg, root_t, batch)
@@ -285,8 +332,14 @@ mod tests {
     // Level 0, node 0 should have shard 0 and shard 1 claims
     let node0 = &rproof.levels[0][0];
     assert_eq!(node0.child_claims.len(), 2);
-    assert_eq!(node0.child_claims[0], batch.shard_proofs[0].sumcheck.claimed_sum);
-    assert_eq!(node0.child_claims[1], batch.shard_proofs[1].sumcheck.claimed_sum);
+    assert_eq!(
+      node0.child_claims[0],
+      batch.shard_proofs[0].sumcheck.claimed_sum
+    );
+    assert_eq!(
+      node0.child_claims[1],
+      batch.shard_proofs[1].sumcheck.claimed_sum
+    );
   }
 
   #[test]

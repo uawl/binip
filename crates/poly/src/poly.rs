@@ -14,6 +14,7 @@
 
 use field::{FieldElem, GF2_128};
 use rand::Rng;
+use rayon::prelude::*;
 
 /// Multilinear Extension polynomial — evaluation table over {0,1}^n.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,21 +31,31 @@ impl MlePoly {
   /// Panics if `evals.len()` is not a power of two.
   pub fn new(evals: Vec<GF2_128>) -> Self {
     let len = evals.len();
-    assert!(len.is_power_of_two(), "MlePoly: evals.len() must be a power of two, got {len}");
+    assert!(
+      len.is_power_of_two(),
+      "MlePoly: evals.len() must be a power of two, got {len}"
+    );
     let n_vars = len.trailing_zeros();
     Self { evals, n_vars }
   }
 
   /// Construct the zero polynomial with `n_vars` variables.
   pub fn zero(n_vars: u32) -> Self {
-    Self { evals: vec![GF2_128::zero(); 1 << n_vars], n_vars }
+    Self {
+      evals: vec![GF2_128::zero(); 1 << n_vars],
+      n_vars,
+    }
   }
 
   /// Evaluate the MLE at a full point `r ∈ GF(2^128)^n` using CPU fold.
   ///
   /// Panics if `r.len() != n_vars`.
   pub fn evaluate(&self, r: &[GF2_128]) -> GF2_128 {
-    assert_eq!(r.len() as u32, self.n_vars, "MlePoly::evaluate: wrong number of vars");
+    assert_eq!(
+      r.len() as u32,
+      self.n_vars,
+      "MlePoly::evaluate: wrong number of vars"
+    );
     let mut table = self.evals.clone();
     let mut half = table.len() >> 1;
     for &ri in r {
@@ -67,7 +78,10 @@ impl MlePoly {
     let new_evals: Vec<GF2_128> = (0..half)
       .map(|i| self.evals[i] * one_minus_r + self.evals[i + half] * r)
       .collect();
-    Self { evals: new_evals, n_vars: self.n_vars - 1 }
+    Self {
+      evals: new_evals,
+      n_vars: self.n_vars - 1,
+    }
   }
 
   /// Sum all evaluations: Σ evals[i]. Equals MLE summed over {0,1}^n.
@@ -92,28 +106,47 @@ impl MlePoly {
       while i < size {
         for j in i..i + stride {
           let lo = evals[j];
-          evals[j]          = lo * one_minus_ri;   // x_i = 0
-          evals[j + stride] = lo * ri;             // x_i = 1
+          evals[j] = lo * one_minus_ri; // x_i = 0
+          evals[j + stride] = lo * ri; // x_i = 1
         }
         i += stride * 2;
       }
       stride >>= 1;
     }
-    Self { evals, n_vars: n as u32 }
+    Self {
+      evals,
+      n_vars: n as u32,
+    }
   }
 
   /// Pointwise add two MLEs (same n_vars).
   pub fn add_poly(&self, other: &Self) -> Self {
     assert_eq!(self.n_vars, other.n_vars);
-    let evals = self.evals.iter().zip(&other.evals).map(|(&a, &b)| a + b).collect();
-    Self { evals, n_vars: self.n_vars }
+    let evals = self
+      .evals
+      .iter()
+      .zip(&other.evals)
+      .map(|(&a, &b)| a + b)
+      .collect();
+    Self {
+      evals,
+      n_vars: self.n_vars,
+    }
   }
 
   /// Pointwise multiply two MLEs (product-of-MLEs, NOT standard composition).
   pub fn mul_poly(&self, other: &Self) -> Self {
     assert_eq!(self.n_vars, other.n_vars);
-    let evals = self.evals.iter().zip(&other.evals).map(|(&a, &b)| a * b).collect();
-    Self { evals, n_vars: self.n_vars }
+    let evals = self
+      .evals
+      .iter()
+      .zip(&other.evals)
+      .map(|(&a, &b)| a * b)
+      .collect();
+    Self {
+      evals,
+      n_vars: self.n_vars,
+    }
   }
 
   /// Generate a random multilinear polynomial whose sum over {0,1}^n is zero.
@@ -149,7 +182,29 @@ impl MlePoly {
       .zip(&mask.evals)
       .map(|(&w, &b)| w + r * b)
       .collect();
-    Self { evals, n_vars: self.n_vars }
+    Self {
+      evals,
+      n_vars: self.n_vars,
+    }
+  }
+
+  /// Parallel variant of [`blind`] — the pointwise masking runs via rayon.
+  ///
+  /// The random mask generation stays sequential (RNG is inherently serial),
+  /// but the expensive `n × 2 field-mul + add` step is parallelised.
+  pub fn blind_par<R: Rng>(&self, rng: &mut R) -> Self {
+    let r = GF2_128::random_nonzero(rng);
+    let mask = Self::random_zero_sum(self.n_vars, rng);
+    let evals: Vec<GF2_128> = self
+      .evals
+      .par_iter()
+      .zip(mask.evals.par_iter())
+      .map(|(&w, &b)| w + r * b)
+      .collect();
+    Self {
+      evals,
+      n_vars: self.n_vars,
+    }
   }
 }
 
@@ -230,7 +285,10 @@ mod tests {
       let b = MlePoly::random_zero_sum(n_vars, &mut rng);
       assert_eq!(b.evals.len(), 1 << n_vars);
       assert_eq!(b.n_vars, n_vars);
-      assert!(b.sum().is_zero(), "random_zero_sum n_vars={n_vars} should have sum=0");
+      assert!(
+        b.sum().is_zero(),
+        "random_zero_sum n_vars={n_vars} should have sum=0"
+      );
     }
   }
 
@@ -269,7 +327,10 @@ mod tests {
     let mut rng = rand::rng();
     let poly = MlePoly::zero(4);
     let blinded = poly.blind(&mut rng);
-    assert!(blinded.sum().is_zero(), "blinded zero-poly should still sum to 0");
+    assert!(
+      blinded.sum().is_zero(),
+      "blinded zero-poly should still sum to 0"
+    );
     // But evaluations should be nonzero (the blinding mask).
     assert!(blinded.evals.iter().any(|e| !e.is_zero()));
   }

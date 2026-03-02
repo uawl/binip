@@ -57,62 +57,53 @@ pub fn eval_constraint(tag: u32, cols: &[GF2_128; 8]) -> Result<GF2_128, Constra
   let _advice = cols[7];
 
   match tag {
-    // ── ALU (tag 0): Add32 ──────────────────────────────────────────────
-    // Simplified constraint: out + in0 + in1 should relate via carry.
-    // Full 32-bit carry chain is handled bitwise; here we check the
-    // aggregate identity:  out = in0 + in1 + cin (mod 2^32) lifted to GF2_128.
-    //
-    // In the field embedding, XOR-addition is free.  The constraint
-    // checks: out ⊕ in0 ⊕ in1 ⊕ flags = 0  (flags encodes carry correction).
-    0 => Ok(out + in0 + in1 + flags),
+    // ── ALU (tag 0): Add128 ─────────────────────────────────────────────
+    // Integer addition cannot be checked algebraically in GF(2^128):
+    // field addition is XOR, not integer add.  Soundness is enforced by
+    // the byte-level Add LUT in `lookup::emit_add128`.
+    0 => Ok(GF2_128::zero()),
 
-    // ── ALU (tag 1): Mul32 ──────────────────────────────────────────────
-    // out = low 32 bits of in0 * in1; flags = high 32 bits.
-    // Constraint: in0 * in1 = flags * 2^32 + out
-    //   → in0 * in1 + flags * GF2_128::from(1u64 << 32) + out = 0  (char 2)
-    1 => {
-      let shift32 = GF2_128::from(1u64 << 32);
-      Ok(in0 * in1 + flags * shift32 + out)
-    }
+    // ── ALU (tag 1): Mul128 ─────────────────────────────────────────────
+    // GF(2^128) field multiplication ≠ integer multiplication.
+    // Soundness is enforced by the byte-level Mul LUT for each partial
+    // product plus a deterministic column-sum check in
+    // `lookup::verify_deterministic_checks`.
+    1 => Ok(GF2_128::zero()),
 
-    // ── Bitwise (tag 2): And32 ──────────────────────────────────────────
-    // out = in0 AND in1 → in field: out = in0 * in1  (since AND ≅ mult in GF(2))
-    2 => Ok(out + in0 * in1),
+    // ── Bitwise (tag 2): And128 ─────────────────────────────────────────
+    // GF(2^128) multiplication ≠ bitwise AND (AND ≅ mult only in GF(2)).
+    // Soundness is enforced by the byte-level And LUT in
+    // `lookup::emit_and128`.
+    2 => Ok(GF2_128::zero()),
 
-    // ── Bitwise (tag 3): Xor32 ──────────────────────────────────────────
+    // ── Bitwise (tag 3): Xor128 ─────────────────────────────────────────
     // out = in0 XOR in1 → in field: out = in0 + in1
     3 => Ok(out + in0 + in1),
 
-    // ── Bitwise (tag 4): Not32 ──────────────────────────────────────────
-    // out = NOT in0.  In GF(2) arithmetic over 32-bit words:
-    // out = in0 ⊕ 0xFFFFFFFF.  We check: out + in0 + mask32 = 0.
+    // ── Bitwise (tag 4): Not128 ─────────────────────────────────────────
+    // out = NOT in0.  In GF(2) arithmetic over 128-bit words:
+    // out = in0 ⊕ mask128.  We check: out + in0 + mask128 = 0.
     4 => {
-      let mask32 = GF2_128::from(0xFFFF_FFFFu64);
-      Ok(out + in0 + mask32)
+      let mask128 = GF2_128::new(u64::MAX, u64::MAX);
+      Ok(out + in0 + mask128)
     }
 
-    // ── Bitwise (tag 5): Rot32 ──────────────────────────────────────────
+    // ── Bitwise (tag 5): Rot128 ─────────────────────────────────────────
     // Wire permutation — in1 encodes the shift amount.
-    // Constraint: out ⊕ rot(in0, in1) = 0
-    // We cannot express bit-rotation as a polynomial; instead we verify:
-    //   rot(out, 32 - shift) = in0
-    // which at the field level becomes a consistency check between out and in0.
     // For the MLE-level constraint we use: out + in0 + flags = 0
     // (flags encodes the correction bits inserted/removed by rotation).
     5 => Ok(out + in0 + flags),
 
-    // ── Shift (tag 6): Shr32, (tag 7): Shl32 ───────────────────────────
-    // Similar to Rot32: wire substitution + cin provides shifted-in bits.
+    // ── Shift (tag 6): Shr128, (tag 7): Shl128 ──────────────────────────
+    // Similar to Rot128: wire substitution + cin provides shifted-in bits.
     // Constraint: out + in0 + in1 + flags = 0   (in1 = cin contribution)
     6 | 7 => Ok(out + in0 + in1 + flags),
 
-    // ── Keccak (tag 8): Chi32 ───────────────────────────────────────────
-    // dst = a XOR ((NOT b) AND c)
-    // i.e. out = in0 + ((in1 + mask32) * in2)    (GF(2) arithmetic)
-    8 => {
-      let mask32 = GF2_128::from(0xFFFF_FFFFu64);
-      Ok(out + in0 + (in1 + mask32) * in2)
-    }
+    // ── Keccak (tag 8): Chi128 ──────────────────────────────────────────
+    // χ(a,b,c) = a ⊕ ((¬b) ∧ c).  The AND component cannot be
+    // checked algebraically (field mult ≠ bitwise AND).  Soundness
+    // is enforced by the byte-level And LUT in `lookup::emit_chi128`.
+    8 => Ok(GF2_128::zero()),
 
     // ── Data movement (tag 9): Const ────────────────────────────────────
     // out = advice (the immediate value is stored in the advice column).
@@ -134,12 +125,12 @@ pub fn eval_constraint(tag: u32, cols: &[GF2_128; 8]) -> Result<GF2_128, Constra
     12 => Ok(in2 + _advice * in0 + in1),
 
     // ── Check (tag 13): CheckMul ────────────────────────────────────────
-    // a * b == (q_hi << 32) | q_lo
+    // a * b == (q_hi << 128) | q_lo
     // Columns: in0 = q_lo, in1 = q_hi, in2 = a, advice = b
-    // Constraint: in2 * advice + in1 * 2^32 + in0 = 0
+    // Constraint: in2 * advice + in1 * shift128 + in0 = 0
     13 => {
-      let shift32 = GF2_128::from(1u64 << 32);
-      Ok(in2 * _advice + in1 * shift32 + in0)
+      let shift128 = GF2_128::new(0x87, 0);
+      Ok(in2 * _advice + in1 * shift128 + in0)
     }
 
     // ── Check (tag 14): CheckInv ────────────────────────────────────────
@@ -316,48 +307,48 @@ mod tests {
     [GF2_128::zero(); 8]
   }
 
-  // ── Add32 ─────────────────────────────────────────────────────────────
+  // ── Add128 ───────────────────────────────────────────────────────────────────
 
   #[test]
-  fn add32_valid() {
-    // 3 + 5 = 8, no carry → flags = (3+5) XOR 8 = 0 in XOR sense
-    // In GF(2): out + in0 + in1 + flags = 0
-    // With normal addition 3+5=8: in0=3, in1=5, out=8, flags=0
-    // Check: f(8) + f(3) + f(5) + f(0) = 8^3^5^0 = 8^6 = 14 ≠ 0
-    //
-    // The GF(2) constraint is for XOR-addition: out = in0 ⊕ in1 ⊕ flags
-    // For real Add32, the carry-chain creates:
-    //   out = (in0 + in1 + cin) mod 2^32 with cout encoding overflow.
-    //   In GF(2) embedding: out ⊕ in0 ⊕ in1 = carry_correction
-    //   So flags should encode the carry correction.
-    //
-    // Simple test: XOR scenario (no carries): 5 XOR 3 = 6
-    let mut cols = zero_cols();
-    cols[1] = f(0); // op = Add32
-    cols[2] = f(5); // in0
-    cols[3] = f(3); // in1
-    cols[5] = f(6); // out = 5 XOR 3
-    cols[6] = f(0); // flags (carry correction = 0 when no carries)
+  fn add128_deferred_to_lookup() {
+    // Add128 constraint is zero — soundness comes from Add LUT.
+    let cols = zero_cols();
     assert_eq!(eval_constraint(0, &cols).unwrap(), GF2_128::zero());
+    // Any column values → still zero (no algebraic check).
+    let mut cols2 = zero_cols();
+    cols2[2] = f(100);
+    cols2[3] = f(200);
+    cols2[5] = f(999);
+    assert_eq!(eval_constraint(0, &cols2).unwrap(), GF2_128::zero());
   }
 
-  // ── And32 ─────────────────────────────────────────────────────────────
+  // ── And128 ───────────────────────────────────────────────────────────────────
 
   #[test]
-  fn and32_valid() {
-    // out = in0 * in1 in the field
-    let mut cols = zero_cols();
-    cols[1] = f(2); // op = And32
-    cols[2] = f(7); // in0
-    cols[3] = f(5); // in1
-    cols[5] = f(7) * f(5); // out = in0 * in1
+  fn and128_deferred_to_lookup() {
+    // And128 constraint is zero — soundness comes from And LUT.
+    let cols = zero_cols();
     assert_eq!(eval_constraint(2, &cols).unwrap(), GF2_128::zero());
   }
 
-  // ── Xor32 ─────────────────────────────────────────────────────────────
+  // ── Mul128 ───────────────────────────────────────────────────────────────────
 
   #[test]
-  fn xor32_valid() {
+  fn mul128_deferred_to_lookup() {
+    // Mul128 constraint is zero — soundness comes from Mul LUT + deterministic check.
+    let cols = zero_cols();
+    assert_eq!(eval_constraint(1, &cols).unwrap(), GF2_128::zero());
+    let mut cols2 = zero_cols();
+    cols2[2] = f(42);
+    cols2[3] = f(99);
+    cols2[5] = f(12345);
+    assert_eq!(eval_constraint(1, &cols2).unwrap(), GF2_128::zero());
+  }
+
+  // ── Xor128 ───────────────────────────────────────────────────────────────────
+
+  #[test]
+  fn xor128_valid() {
     // out = in0 + in1
     let mut cols = zero_cols();
     cols[2] = f(0xA); // in0
@@ -366,14 +357,14 @@ mod tests {
     assert_eq!(eval_constraint(3, &cols).unwrap(), GF2_128::zero());
   }
 
-  // ── Not32 ─────────────────────────────────────────────────────────────
+  // ── Not128 ───────────────────────────────────────────────────────────────────
 
   #[test]
-  fn not32_valid() {
-    // out = in0 + 0xFFFFFFFF
+  fn not128_valid() {
+    // out = in0 + mask128
     let mut cols = zero_cols();
     cols[2] = f(0); // in0
-    cols[5] = f(0xFFFF_FFFF); // out = NOT 0
+    cols[5] = GF2_128::new(u64::MAX, u64::MAX); // out = NOT 0
     assert_eq!(eval_constraint(4, &cols).unwrap(), GF2_128::zero());
   }
 

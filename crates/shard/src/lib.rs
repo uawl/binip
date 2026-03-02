@@ -17,5 +17,5 @@ pub mod verifier;
 
 pub use config::RecursiveConfig;
 pub use proof::{ShardProof, ShardProofBatch};
-pub use prover::{prove_all, prove_all_gpu, prove_shard, split_mle};
-pub use verifier::{verify_all, verify_shard, ShardVerifyResult};
+pub use prover::{prove_all, prove_all_par, prove_shard, split_mle};
+pub use verifier::{ShardVerifyResult, verify_all, verify_shard};

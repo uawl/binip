@@ -31,6 +31,12 @@ impl LeafProof {
 pub struct TypeCert {
   /// Blake3 Merkle root over the serialised tree shape.
   pub root_hash: [u8; 32],
+  /// Blake3 hash committing to the actual EVM state values (stack,
+  /// gas, memory sizes, storage keys/values) in every `Leaf` node.
+  /// This binds the witness-observable state into the Fiat-Shamir
+  /// transcript so the verifier can run value-level consistency
+  /// checks on an authenticated tree.
+  pub state_hash: [u8; 32],
   /// Total number of `Leaf` nodes in the tree.
   pub leaf_count: usize,
 }

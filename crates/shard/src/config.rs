@@ -22,7 +22,11 @@ pub struct RecursiveConfig {
 
 impl Default for RecursiveConfig {
   fn default() -> Self {
-    Self { total_vars: 20, shard_vars: 10, fan_in: 64 }
+    Self {
+      total_vars: 20,
+      shard_vars: 10,
+      fan_in: 64,
+    }
   }
 }
 
@@ -32,7 +36,11 @@ impl RecursiveConfig {
   /// Uses `fan_in = 64` and `shard_vars = max(1, total_vars / 2)`.
   pub fn for_n_vars(total_vars: u32) -> Self {
     let shard_vars = (total_vars / 2).max(1).min(total_vars);
-    Self { total_vars, shard_vars, fan_in: 64 }
+    Self {
+      total_vars,
+      shard_vars,
+      fan_in: 64,
+    }
   }
   /// Number of shards: `2^(total_vars - shard_vars)`.
   pub fn n_shards(&self) -> u32 {
@@ -80,7 +88,11 @@ mod tests {
   use super::*;
 
   fn default_cfg() -> RecursiveConfig {
-    RecursiveConfig { total_vars: 20, shard_vars: 8, fan_in: 8 }
+    RecursiveConfig {
+      total_vars: 20,
+      shard_vars: 8,
+      fan_in: 8,
+    }
   }
 
   #[test]
@@ -90,7 +102,11 @@ mod tests {
 
   #[test]
   fn n_shards_equal_vars() {
-    let cfg = RecursiveConfig { total_vars: 8, shard_vars: 8, fan_in: 4 };
+    let cfg = RecursiveConfig {
+      total_vars: 8,
+      shard_vars: 8,
+      fan_in: 4,
+    };
     assert_eq!(cfg.n_shards(), 1);
   }
 
@@ -102,14 +118,22 @@ mod tests {
 
   #[test]
   fn depth_single_shard() {
-    let cfg = RecursiveConfig { total_vars: 8, shard_vars: 8, fan_in: 4 };
+    let cfg = RecursiveConfig {
+      total_vars: 8,
+      shard_vars: 8,
+      fan_in: 4,
+    };
     assert_eq!(cfg.depth(), 0);
   }
 
   #[test]
   fn depth_small() {
     // 4 shards, fan_in=2: 4/2=2 → 2/2=1 → depth 2
-    let cfg = RecursiveConfig { total_vars: 4, shard_vars: 2, fan_in: 2 };
+    let cfg = RecursiveConfig {
+      total_vars: 4,
+      shard_vars: 2,
+      fan_in: 2,
+    };
     assert_eq!(cfg.n_shards(), 4);
     assert_eq!(cfg.depth(), 2);
   }

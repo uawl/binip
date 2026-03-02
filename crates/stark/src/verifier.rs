@@ -10,6 +10,7 @@
 //! 6. **PCS opening** — verify the opening proof at the challenge point.
 //! 7. **Root claim consistency** — recursive root_claim == shard total_sum.
 
+use circuit::lookup;
 use evm_types::ProofNode;
 use field::{FieldElem, GF2_128};
 use transcript::{Blake3Transcript, Transcript};
@@ -25,8 +26,17 @@ pub enum VerifyError {
   #[error("type cert root hash mismatch")]
   TypeCertMismatch,
 
+  #[error("type cert state hash mismatch")]
+  StateCertMismatch,
+
   #[error("constraint sum is non-zero")]
   ConstraintSumNonZero,
+
+  #[error("boundary constraint sum is non-zero")]
+  BoundaryConstraintSumNonZero,
+
+  #[error("consistency check failed: {0}")]
+  ConsistencyCheck(String),
 
   #[error("shard verification failed: {0}")]
   ShardVerify(String),
@@ -38,13 +48,19 @@ pub enum VerifyError {
   PcsOpenFailed,
 
   #[error("root claim mismatch: recursive root {recursive:?} != shard total {shard:?}")]
-  RootClaimMismatch {
-    recursive: GF2_128,
-    shard: GF2_128,
-  },
+  RootClaimMismatch { recursive: GF2_128, shard: GF2_128 },
 
   #[error("beta challenge mismatch")]
   BetaMismatch,
+
+  #[error("gamma challenge mismatch")]
+  GammaMismatch,
+
+  #[error("reconstruction sum is non-zero")]
+  ReconstructionSumNonZero,
+
+  #[error("lookup verification failed")]
+  LookupVerifyFailed,
 }
 
 /// Verify a top-level STARK proof.
@@ -56,15 +72,22 @@ pub enum VerifyError {
 /// * `params` – the same parameters used during proving.
 ///
 /// The verifier does NOT need the witness (execution trace).
-pub fn verify(
-  proof: &Proof,
-  tree: &ProofNode,
-  params: &StarkParams,
-) -> Result<(), VerifyError> {
+pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(), VerifyError> {
   // ── 1. Type cert ──────────────────────────────────────────────────────
   let cert = evm_types::build_cert(tree)?;
   if cert.root_hash != proof.type_cert.root_hash {
     return Err(VerifyError::TypeCertMismatch);
+  }
+  if cert.state_hash != proof.type_cert.state_hash {
+    return Err(VerifyError::StateCertMismatch);
+  }
+
+  // ── 1b. Native consistency check (ordering invariants) ────────────────
+  let errors = evm_types::consistency_check_all(tree);
+  if !errors.is_empty() {
+    return Err(VerifyError::ConsistencyCheck(
+      errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+    ));
   }
 
   // ── 2. Constraint sum must be zero ────────────────────────────────────
@@ -72,18 +95,35 @@ pub fn verify(
     return Err(VerifyError::ConstraintSumNonZero);
   }
 
+  // ── 2b. Boundary constraint sum must be zero ──────────────────────────
+  if !proof.boundary_constraint_sum.is_zero() {
+    return Err(VerifyError::BoundaryConstraintSumNonZero);
+  }
+
   // ── 3. Rebuild transcript and derive β ────────────────────────────────
   let mut transcript = Blake3Transcript::new();
   transcript.absorb_bytes(&proof.type_cert.root_hash);
+  transcript.absorb_bytes(&proof.type_cert.state_hash);
   let beta = transcript.squeeze_challenge();
   if beta != proof.beta {
     return Err(VerifyError::BetaMismatch);
   }
 
+  // ── 3b. Derive γ and verify reconstruction + lookups ──────────────────
+  // (γ is squeezed BEFORE PCS commit, matching prover ordering)
+  let gamma = transcript.squeeze_challenge();
+  if gamma != proof.gamma {
+    return Err(VerifyError::GammaMismatch);
+  }
+  if !proof.reconstruction_sum.is_zero() {
+    return Err(VerifyError::ReconstructionSumNonZero);
+  }
+  if !lookup::verify_lookups_par(&proof.lookup_proofs, &mut proof.lookup_witness.clone(), &mut transcript.clone()) {
+    return Err(VerifyError::LookupVerifyFailed);
+  }
+
   // Absorb PCS commitment (mirrors prover step 3)
   transcript.absorb_bytes(&proof.batch_commit.root);
-
-  // ── 4. Shard verification ─────────────────────────────────────────────
   let shard_transcript = transcript.clone();
 
   // ── 5. Shard + Recursive verification ────────────────────────────────
@@ -131,7 +171,7 @@ mod tests {
   use evm_types::state::EvmState;
   use vm::Row;
 
-  fn xor_row(a: u32, b: u32) -> Row {
+  fn xor_row(a: u128, b: u128) -> Row {
     Row {
       pc: 0,
       op: 3,
@@ -144,36 +184,32 @@ mod tests {
     }
   }
 
-  fn state_with_depth(depth: usize, pc: u32) -> EvmState {
+  fn state_with_gas(depth: usize, pc: u32, gas: u64) -> EvmState {
     use revm::primitives::U256;
-    EvmState::with_stack(vec![U256::ZERO; depth], pc)
+    let mut s = EvmState::with_stack(vec![U256::ZERO; depth], pc);
+    s.gas = gas;
+    s
   }
 
   fn make_trace_and_tree() -> (Vec<Row>, ProofNode) {
-    let rows = vec![
-      xor_row(1, 2),
-      xor_row(3, 4),
-      xor_row(5, 6),
-      xor_row(7, 8),
-    ];
+    let rows = vec![xor_row(1, 2), xor_row(3, 4), xor_row(5, 6), xor_row(7, 8)];
 
-    let leaf = |i: u32, depth: usize| {
-      ProofNode::Leaf {
-        opcode: 0x01,
-        pre_state: state_with_depth(depth, i),
-        post_state: state_with_depth(depth - 1, i + 1),
-        leaf_proof: LeafProof::placeholder(),
-      }
+    // ADD costs 3 gas per step.
+    let leaf = |i: u32, depth: usize, gas: u64| ProofNode::Leaf {
+      opcode: 0x01,
+      pre_state: state_with_gas(depth, i, gas),
+      post_state: state_with_gas(depth - 1, i + 1, gas - 3),
+      leaf_proof: LeafProof::placeholder(),
     };
 
     let tree = ProofNode::Seq {
       left: Box::new(ProofNode::Seq {
-        left: Box::new(leaf(0, 5)),
-        right: Box::new(leaf(1, 4)),
+        left: Box::new(leaf(0, 5, 1000)),
+        right: Box::new(leaf(1, 4, 997)),
       }),
       right: Box::new(ProofNode::Seq {
-        left: Box::new(leaf(2, 3)),
-        right: Box::new(leaf(3, 2)),
+        left: Box::new(leaf(2, 3, 994)),
+        right: Box::new(leaf(3, 2, 991)),
       }),
     };
 
@@ -213,8 +249,7 @@ mod tests {
     let (rows, tree) = make_trace_and_tree();
     let params = StarkParams::for_n_vars(2);
     let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
-    proof.recursive_proof.root_claim =
-      proof.recursive_proof.root_claim + GF2_128::from(1u64);
+    proof.recursive_proof.root_claim = proof.recursive_proof.root_claim + GF2_128::from(1u64);
     let err = verify(&proof, &tree, &params).unwrap_err();
     // Could be recursive verify error or root claim mismatch
     assert!(

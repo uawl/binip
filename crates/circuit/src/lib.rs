@@ -14,9 +14,16 @@
 //! 5. Feed the constraint MLE to [`sumcheck::prove`].
 
 pub mod constraint;
+pub mod decomp;
 pub mod encoder;
+pub mod lookup;
+pub mod state_constraint;
 pub mod trace;
 
 pub use constraint::{ConstraintError, eval_constraint};
-pub use encoder::{encode_row, COL_ADVICE, COL_FLAGS, COL_IN0, COL_IN1, COL_IN2, COL_OP, COL_OUT, COL_PC, NUM_COLS};
+pub use decomp::{DecompRow, eval_reconstruction};
+pub use encoder::{
+  COL_ADVICE, COL_FLAGS, COL_IN0, COL_IN1, COL_IN2, COL_OP, COL_OUT, COL_PC, NUM_COLS, encode_row,
+};
+pub use state_constraint::{BoundaryRow, BoundaryTraceTable, extract_boundaries};
 pub use trace::TraceTable;

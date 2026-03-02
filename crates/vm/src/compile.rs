@@ -2,10 +2,10 @@
 //!
 //! ## Register allocation
 //!
-//! A U256 value occupies **8 consecutive registers** in little-endian limb
-//! order.  EVM stack slot `s` (0 = top) is mapped to base register `s * 8`.
-//! With 64 registers we can address 8 EVM words simultaneously, which is
-//! more than enough for any single opcode (max 3 inputs + 1 output).
+//! A U256 value occupies **2 consecutive registers** in little-endian limb
+//! order.  EVM stack slot `s` (0 = top) is mapped to base register `s * 2`.
+//! With 16 registers we can address 5 EVM words plus 6 scratch registers,
+//! which is more than enough for any single opcode (max 3 inputs + 1 output).
 //!
 //! ## Advice pattern
 //!
@@ -15,8 +15,8 @@
 
 use crate::isa::{FlagReg, MicroOp, Reg};
 
-/// Number of 32-bit limbs per U256 word.
-const LIMBS: usize = 8;
+/// Number of 128-bit limbs per U256 word.
+const LIMBS: usize = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Register-slot helpers
@@ -32,9 +32,9 @@ const fn limb(s: usize, l: usize) -> Reg {
   slot(s) + l as Reg
 }
 
-/// Scratch area starts after 5 stack-slot groups (regs 40..63).
+/// Scratch area starts after 5 stack-slot groups (regs 10..15).
 const fn scratch(i: usize) -> Reg {
-  40 + i as Reg
+  10 + i as Reg
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ pub struct Compiled {
   /// Micro-ops that implement this opcode.
   pub ops: Vec<MicroOp>,
   /// Number of U256 limbs to pre-populate on the advice tape for this opcode
-  /// (each u32 limb counts as 1).
+  /// (each u128 limb counts as 1).
   pub advice_count: usize,
 }
 
@@ -63,67 +63,67 @@ pub fn compile(opcode: u8) -> Option<Compiled> {
 
   match opcode {
     // ── Arithmetic ────────────────────────────────────────────────────────
-    ADD       => Some(compile_add()),
-    SUB       => Some(compile_sub()),
-    MUL       => Some(compile_mul()),
-    DIV       => Some(compile_div()),
-    MOD       => Some(compile_mod()),
-    ADDMOD    => Some(compile_addmod()),
-    MULMOD    => Some(compile_mulmod()),
-    EXP       => Some(compile_advice_u256()),
-    SDIV      => Some(compile_advice_u256()),
-    SMOD      => Some(compile_advice_u256()),
+    ADD => Some(compile_add()),
+    SUB => Some(compile_sub()),
+    MUL => Some(compile_mul()),
+    DIV => Some(compile_div()),
+    MOD => Some(compile_mod()),
+    ADDMOD => Some(compile_addmod()),
+    MULMOD => Some(compile_mulmod()),
+    EXP => Some(compile_advice_u256()),
+    SDIV => Some(compile_advice_u256()),
+    SMOD => Some(compile_advice_u256()),
     SIGNEXTEND => Some(compile_advice_u256()),
 
     // ── Comparison ────────────────────────────────────────────────────────
-    LT        => Some(compile_advice_bool()),
-    GT        => Some(compile_advice_bool()),
-    SLT       => Some(compile_advice_bool()),
-    SGT       => Some(compile_advice_bool()),
-    ISZERO    => Some(compile_iszero()),
-    EQ        => Some(compile_eq()),
+    LT => Some(compile_advice_bool()),
+    GT => Some(compile_advice_bool()),
+    SLT => Some(compile_advice_bool()),
+    SGT => Some(compile_advice_bool()),
+    ISZERO => Some(compile_iszero()),
+    EQ => Some(compile_eq()),
 
     // ── Bitwise ───────────────────────────────────────────────────────────
-    AND       => Some(compile_bitwise_and()),
-    OR        => Some(compile_bitwise_or()),
-    XOR       => Some(compile_bitwise_xor()),
-    NOT       => Some(compile_bitwise_not()),
-    SHL       => Some(compile_advice_u256()),
-    SHR       => Some(compile_advice_u256()),
-    SAR       => Some(compile_advice_u256()),
-    BYTE      => Some(compile_byte_extract()),
+    AND => Some(compile_bitwise_and()),
+    OR => Some(compile_bitwise_or()),
+    XOR => Some(compile_bitwise_xor()),
+    NOT => Some(compile_bitwise_not()),
+    SHL => Some(compile_advice_u256()),
+    SHR => Some(compile_advice_u256()),
+    SAR => Some(compile_advice_u256()),
+    BYTE => Some(compile_byte_extract()),
 
     // ── Push / Pop ────────────────────────────────────────────────────────
-    PUSH0     => Some(compile_push_zero()),
-    POP       => Some(compile_noop()),
+    PUSH0 => Some(compile_push_zero()),
+    POP => Some(compile_noop()),
 
     // ── DUP / SWAP ────────────────────────────────────────────────────────
-    DUP1..=DUP16   => Some(compile_dup(opcode - DUP1 + 1)),
+    DUP1..=DUP16 => Some(compile_dup(opcode - DUP1 + 1)),
     SWAP1..=SWAP16 => Some(compile_swap()),
 
     // ── Keccak ────────────────────────────────────────────────────────────
     KECCAK256 => Some(compile_keccak()),
 
     // ── Memory ────────────────────────────────────────────────────────────
-    MLOAD     => Some(compile_mload()),
-    MSTORE    => Some(compile_mstore()),
-    MSTORE8   => Some(compile_mstore8()),
-    MCOPY     => Some(compile_noop()),
+    MLOAD => Some(compile_mload()),
+    MSTORE => Some(compile_mstore()),
+    MSTORE8 => Some(compile_mstore8()),
+    MCOPY => Some(compile_noop()),
 
     // ── Storage ───────────────────────────────────────────────────────────
-    SLOAD     => Some(compile_sload()),
-    SSTORE    => Some(compile_sstore()),
-    TLOAD     => Some(compile_tload()),
-    TSTORE    => Some(compile_tstore()),
+    SLOAD => Some(compile_sload()),
+    SSTORE => Some(compile_sstore()),
+    TLOAD => Some(compile_tload()),
+    TSTORE => Some(compile_tstore()),
 
     // ── Jump / control ────────────────────────────────────────────────────
-    JUMP      => Some(compile_noop()),
-    JUMPI     => Some(compile_noop()),
-    JUMPDEST  => Some(compile_noop()),
-    STOP      => Some(compile_stop()),
-    RETURN    => Some(compile_noop()),
-    REVERT    => Some(compile_noop()),
-    INVALID   => Some(compile_stop()),
+    JUMP => Some(compile_noop()),
+    JUMPI => Some(compile_noop()),
+    JUMPDEST => Some(compile_noop()),
+    STOP => Some(compile_stop()),
+    RETURN => Some(compile_noop()),
+    REVERT => Some(compile_noop()),
+    INVALID => Some(compile_stop()),
     SELFDESTRUCT => Some(compile_noop()),
 
     // ── Environment / state queries ───────────────────────────────────────
@@ -149,7 +149,7 @@ pub fn compile(opcode: u8) -> Option<Compiled> {
     CREATE | CREATE2 => Some(compile_advice_u256()),
     CALL | CALLCODE | DELEGATECALL | STATICCALL => Some(compile_advice_u256()),
 
-    _         => None,
+    _ => None,
   }
 }
 
@@ -162,10 +162,13 @@ pub fn compile(opcode: u8) -> Option<Compiled> {
 /// Used by: POP, JUMP, JUMPI, JUMPDEST, RETURN, REVERT, SELFDESTRUCT,
 /// LOG0-LOG4, CALLDATACOPY, CODECOPY, EXTCODECOPY, RETURNDATACOPY, MCOPY.
 fn compile_noop() -> Compiled {
-  Compiled { ops: vec![], advice_count: 0 }
+  Compiled {
+    ops: vec![],
+    advice_count: 0,
+  }
 }
 
-/// Load a full U256 (8 limbs) from the advice tape into slot 0.
+/// Load a full U256 (2 limbs) from the advice tape into slot 0.
 ///
 /// Used by opcodes whose result is computed externally by the prover and
 /// verified at the circuit/proof-tree layer: EXP, SDIV, SMOD, SHL, SHR,
@@ -176,24 +179,42 @@ fn compile_advice_u256() -> Compiled {
     ops.push(MicroOp::AdviceLoad { dst: scratch(i) });
   }
   for i in 0..LIMBS {
-    ops.push(MicroOp::Mov { dst: limb(0, i), src: scratch(i) });
+    ops.push(MicroOp::Mov {
+      dst: limb(0, i),
+      src: scratch(i),
+    });
   }
-  Compiled { ops, advice_count: LIMBS }
+  Compiled {
+    ops,
+    advice_count: LIMBS,
+  }
 }
 
 /// Load a boolean (0 or 1) from the advice tape into slot 0.
 ///
-/// Loads a single limb, range-checks it to 1 bit, zeros limbs 1..7.
+/// Loads a single limb, range-checks it to 1 bit, zeros limb 1.
 /// Used by: LT, GT, SLT, SGT.
 fn compile_advice_bool() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS + 3);
   ops.push(MicroOp::AdviceLoad { dst: scratch(0) });
-  ops.push(MicroOp::RangeCheck { r: scratch(0), bits: 1 });
-  ops.push(MicroOp::Mov { dst: limb(0, 0), src: scratch(0) });
+  ops.push(MicroOp::RangeCheck {
+    r: scratch(0),
+    bits: 1,
+  });
+  ops.push(MicroOp::Mov {
+    dst: limb(0, 0),
+    src: scratch(0),
+  });
   for i in 1..LIMBS {
-    ops.push(MicroOp::Const { dst: limb(0, i), val: 0 });
+    ops.push(MicroOp::Const {
+      dst: limb(0, i),
+      val: 0,
+    });
   }
-  Compiled { ops, advice_count: 1 }
+  Compiled {
+    ops,
+    advice_count: 1,
+  }
 }
 
 /// BYTE: extract a single byte from a U256 value.
@@ -202,17 +223,32 @@ fn compile_advice_bool() -> Compiled {
 fn compile_byte_extract() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS + 3);
   ops.push(MicroOp::AdviceLoad { dst: scratch(0) });
-  ops.push(MicroOp::RangeCheck { r: scratch(0), bits: 8 });
-  ops.push(MicroOp::Mov { dst: limb(0, 0), src: scratch(0) });
+  ops.push(MicroOp::RangeCheck {
+    r: scratch(0),
+    bits: 8,
+  });
+  ops.push(MicroOp::Mov {
+    dst: limb(0, 0),
+    src: scratch(0),
+  });
   for i in 1..LIMBS {
-    ops.push(MicroOp::Const { dst: limb(0, i), val: 0 });
+    ops.push(MicroOp::Const {
+      dst: limb(0, i),
+      val: 0,
+    });
   }
-  Compiled { ops, advice_count: 1 }
+  Compiled {
+    ops,
+    advice_count: 1,
+  }
 }
 
 /// STOP / INVALID: halt execution via the Done micro-op.
 fn compile_stop() -> Compiled {
-  Compiled { ops: vec![MicroOp::Done], advice_count: 0 }
+  Compiled {
+    ops: vec![MicroOp::Done],
+    advice_count: 0,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,13 +262,26 @@ fn compile_stop() -> Compiled {
 /// - DUP6..DUP16: caller pre-loads the source element into slot 1 → MOV to slot 0.
 fn compile_dup(n: u8) -> Compiled {
   if n == 1 {
-    return Compiled { ops: vec![], advice_count: 0 };
+    return Compiled {
+      ops: vec![],
+      advice_count: 0,
+    };
   }
-  let src_slot = if (n as usize) <= 5 { (n - 1) as usize } else { 1 };
+  let src_slot = if (n as usize) <= 5 {
+    (n - 1) as usize
+  } else {
+    1
+  };
   let ops = (0..LIMBS)
-    .map(|i| MicroOp::Mov { dst: limb(0, i), src: limb(src_slot, i) })
+    .map(|i| MicroOp::Mov {
+      dst: limb(0, i),
+      src: limb(src_slot, i),
+    })
     .collect();
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
 /// SWAP N (N=1..16): swap TOS with the (N+1)-th stack element.
@@ -242,11 +291,23 @@ fn compile_dup(n: u8) -> Compiled {
 fn compile_swap() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS * 3);
   for i in 0..LIMBS {
-    ops.push(MicroOp::Mov { dst: scratch(i), src: limb(0, i) });
-    ops.push(MicroOp::Mov { dst: limb(0, i), src: limb(1, i) });
-    ops.push(MicroOp::Mov { dst: limb(1, i), src: scratch(i) });
+    ops.push(MicroOp::Mov {
+      dst: scratch(i),
+      src: limb(0, i),
+    });
+    ops.push(MicroOp::Mov {
+      dst: limb(0, i),
+      src: limb(1, i),
+    });
+    ops.push(MicroOp::Mov {
+      dst: limb(1, i),
+      src: scratch(i),
+    });
   }
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -256,7 +317,10 @@ fn compile_swap() -> Compiled {
 /// TLOAD: pop key (slot0), load value from transient storage → slot0.
 fn compile_tload() -> Compiled {
   Compiled {
-    ops: vec![MicroOp::TLoad { dst: slot(0), key_reg: slot(0) }],
+    ops: vec![MicroOp::TLoad {
+      dst: slot(0),
+      key_reg: slot(0),
+    }],
     advice_count: 0,
   }
 }
@@ -264,7 +328,10 @@ fn compile_tload() -> Compiled {
 /// TSTORE: pop key (slot0) and value (slot1), store to transient storage.
 fn compile_tstore() -> Compiled {
   Compiled {
-    ops: vec![MicroOp::TStore { key_reg: slot(0), val_reg: slot(1) }],
+    ops: vec![MicroOp::TStore {
+      key_reg: slot(0),
+      val_reg: slot(1),
+    }],
     advice_count: 0,
   }
 }
@@ -282,7 +349,7 @@ fn compile_add() -> Compiled {
     // First limb uses flag 0 (which is false-initialized).
     let cin: FlagReg = i as FlagReg;
     let cout: FlagReg = ((i + 1) % LIMBS) as FlagReg;
-    ops.push(MicroOp::Add32 {
+    ops.push(MicroOp::Add128 {
       dst: limb(0, i),
       a: limb(0, i),
       b: limb(1, i),
@@ -290,39 +357,39 @@ fn compile_add() -> Compiled {
       cout,
     });
   }
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
 /// SUB: slot0 = slot0 - slot1 (two's complement).
 ///
-/// a - b = a + (NOT b) + 1.  We set flag 0 = true before the chain to inject
-/// the +1 carry, then chain normally.  Cost: 256 AND.
+/// a - b = a + (NOT b) + 1.
 fn compile_sub() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS * 2 + 1);
   // NOT each limb of slot1 into scratch
   for i in 0..LIMBS {
-    ops.push(MicroOp::Not32 {
+    ops.push(MicroOp::Not128 {
       dst: scratch(i),
       src: limb(1, i),
     });
   }
-  // Set flag 0 = 1 by loading 0xFFFF_FFFF + 0 + cin=0 → carry=0 is wrong.
-  // Instead, use Const to load 1 into a scratch reg, then Add32(0+0+cin)
-  // with a trick: we rely on the fact that NOT + carry-in of 1 = negate.
-  //
-  // Simpler: load a = slot0, b = NOT(slot1), and inject carry = 1 on limb 0
-  // by adding an extra 1 via a scratch register.
+  // Set flag 0 = 1: inject +1 carry for two's complement negation.
   //
   // We add slot0[0] + NOT(slot1[0]) + 1 for the first limb:
-  ops.push(MicroOp::Const { dst: scratch(LIMBS), val: 1 });
-  ops.push(MicroOp::Add32 {
+  ops.push(MicroOp::Const {
+    dst: scratch(LIMBS),
+    val: 1,
+  });
+  ops.push(MicroOp::Add128 {
     dst: scratch(LIMBS + 1),
     a: scratch(0),
     b: scratch(LIMBS),
     cin: 0,
     cout: 1, // flag 1 = carry from NOT(b[0]) + 1
   });
-  ops.push(MicroOp::Add32 {
+  ops.push(MicroOp::Add128 {
     dst: limb(0, 0),
     a: limb(0, 0),
     b: scratch(LIMBS + 1),
@@ -336,32 +403,38 @@ fn compile_sub() -> Compiled {
   // Restart with a cleaner approach: manually do a - b = a + ~b + 1
   ops.clear();
 
-  // Step 1: NOT all of slot1 into scratch[0..8]
+  // Step 1: NOT all of slot1 into scratch[0..LIMBS]
   for i in 0..LIMBS {
-    ops.push(MicroOp::Not32 {
+    ops.push(MicroOp::Not128 {
       dst: scratch(i),
       src: limb(1, i),
     });
   }
 
-  // Step 2: Add 1 to scratch[0..8] to form (-b) = ~b + 1.
-  // We do this by using Add32 with a Const(1) for limb 0, then 0 for rest.
+  // Step 2: Add 1 to scratch[0..LIMBS] to form (-b) = ~b + 1.
+  // We do this by using Add128 with a Const(1) for limb 0, then 0 for rest.
   // Flag 0 is initially false; we use Const(1) and add to scratch[0].
-  ops.push(MicroOp::Const { dst: scratch(LIMBS), val: 1 });
+  ops.push(MicroOp::Const {
+    dst: scratch(LIMBS),
+    val: 1,
+  });
   // scratch[0] = scratch[0] + 1
-  ops.push(MicroOp::Add32 {
+  ops.push(MicroOp::Add128 {
     dst: scratch(0),
     a: scratch(0),
     b: scratch(LIMBS),
     cin: 0,
     cout: 0, // carry → flag 0
   });
-  // scratch[1..7] += carry
-  ops.push(MicroOp::Const { dst: scratch(LIMBS), val: 0 });
+  // scratch[1..] += carry
+  ops.push(MicroOp::Const {
+    dst: scratch(LIMBS),
+    val: 0,
+  });
   for i in 1..LIMBS {
     let cin: FlagReg = ((i - 1) % LIMBS) as FlagReg;
     let cout: FlagReg = (i % LIMBS) as FlagReg;
-    ops.push(MicroOp::Add32 {
+    ops.push(MicroOp::Add128 {
       dst: scratch(i),
       a: scratch(i),
       b: scratch(LIMBS),
@@ -371,11 +444,10 @@ fn compile_sub() -> Compiled {
   }
 
   // Step 3: Add slot0 + (-b) with clean carry chain.
-  // Reset flag by using flag indices 0..7 freshly.
   for i in 0..LIMBS {
     let cin: FlagReg = i as FlagReg;
     let cout: FlagReg = ((i + 1) % LIMBS) as FlagReg;
-    ops.push(MicroOp::Add32 {
+    ops.push(MicroOp::Add128 {
       dst: limb(0, i),
       a: limb(0, i),
       b: scratch(i),
@@ -384,14 +456,16 @@ fn compile_sub() -> Compiled {
     });
   }
 
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
 /// MUL: slot0 = (slot0 * slot1) mod 2^256.
 ///
 /// Uses the advice pattern: prover supplies the 256-bit product, then
 /// CheckMul verifies each limb-pair multiplication.
-/// Cost: 8 × Advice + 8 × CheckMul ≈ 4K AND.
 fn compile_mul() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS * 2);
   // Load the 8 result limbs from the advice tape into scratch[0..8].
@@ -408,21 +482,27 @@ fn compile_mul() -> Compiled {
   // For now, verify limb 0: a[0] * b[0] should produce scratch[0] as low part.
   ops.push(MicroOp::CheckMul {
     q_lo: scratch(0),
-    q_hi: scratch(LIMBS),  // high part goes to extra scratch
+    q_hi: scratch(LIMBS), // high part goes to extra scratch
     a: limb(0, 0),
     b: limb(1, 0),
   });
   // Move result from scratch to slot 0.
   for i in 0..LIMBS {
-    ops.push(MicroOp::Mov { dst: limb(0, i), src: scratch(i) });
+    ops.push(MicroOp::Mov {
+      dst: limb(0, i),
+      src: scratch(i),
+    });
   }
-  Compiled { ops, advice_count: LIMBS }
+  Compiled {
+    ops,
+    advice_count: LIMBS,
+  }
 }
 
 /// DIV: slot0 = slot0 / slot1.
 ///
-/// Advice pattern: load quot (8 limbs) and rem (8 limbs) from tape,
-/// then CheckDiv on each limb.  Cost: ~4K AND.
+/// Advice pattern: load quot (LIMBS limbs) and rem (LIMBS limbs) from tape,
+/// then CheckDiv.
 fn compile_div() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS * 2 + LIMBS + LIMBS);
   // Load quotient into scratch[0..8]
@@ -433,7 +513,9 @@ fn compile_div() -> Compiled {
   // We'll reuse slot 2 range (regs 16..23) as temp for remainder.
   let rem_base: Reg = slot(2);
   for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: rem_base + i as Reg });
+    ops.push(MicroOp::AdviceLoad {
+      dst: rem_base + i as Reg,
+    });
   }
   // Verify each limb: dividend[i] == divisor[i] * quot[i] + rem[i].
   // For the full 256-bit check the circuit layer does the multi-limb constraint.
@@ -446,9 +528,15 @@ fn compile_div() -> Compiled {
   });
   // Result = quotient → slot 0
   for i in 0..LIMBS {
-    ops.push(MicroOp::Mov { dst: limb(0, i), src: scratch(i) });
+    ops.push(MicroOp::Mov {
+      dst: limb(0, i),
+      src: scratch(i),
+    });
   }
-  Compiled { ops, advice_count: LIMBS * 2 }
+  Compiled {
+    ops,
+    advice_count: LIMBS * 2,
+  }
 }
 
 /// MOD: slot0 = slot0 % slot1.
@@ -463,7 +551,9 @@ fn compile_mod() -> Compiled {
   // Load remainder into slot 2 range
   let rem_base: Reg = slot(2);
   for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: rem_base + i as Reg });
+    ops.push(MicroOp::AdviceLoad {
+      dst: rem_base + i as Reg,
+    });
   }
   // Verify limb 0
   ops.push(MicroOp::CheckDiv {
@@ -474,9 +564,15 @@ fn compile_mod() -> Compiled {
   });
   // Result = remainder → slot 0
   for i in 0..LIMBS {
-    ops.push(MicroOp::Mov { dst: limb(0, i), src: rem_base + i as Reg });
+    ops.push(MicroOp::Mov {
+      dst: limb(0, i),
+      src: rem_base + i as Reg,
+    });
   }
-  Compiled { ops, advice_count: LIMBS * 2 }
+  Compiled {
+    ops,
+    advice_count: LIMBS * 2,
+  }
 }
 
 /// ADDMOD: slot0 = (slot0 + slot1) % slot2.
@@ -489,7 +585,7 @@ fn compile_addmod() -> Compiled {
   for i in 0..LIMBS {
     let cin: FlagReg = i as FlagReg;
     let cout: FlagReg = ((i + 1) % LIMBS) as FlagReg;
-    ops.push(MicroOp::Add32 {
+    ops.push(MicroOp::Add128 {
       dst: limb(0, i),
       a: limb(0, i),
       b: limb(1, i),
@@ -498,28 +594,35 @@ fn compile_addmod() -> Compiled {
     });
   }
   // Step 2: advice-based modular reduction: slot0 % slot2
-  // slot2 lives at base reg 16..23.
-  // Load quot into scratch[0..8]
+  // Load quot into scratch[0..LIMBS]
   for i in 0..LIMBS {
     ops.push(MicroOp::AdviceLoad { dst: scratch(i) });
   }
-  // Load rem into scratch[8..] = regs 48..55
-  let rem_scratch = 48u8;
+  // Load rem into scratch[LIMBS..]
+  let rem_base = scratch(LIMBS);
   for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: rem_scratch + i as Reg });
+    ops.push(MicroOp::AdviceLoad {
+      dst: rem_base + i as Reg,
+    });
   }
   // Verify limb 0: sum[0] == N[0]*q[0] + r[0]
   ops.push(MicroOp::CheckDiv {
     quot: scratch(0),
-    rem: rem_scratch,
+    rem: rem_base,
     dividend: limb(0, 0),
     divisor: limb(2, 0),
   });
   // Result = remainder → slot 0
   for i in 0..LIMBS {
-    ops.push(MicroOp::Mov { dst: limb(0, i), src: rem_scratch + i as Reg });
+    ops.push(MicroOp::Mov {
+      dst: limb(0, i),
+      src: rem_base + i as Reg,
+    });
   }
-  Compiled { ops, advice_count: LIMBS * 2 }
+  Compiled {
+    ops,
+    advice_count: LIMBS * 2,
+  }
 }
 
 /// MULMOD: slot0 = (slot0 * slot1) % slot2.
@@ -528,17 +631,20 @@ fn compile_addmod() -> Compiled {
 /// Verify: CheckMul(a, b) → t, CheckMul(q, N) → s, then t == s + r (XOR).
 fn compile_mulmod() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS * 4);
-  // Load q (8 limbs) and r (8 limbs) from advice
+  // Load q (LIMBS limbs) and r (LIMBS limbs) from advice.
+  // q → scratch[0..LIMBS], r → slot(3) (reuse slot 3 as temp)
   for i in 0..LIMBS {
     ops.push(MicroOp::AdviceLoad { dst: scratch(i) }); // q
   }
-  let rem_scratch = 48u8;
+  let rem_base = slot(3);
   for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: rem_scratch + i as Reg }); // r
+    ops.push(MicroOp::AdviceLoad {
+      dst: rem_base + i as Reg,
+    }); // r
   }
   // Verify limb 0 of a*b
   ops.push(MicroOp::CheckMul {
-    q_lo: scratch(LIMBS),  // temp
+    q_lo: scratch(LIMBS), // temp
     q_hi: scratch(LIMBS + 1),
     a: limb(0, 0),
     b: limb(1, 0),
@@ -552,21 +658,34 @@ fn compile_mulmod() -> Compiled {
   });
   // Result = r → slot 0
   for i in 0..LIMBS {
-    ops.push(MicroOp::Mov { dst: limb(0, i), src: rem_scratch + i as Reg });
+    ops.push(MicroOp::Mov {
+      dst: limb(0, i),
+      src: rem_base + i as Reg,
+    });
   }
-  Compiled { ops, advice_count: LIMBS * 2 }
+  Compiled {
+    ops,
+    advice_count: LIMBS * 2,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bitwise compilers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// AND: slot0 = slot0 & slot1.  Cost: 256 AND.
+/// AND: slot0 = slot0 & slot1.
 fn compile_bitwise_and() -> Compiled {
   let ops = (0..LIMBS)
-    .map(|i| MicroOp::And32 { dst: limb(0, i), a: limb(0, i), b: limb(1, i) })
+    .map(|i| MicroOp::And128 {
+      dst: limb(0, i),
+      a: limb(0, i),
+      b: limb(1, i),
+    })
     .collect();
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
 /// OR: slot0 = slot0 | slot1.  Cost: 0 AND.
@@ -582,29 +701,57 @@ fn compile_bitwise_or() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS * 3);
   for i in 0..LIMBS {
     // scratch[i] = a[i] & b[i]
-    ops.push(MicroOp::And32 { dst: scratch(i), a: limb(0, i), b: limb(1, i) });
+    ops.push(MicroOp::And128 {
+      dst: scratch(i),
+      a: limb(0, i),
+      b: limb(1, i),
+    });
     // slot0[i] = a[i] ^ b[i]
-    ops.push(MicroOp::Xor32 { dst: limb(0, i), a: limb(0, i), b: limb(1, i) });
+    ops.push(MicroOp::Xor128 {
+      dst: limb(0, i),
+      a: limb(0, i),
+      b: limb(1, i),
+    });
     // slot0[i] = (a ^ b) ^ (a & b)  = a | b
-    ops.push(MicroOp::Xor32 { dst: limb(0, i), a: limb(0, i), b: scratch(i) });
+    ops.push(MicroOp::Xor128 {
+      dst: limb(0, i),
+      a: limb(0, i),
+      b: scratch(i),
+    });
   }
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
-/// XOR: slot0 = slot0 ^ slot1.  Cost: 0 AND.
+/// XOR: slot0 = slot0 ^ slot1.
 fn compile_bitwise_xor() -> Compiled {
   let ops = (0..LIMBS)
-    .map(|i| MicroOp::Xor32 { dst: limb(0, i), a: limb(0, i), b: limb(1, i) })
+    .map(|i| MicroOp::Xor128 {
+      dst: limb(0, i),
+      a: limb(0, i),
+      b: limb(1, i),
+    })
     .collect();
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
-/// NOT: slot0 = ~slot0.  Cost: 0 AND.
+/// NOT: slot0 = ~slot0.
 fn compile_bitwise_not() -> Compiled {
   let ops = (0..LIMBS)
-    .map(|i| MicroOp::Not32 { dst: limb(0, i), src: limb(0, i) })
+    .map(|i| MicroOp::Not128 {
+      dst: limb(0, i),
+      src: limb(0, i),
+    })
     .collect();
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -617,45 +764,104 @@ fn compile_bitwise_not() -> Compiled {
 fn compile_iszero() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS + 4);
   // Accumulate OR of all limbs into scratch[0] via bitwise-OR.
-  ops.push(MicroOp::Mov { dst: scratch(0), src: limb(0, 0) });
+  ops.push(MicroOp::Mov {
+    dst: scratch(0),
+    src: limb(0, 0),
+  });
   for i in 1..LIMBS {
     // scratch[0] |= limb(0, i)  using  a|b = (a^b) ^ (a&b)
-    ops.push(MicroOp::And32 { dst: scratch(1), a: scratch(0), b: limb(0, i) });
-    ops.push(MicroOp::Xor32 { dst: scratch(0), a: scratch(0), b: limb(0, i) });
-    ops.push(MicroOp::Xor32 { dst: scratch(0), a: scratch(0), b: scratch(1) });
+    ops.push(MicroOp::And128 {
+      dst: scratch(1),
+      a: scratch(0),
+      b: limb(0, i),
+    });
+    ops.push(MicroOp::Xor128 {
+      dst: scratch(0),
+      a: scratch(0),
+      b: limb(0, i),
+    });
+    ops.push(MicroOp::Xor128 {
+      dst: scratch(0),
+      a: scratch(0),
+      b: scratch(1),
+    });
   }
   // Now scratch[0] = OR of all limbs.  If zero → result is 1, else 0.
   // Load advice (0 or 1) and range-check.
   ops.push(MicroOp::AdviceLoad { dst: scratch(2) });
-  ops.push(MicroOp::RangeCheck { r: scratch(2), bits: 1 });
+  ops.push(MicroOp::RangeCheck {
+    r: scratch(2),
+    bits: 1,
+  });
   // Set slot0 = [advice, 0, 0, ..., 0]
-  ops.push(MicroOp::Mov { dst: limb(0, 0), src: scratch(2) });
+  ops.push(MicroOp::Mov {
+    dst: limb(0, 0),
+    src: scratch(2),
+  });
   for i in 1..LIMBS {
-    ops.push(MicroOp::Const { dst: limb(0, i), val: 0 });
+    ops.push(MicroOp::Const {
+      dst: limb(0, i),
+      val: 0,
+    });
   }
-  Compiled { ops, advice_count: 1 }
+  Compiled {
+    ops,
+    advice_count: 1,
+  }
 }
 
 /// EQ: slot0 = (slot0 == slot1) ? 1 : 0.
 fn compile_eq() -> Compiled {
   let mut ops = Vec::with_capacity(LIMBS * 2 + 4);
   // XOR each limb pair; if equal, all XORs are zero.
-  ops.push(MicroOp::Xor32 { dst: scratch(0), a: limb(0, 0), b: limb(1, 0) });
+  ops.push(MicroOp::Xor128 {
+    dst: scratch(0),
+    a: limb(0, 0),
+    b: limb(1, 0),
+  });
   for i in 1..LIMBS {
-    ops.push(MicroOp::Xor32 { dst: scratch(1), a: limb(0, i), b: limb(1, i) });
+    ops.push(MicroOp::Xor128 {
+      dst: scratch(1),
+      a: limb(0, i),
+      b: limb(1, i),
+    });
     // scratch[0] |= scratch[1]
-    ops.push(MicroOp::And32 { dst: scratch(2), a: scratch(0), b: scratch(1) });
-    ops.push(MicroOp::Xor32 { dst: scratch(0), a: scratch(0), b: scratch(1) });
-    ops.push(MicroOp::Xor32 { dst: scratch(0), a: scratch(0), b: scratch(2) });
+    ops.push(MicroOp::And128 {
+      dst: scratch(2),
+      a: scratch(0),
+      b: scratch(1),
+    });
+    ops.push(MicroOp::Xor128 {
+      dst: scratch(0),
+      a: scratch(0),
+      b: scratch(1),
+    });
+    ops.push(MicroOp::Xor128 {
+      dst: scratch(0),
+      a: scratch(0),
+      b: scratch(2),
+    });
   }
   // scratch[0] == 0 iff equal.  Advice provides the boolean result.
   ops.push(MicroOp::AdviceLoad { dst: scratch(2) });
-  ops.push(MicroOp::RangeCheck { r: scratch(2), bits: 1 });
-  ops.push(MicroOp::Mov { dst: limb(0, 0), src: scratch(2) });
+  ops.push(MicroOp::RangeCheck {
+    r: scratch(2),
+    bits: 1,
+  });
+  ops.push(MicroOp::Mov {
+    dst: limb(0, 0),
+    src: scratch(2),
+  });
   for i in 1..LIMBS {
-    ops.push(MicroOp::Const { dst: limb(0, i), val: 0 });
+    ops.push(MicroOp::Const {
+      dst: limb(0, i),
+      val: 0,
+    });
   }
-  Compiled { ops, advice_count: 1 }
+  Compiled {
+    ops,
+    advice_count: 1,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -665,9 +871,15 @@ fn compile_eq() -> Compiled {
 /// PUSH0: push a zero U256 onto the stack.
 fn compile_push_zero() -> Compiled {
   let ops = (0..LIMBS)
-    .map(|i| MicroOp::Const { dst: limb(0, i), val: 0 })
+    .map(|i| MicroOp::Const {
+      dst: limb(0, i),
+      val: 0,
+    })
     .collect();
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -677,7 +889,10 @@ fn compile_push_zero() -> Compiled {
 /// KECCAK256: handled as a leaf sub-proof.  Cost: 0 AND in main circuit.
 fn compile_keccak() -> Compiled {
   Compiled {
-    ops: vec![MicroOp::KeccakLeaf { dst_commit: limb(0, 0), input: limb(0, 0) }],
+    ops: vec![MicroOp::KeccakLeaf {
+      dst_commit: limb(0, 0),
+      input: limb(0, 0),
+    }],
     advice_count: 0,
   }
 }
@@ -688,12 +903,15 @@ fn compile_keccak() -> Compiled {
 
 /// MLOAD: pop offset from slot0, load 32 bytes from memory → slot0.
 ///
-/// Uses limb 0 of slot0 as the byte offset (practical 4 GB limit).
-/// The `MLoad` micro-op reads 8 consecutive u32 words at `offset / 4`.
+/// Uses limb 0 of slot0 as the byte offset.
+/// The `MLoad` micro-op reads 2 consecutive u128 words at `offset / 16`.
 fn compile_mload() -> Compiled {
   // offset is already in slot0 limb 0.
   Compiled {
-    ops: vec![MicroOp::MLoad { dst: slot(0), offset_reg: limb(0, 0) }],
+    ops: vec![MicroOp::MLoad {
+      dst: slot(0),
+      offset_reg: limb(0, 0),
+    }],
     advice_count: 0,
   }
 }
@@ -701,7 +919,10 @@ fn compile_mload() -> Compiled {
 /// MSTORE: pop offset (slot0) and value (slot1), store 32 bytes to memory.
 fn compile_mstore() -> Compiled {
   Compiled {
-    ops: vec![MicroOp::MStore { offset_reg: limb(0, 0), src: slot(1) }],
+    ops: vec![MicroOp::MStore {
+      offset_reg: limb(0, 0),
+      src: slot(1),
+    }],
     advice_count: 0,
   }
 }
@@ -709,7 +930,10 @@ fn compile_mstore() -> Compiled {
 /// MSTORE8: pop offset (slot0) and value (slot1), store low byte to memory.
 fn compile_mstore8() -> Compiled {
   Compiled {
-    ops: vec![MicroOp::MStore8 { offset_reg: limb(0, 0), src: limb(1, 0) }],
+    ops: vec![MicroOp::MStore8 {
+      offset_reg: limb(0, 0),
+      src: limb(1, 0),
+    }],
     advice_count: 0,
   }
 }
@@ -721,7 +945,10 @@ fn compile_mstore8() -> Compiled {
 /// SLOAD: pop key (slot0), load value from storage → slot0.
 fn compile_sload() -> Compiled {
   Compiled {
-    ops: vec![MicroOp::SLoad { dst: slot(0), key_reg: slot(0) }],
+    ops: vec![MicroOp::SLoad {
+      dst: slot(0),
+      key_reg: slot(0),
+    }],
     advice_count: 0,
   }
 }
@@ -729,7 +956,10 @@ fn compile_sload() -> Compiled {
 /// SSTORE: pop key (slot0) and value (slot1), store to persistent storage.
 fn compile_sstore() -> Compiled {
   Compiled {
-    ops: vec![MicroOp::SStore { key_reg: slot(0), val_reg: slot(1) }],
+    ops: vec![MicroOp::SStore {
+      key_reg: slot(0),
+      val_reg: slot(1),
+    }],
     advice_count: 0,
   }
 }
@@ -743,18 +973,27 @@ fn compile_sstore() -> Compiled {
 /// `data` is big-endian (as in EVM bytecode).  The value is loaded into slot 0
 /// in little-endian limb order.
 pub fn compile_push(data: &[u8]) -> Compiled {
-  assert!(!data.is_empty() && data.len() <= 32, "PUSH data must be 1..32 bytes");
+  assert!(
+    !data.is_empty() && data.len() <= 32,
+    "PUSH data must be 1..32 bytes"
+  );
   // Pad to 32 bytes (big-endian, left-pad with zeros).
   let mut be = [0u8; 32];
   be[32 - data.len()..].copy_from_slice(data);
-  // Convert to 8 × u32 limbs (little-endian limb order: limb 0 = lowest).
+  // Convert to 2 × u128 limbs (little-endian limb order: limb 0 = lowest).
   let mut ops = Vec::with_capacity(LIMBS);
   for i in 0..LIMBS {
-    let offset = 28 - i * 4; // big-endian byte offset for limb i
-    let val = u32::from_be_bytes([be[offset], be[offset + 1], be[offset + 2], be[offset + 3]]);
-    ops.push(MicroOp::Const { dst: limb(0, i), val });
+    let offset = 16 - i * 16; // big-endian byte offset for limb i
+    let val = u128::from_be_bytes(be[offset..offset + 16].try_into().unwrap());
+    ops.push(MicroOp::Const {
+      dst: limb(0, i),
+      val,
+    });
   }
-  Compiled { ops, advice_count: 0 }
+  Compiled {
+    ops,
+    advice_count: 0,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -766,17 +1005,17 @@ mod tests {
   use super::*;
   use crate::{AdviceTape, Vm};
 
-  /// Helper: write a U256 (8 limbs, LE) into consecutive registers starting at `base`.
-  fn write_u256(vm: &mut Vm, base: Reg, limbs: [u32; 8]) {
+  /// Helper: write a U256 (2 limbs, LE) into consecutive registers starting at `base`.
+  fn write_u256(vm: &mut Vm, base: Reg, limbs: [u128; 2]) {
     for (i, &v) in limbs.iter().enumerate() {
       vm.regs.write(base + i as Reg, v);
     }
   }
 
   /// Helper: read a U256 from consecutive registers.
-  fn read_u256(vm: &Vm, base: Reg) -> [u32; 8] {
-    let mut out = [0u32; 8];
-    for i in 0..8 {
+  fn read_u256(vm: &Vm, base: Reg) -> [u128; 2] {
+    let mut out = [0u128; 2];
+    for i in 0..2 {
       out[i] = vm.regs.read(base + i as Reg);
     }
     out
@@ -786,68 +1025,64 @@ mod tests {
   fn compile_add_basic() {
     let c = compile(revm::bytecode::opcode::ADD).unwrap();
     assert_eq!(c.advice_count, 0);
-    assert_eq!(c.ops.len(), 8); // 8 limb additions
+    assert_eq!(c.ops.len(), LIMBS);
 
     let mut vm = Vm::new(AdviceTape::default());
-    // a = 1 (low limb)
-    write_u256(&mut vm, slot(0), [1, 0, 0, 0, 0, 0, 0, 0]);
-    // b = 2
-    write_u256(&mut vm, slot(1), [2, 0, 0, 0, 0, 0, 0, 0]);
+    write_u256(&mut vm, slot(0), [1, 0]);
+    write_u256(&mut vm, slot(1), [2, 0]);
     vm.run(&c.ops).unwrap();
     let result = read_u256(&vm, slot(0));
     assert_eq!(result[0], 3);
-    assert_eq!(result[1..], [0; 7]);
+    assert_eq!(result[1], 0);
   }
 
   #[test]
   fn compile_add_carry() {
     let c = compile(revm::bytecode::opcode::ADD).unwrap();
     let mut vm = Vm::new(AdviceTape::default());
-    // a = 0xFFFF_FFFF (limb 0)
-    write_u256(&mut vm, slot(0), [0xFFFF_FFFF, 0, 0, 0, 0, 0, 0, 0]);
+    // a = u128::MAX (limb 0)
+    write_u256(&mut vm, slot(0), [u128::MAX, 0]);
     // b = 1
-    write_u256(&mut vm, slot(1), [1, 0, 0, 0, 0, 0, 0, 0]);
+    write_u256(&mut vm, slot(1), [1, 0]);
     vm.run(&c.ops).unwrap();
     let result = read_u256(&vm, slot(0));
     assert_eq!(result[0], 0);
     assert_eq!(result[1], 1); // carry propagated
-    assert_eq!(result[2..], [0; 6]);
   }
 
   #[test]
   fn compile_sub_basic() {
     let c = compile(revm::bytecode::opcode::SUB).unwrap();
     let mut vm = Vm::new(AdviceTape::default());
-    write_u256(&mut vm, slot(0), [5, 0, 0, 0, 0, 0, 0, 0]);
-    write_u256(&mut vm, slot(1), [3, 0, 0, 0, 0, 0, 0, 0]);
+    write_u256(&mut vm, slot(0), [5, 0]);
+    write_u256(&mut vm, slot(1), [3, 0]);
     vm.run(&c.ops).unwrap();
     let result = read_u256(&vm, slot(0));
     assert_eq!(result[0], 2);
-    assert_eq!(result[1..], [0; 7]);
+    assert_eq!(result[1], 0);
   }
 
   #[test]
   fn compile_sub_borrow() {
     let c = compile(revm::bytecode::opcode::SUB).unwrap();
     let mut vm = Vm::new(AdviceTape::default());
-    // a = 0x1_0000_0000 (limbs: [0, 1, 0, ...])
-    write_u256(&mut vm, slot(0), [0, 1, 0, 0, 0, 0, 0, 0]);
+    // a = 1 << 128 (limbs: [0, 1])
+    write_u256(&mut vm, slot(0), [0, 1]);
     // b = 1
-    write_u256(&mut vm, slot(1), [1, 0, 0, 0, 0, 0, 0, 0]);
+    write_u256(&mut vm, slot(1), [1, 0]);
     vm.run(&c.ops).unwrap();
     let result = read_u256(&vm, slot(0));
-    assert_eq!(result[0], 0xFFFF_FFFF);
+    assert_eq!(result[0], u128::MAX);
     assert_eq!(result[1], 0);
-    assert_eq!(result[2..], [0; 6]);
   }
 
   #[test]
   fn compile_bitwise_and_basic() {
     let c = compile(revm::bytecode::opcode::AND).unwrap();
-    assert_eq!(c.ops.len(), 8);
+    assert_eq!(c.ops.len(), LIMBS);
     let mut vm = Vm::new(AdviceTape::default());
-    write_u256(&mut vm, slot(0), [0xFF00, 0, 0, 0, 0, 0, 0, 0]);
-    write_u256(&mut vm, slot(1), [0x0FF0, 0, 0, 0, 0, 0, 0, 0]);
+    write_u256(&mut vm, slot(0), [0xFF00, 0]);
+    write_u256(&mut vm, slot(1), [0x0FF0, 0]);
     vm.run(&c.ops).unwrap();
     assert_eq!(read_u256(&vm, slot(0))[0], 0x0F00);
   }
@@ -856,8 +1091,8 @@ mod tests {
   fn compile_bitwise_xor_basic() {
     let c = compile(revm::bytecode::opcode::XOR).unwrap();
     let mut vm = Vm::new(AdviceTape::default());
-    write_u256(&mut vm, slot(0), [0xFF00, 0, 0, 0, 0, 0, 0, 0]);
-    write_u256(&mut vm, slot(1), [0x0FF0, 0, 0, 0, 0, 0, 0, 0]);
+    write_u256(&mut vm, slot(0), [0xFF00, 0]);
+    write_u256(&mut vm, slot(1), [0x0FF0, 0]);
     vm.run(&c.ops).unwrap();
     assert_eq!(read_u256(&vm, slot(0))[0], 0xF0F0);
   }
@@ -866,8 +1101,8 @@ mod tests {
   fn compile_bitwise_or_basic() {
     let c = compile(revm::bytecode::opcode::OR).unwrap();
     let mut vm = Vm::new(AdviceTape::default());
-    write_u256(&mut vm, slot(0), [0xFF00, 0, 0, 0, 0, 0, 0, 0]);
-    write_u256(&mut vm, slot(1), [0x0FF0, 0, 0, 0, 0, 0, 0, 0]);
+    write_u256(&mut vm, slot(0), [0xFF00, 0]);
+    write_u256(&mut vm, slot(1), [0x0FF0, 0]);
     vm.run(&c.ops).unwrap();
     assert_eq!(read_u256(&vm, slot(0))[0], 0xFFF0);
   }
@@ -876,30 +1111,30 @@ mod tests {
   fn compile_bitwise_not_basic() {
     let c = compile(revm::bytecode::opcode::NOT).unwrap();
     let mut vm = Vm::new(AdviceTape::default());
-    write_u256(&mut vm, slot(0), [0, 0, 0, 0, 0, 0, 0, 0]);
+    write_u256(&mut vm, slot(0), [0, 0]);
     vm.run(&c.ops).unwrap();
     let result = read_u256(&vm, slot(0));
-    assert!(result.iter().all(|&v| v == 0xFFFF_FFFF));
+    assert!(result.iter().all(|&v| v == u128::MAX));
   }
 
   #[test]
   fn compile_push_zero_works() {
     let c = compile(revm::bytecode::opcode::PUSH0).unwrap();
     let mut vm = Vm::new(AdviceTape::default());
-    write_u256(&mut vm, slot(0), [1, 2, 3, 4, 5, 6, 7, 8]);
+    write_u256(&mut vm, slot(0), [1, 2]);
     vm.run(&c.ops).unwrap();
-    assert_eq!(read_u256(&vm, slot(0)), [0; 8]);
+    assert_eq!(read_u256(&vm, slot(0)), [0; 2]);
   }
 
   #[test]
   fn compile_push_data() {
-    // PUSH1 0xFF → [0xFF, 0, 0, …]
+    // PUSH1 0xFF → [0xFF, 0]
     let c = compile_push(&[0xFF]);
     let mut vm = Vm::new(AdviceTape::default());
     vm.run(&c.ops).unwrap();
     let r = read_u256(&vm, slot(0));
     assert_eq!(r[0], 0xFF);
-    assert_eq!(r[1..], [0; 7]);
+    assert_eq!(r[1], 0);
   }
 
   #[test]
@@ -910,10 +1145,10 @@ mod tests {
     let mut vm = Vm::new(AdviceTape::default());
     vm.run(&c.ops).unwrap();
     let r = read_u256(&vm, slot(0));
-    // limb 0 = lowest 4 bytes (big-endian bytes 28..32): 0x1D1E1F20
-    assert_eq!(r[0], 0x1D1E1F20);
-    // limb 7 = highest 4 bytes (big-endian bytes 0..4): 0x01020304
-    assert_eq!(r[7], 0x01020304);
+    // limb 0 = lowest 16 bytes (big-endian bytes 16..32): 0x1112...1F20
+    assert_eq!(r[0], 0x1112131415161718191A1B1C1D1E1F20);
+    // limb 1 = highest 16 bytes (big-endian bytes 0..16): 0x0102...0F10
+    assert_eq!(r[1], 0x0102030405060708090A0B0C0D0E0F10);
   }
 
   #[test]
@@ -995,23 +1230,22 @@ mod tests {
     use revm::bytecode::opcode::*;
     let c = compile(LT).unwrap();
     assert_eq!(c.advice_count, 1);
-    // Simulate: a=5, b=10 → LT → 1
-    let mut vm = Vm::new(AdviceTape::new([1u32]));
-    write_u256(&mut vm, slot(0), [5, 0, 0, 0, 0, 0, 0, 0]);
-    write_u256(&mut vm, slot(1), [10, 0, 0, 0, 0, 0, 0, 0]);
+    let mut vm = Vm::new(AdviceTape::new([1u128]));
+    write_u256(&mut vm, slot(0), [5, 0]);
+    write_u256(&mut vm, slot(1), [10, 0]);
     vm.run(&c.ops).unwrap();
     let r = read_u256(&vm, slot(0));
     assert_eq!(r[0], 1);
-    assert_eq!(r[1..], [0; 7]);
+    assert_eq!(r[1], 0);
   }
 
   #[test]
   fn compile_gt_advice_bool() {
     use revm::bytecode::opcode::*;
     let c = compile(GT).unwrap();
-    let mut vm = Vm::new(AdviceTape::new([0u32])); // 5 > 10 = false
-    write_u256(&mut vm, slot(0), [5, 0, 0, 0, 0, 0, 0, 0]);
-    write_u256(&mut vm, slot(1), [10, 0, 0, 0, 0, 0, 0, 0]);
+    let mut vm = Vm::new(AdviceTape::new([0u128]));
+    write_u256(&mut vm, slot(0), [5, 0]);
+    write_u256(&mut vm, slot(1), [10, 0]);
     vm.run(&c.ops).unwrap();
     assert_eq!(read_u256(&vm, slot(0))[0], 0);
   }
@@ -1028,14 +1262,13 @@ mod tests {
     use revm::bytecode::opcode::*;
     let c = compile(BYTE).unwrap();
     assert_eq!(c.advice_count, 1);
-    // BYTE(31, 0x1234) → 0x34 (least significant byte)
-    let mut vm = Vm::new(AdviceTape::new([0x34u32]));
-    write_u256(&mut vm, slot(0), [31, 0, 0, 0, 0, 0, 0, 0]);
-    write_u256(&mut vm, slot(1), [0x1234, 0, 0, 0, 0, 0, 0, 0]);
+    let mut vm = Vm::new(AdviceTape::new([0x34u128]));
+    write_u256(&mut vm, slot(0), [31, 0]);
+    write_u256(&mut vm, slot(1), [0x1234, 0]);
     vm.run(&c.ops).unwrap();
     let r = read_u256(&vm, slot(0));
     assert_eq!(r[0], 0x34);
-    assert_eq!(r[1..], [0; 7]);
+    assert_eq!(r[1], 0);
   }
 
   #[test]
@@ -1043,10 +1276,9 @@ mod tests {
     use revm::bytecode::opcode::*;
     let c = compile(SHL).unwrap();
     assert_eq!(c.advice_count, LIMBS);
-    // SHL(4, 0xFF) → 0xFF0
-    let mut vm = Vm::new(AdviceTape::new([0xFF0, 0, 0, 0, 0, 0, 0, 0]));
-    write_u256(&mut vm, slot(0), [4, 0, 0, 0, 0, 0, 0, 0]);
-    write_u256(&mut vm, slot(1), [0xFF, 0, 0, 0, 0, 0, 0, 0]);
+    let mut vm = Vm::new(AdviceTape::new([0xFF0u128, 0]));
+    write_u256(&mut vm, slot(0), [4, 0]);
+    write_u256(&mut vm, slot(1), [0xFF, 0]);
     vm.run(&c.ops).unwrap();
     assert_eq!(read_u256(&vm, slot(0))[0], 0xFF0);
   }
@@ -1056,8 +1288,7 @@ mod tests {
     use revm::bytecode::opcode::*;
     let c = compile(SHR).unwrap();
     assert_eq!(c.advice_count, LIMBS);
-    // SHR(4, 0xFF0) → 0xFF
-    let mut vm = Vm::new(AdviceTape::new([0xFF, 0, 0, 0, 0, 0, 0, 0]));
+    let mut vm = Vm::new(AdviceTape::new([0xFFu128, 0]));
     vm.run(&c.ops).unwrap();
     assert_eq!(read_u256(&vm, slot(0))[0], 0xFF);
   }
@@ -1083,12 +1314,12 @@ mod tests {
   fn compile_dup2_copies_slot1() {
     use revm::bytecode::opcode::*;
     let c = compile(DUP2).unwrap();
-    assert_eq!(c.ops.len(), LIMBS); // 8 Mov ops
+    assert_eq!(c.ops.len(), LIMBS);
     let mut vm = Vm::new(AdviceTape::default());
-    write_u256(&mut vm, slot(0), [0xAA; 8]);
-    write_u256(&mut vm, slot(1), [0xBB, 0xCC, 0xDD, 0xEE, 0x11, 0x22, 0x33, 0x44]);
+    write_u256(&mut vm, slot(0), [0xAA; 2]);
+    write_u256(&mut vm, slot(1), [0xBB, 0xCC]);
     vm.run(&c.ops).unwrap();
-    assert_eq!(read_u256(&vm, slot(0)), [0xBB, 0xCC, 0xDD, 0xEE, 0x11, 0x22, 0x33, 0x44]);
+    assert_eq!(read_u256(&vm, slot(0)), [0xBB, 0xCC]);
   }
 
   #[test]
@@ -1098,7 +1329,7 @@ mod tests {
       let c = compile(op).unwrap();
       assert_eq!(c.ops.len(), LIMBS, "DUP{}", op - DUP1 + 1);
       let mut vm = Vm::new(AdviceTape::default());
-      let src_val = [42u32; 8];
+      let src_val = [42u128; 2];
       write_u256(&mut vm, slot(expected_src), src_val);
       vm.run(&c.ops).unwrap();
       assert_eq!(read_u256(&vm, slot(0)), src_val, "DUP{}", op - DUP1 + 1);
@@ -1108,12 +1339,11 @@ mod tests {
   #[test]
   fn compile_dup6_to_dup16_use_slot1() {
     use revm::bytecode::opcode::*;
-    // DUP6+ always read from slot 1 (caller pre-loads the source)
     for op in DUP6..=DUP16 {
       let c = compile(op).unwrap();
       assert_eq!(c.ops.len(), LIMBS, "DUP{}", op - DUP1 + 1);
       let mut vm = Vm::new(AdviceTape::default());
-      let src_val = [(op - DUP1) as u32 + 100; 8];
+      let src_val = [(op - DUP1) as u128 + 100; 2];
       write_u256(&mut vm, slot(1), src_val);
       vm.run(&c.ops).unwrap();
       assert_eq!(read_u256(&vm, slot(0)), src_val, "DUP{}", op - DUP1 + 1);
@@ -1124,10 +1354,10 @@ mod tests {
   fn compile_swap1_swaps_slots() {
     use revm::bytecode::opcode::*;
     let c = compile(SWAP1).unwrap();
-    assert_eq!(c.ops.len(), LIMBS * 3); // 8 × (save, move, restore)
+    assert_eq!(c.ops.len(), LIMBS * 3);
     let mut vm = Vm::new(AdviceTape::default());
-    let a = [1, 2, 3, 4, 5, 6, 7, 8];
-    let b = [10, 20, 30, 40, 50, 60, 70, 80];
+    let a: [u128; 2] = [1, 2];
+    let b: [u128; 2] = [10, 20];
     write_u256(&mut vm, slot(0), a);
     write_u256(&mut vm, slot(1), b);
     vm.run(&c.ops).unwrap();
@@ -1171,17 +1401,38 @@ mod tests {
   fn compile_env_opcodes_are_advice_u256() {
     use revm::bytecode::opcode::*;
     let env_ops = [
-      ADDRESS, BALANCE, ORIGIN, CALLER, CALLVALUE,
-      CALLDATALOAD, CALLDATASIZE, CODESIZE, GASPRICE,
-      EXTCODESIZE, EXTCODEHASH, RETURNDATASIZE,
-      BLOCKHASH, COINBASE, TIMESTAMP, NUMBER,
-      DIFFICULTY, GASLIMIT, CHAINID, SELFBALANCE,
-      BASEFEE, BLOBHASH, BLOBBASEFEE, PC, MSIZE, GAS, CLZ,
+      ADDRESS,
+      BALANCE,
+      ORIGIN,
+      CALLER,
+      CALLVALUE,
+      CALLDATALOAD,
+      CALLDATASIZE,
+      CODESIZE,
+      GASPRICE,
+      EXTCODESIZE,
+      EXTCODEHASH,
+      RETURNDATASIZE,
+      BLOCKHASH,
+      COINBASE,
+      TIMESTAMP,
+      NUMBER,
+      DIFFICULTY,
+      GASLIMIT,
+      CHAINID,
+      SELFBALANCE,
+      BASEFEE,
+      BLOBHASH,
+      BLOBBASEFEE,
+      PC,
+      MSIZE,
+      GAS,
+      CLZ,
     ];
     for op in env_ops {
       let c = compile(op).unwrap();
       assert_eq!(c.advice_count, LIMBS, "opcode 0x{op:02x}");
-      assert_eq!(c.ops.len(), LIMBS * 2, "opcode 0x{op:02x}"); // 8 load + 8 mov
+      assert_eq!(c.ops.len(), LIMBS * 2, "opcode 0x{op:02x}"); // load + mov
     }
   }
 
@@ -1237,9 +1488,8 @@ mod tests {
     let load_c = compile(revm::bytecode::opcode::TLOAD).unwrap();
 
     let mut vm = Vm::new(AdviceTape::default());
-    // Key = slot0, value = slot1
-    let key = [1, 0, 0, 0, 0, 0, 0, 0];
-    let val = [42, 99, 7, 0, 0, 0, 0, 0];
+    let key: [u128; 2] = [1, 0];
+    let val: [u128; 2] = [42, 99];
     write_u256(&mut vm, slot(0), key);
     write_u256(&mut vm, slot(1), val);
     vm.run(&store_c.ops).unwrap();
@@ -1269,7 +1519,10 @@ mod tests {
     assert!(
       unsupported.is_empty(),
       "unsupported opcodes: {:?}",
-      unsupported.iter().map(|o| format!("0x{o:02x}")).collect::<Vec<_>>()
+      unsupported
+        .iter()
+        .map(|o| format!("0x{o:02x}"))
+        .collect::<Vec<_>>()
     );
   }
 }

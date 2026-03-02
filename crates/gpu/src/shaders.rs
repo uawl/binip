@@ -12,5 +12,5 @@ pub const GF128_WGSL: &str = include_str!("shaders/gf128.wgsl");
 
 /// Concatenate the shared GF(2^128) arithmetic with a kernel-specific WGSL source.
 pub fn shader_with_gf128(kernel_src: &str) -> String {
-    format!("{}\n\n{}", GF128_WGSL, kernel_src)
+  format!("{}\n\n{}", GF128_WGSL, kernel_src)
 }

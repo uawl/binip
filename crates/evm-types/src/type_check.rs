@@ -43,23 +43,11 @@ pub enum TypeError {
   )]
   BranchTypeMismatch { taken: usize, not_taken: usize },
 
-  #[error(
-    "memory shrank: opcode 0x{opcode:02x} post memory_size {post} < pre memory_size {pre}"
-  )]
-  MemoryShrink {
-    opcode: u8,
-    pre: usize,
-    post: usize,
-  },
+  #[error("memory shrank: opcode 0x{opcode:02x} post memory_size {post} < pre memory_size {pre}")]
+  MemoryShrink { opcode: u8, pre: usize, post: usize },
 
-  #[error(
-    "storage touched count decreased: opcode 0x{opcode:02x} post {post} < pre {pre}"
-  )]
-  StorageShrink {
-    opcode: u8,
-    pre: usize,
-    post: usize,
-  },
+  #[error("storage touched count decreased: opcode 0x{opcode:02x} post {post} < pre {pre}")]
+  StorageShrink { opcode: u8, pre: usize, post: usize },
 
   #[error(
     "invalid jump destination: opcode 0x{opcode:02x} target pc={target} not in jumpdest table"
@@ -147,10 +135,7 @@ pub fn type_check(node: &ProofNode) -> Result<(EvmStateType, EvmStateType), Type
         // post_state.pc must be in the jumpdest table
         let target = post_state.pc;
         if !pre_state.jumpdest_table.contains(&target) {
-          return Err(TypeError::InvalidJumpDest {
-            opcode: op,
-            target,
-          });
+          return Err(TypeError::InvalidJumpDest { opcode: op, target });
         }
       }
 
@@ -220,8 +205,13 @@ pub fn build_cert(node: &ProofNode) -> Result<TypeCert, TypeError> {
   let shape = shape_bytes(node);
   let root_hash: [u8; 32] = blake3::hash(&shape).into();
 
+  // Hash the concrete state values (stack, gas, memory sizes, storage).
+  let state = state_bytes(node);
+  let state_hash: [u8; 32] = blake3::hash(&state).into();
+
   Ok(TypeCert {
     root_hash,
+    state_hash,
     leaf_count: node.leaf_count(),
   })
 }
@@ -267,5 +257,84 @@ fn write_shape(node: &ProofNode, buf: &mut Vec<u8>) {
       write_shape(taken, buf);
       write_shape(not_taken, buf);
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State value commitment
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Serialise the concrete EVM state values from every `Leaf` in the tree.
+///
+/// Unlike [`shape_bytes`] (which only includes sizes/PCs), this captures the
+/// actual U256 stack items, gas budget, memory size, and touched storage
+/// keys+values.  The resulting hash binds the prover's witness so the
+/// verifier can authenticate native consistency checks.
+fn state_bytes(node: &ProofNode) -> Vec<u8> {
+  let mut buf = Vec::new();
+  write_state(node, &mut buf);
+  buf
+}
+
+fn write_state(node: &ProofNode, buf: &mut Vec<u8>) {
+  match node {
+    ProofNode::Leaf {
+      opcode,
+      pre_state,
+      post_state,
+      ..
+    } => {
+      buf.push(0x00); // tag: Leaf
+      buf.push(*opcode);
+      write_evm_state(pre_state, buf);
+      write_evm_state(post_state, buf);
+    }
+    ProofNode::Seq { left, right } => {
+      buf.push(0x01);
+      write_state(left, buf);
+      write_state(right, buf);
+    }
+    ProofNode::Branch {
+      cond,
+      taken,
+      not_taken,
+    } => {
+      buf.push(0x02);
+      write_state(cond, buf);
+      write_state(taken, buf);
+      write_state(not_taken, buf);
+    }
+  }
+}
+
+/// Serialise a single [`EvmState`] — stack values, gas, memory size, storage.
+fn write_evm_state(state: &crate::state::EvmState, buf: &mut Vec<u8>) {
+  // Program counter
+  buf.extend_from_slice(&state.pc.to_le_bytes());
+  // Gas
+  buf.extend_from_slice(&state.gas.to_le_bytes());
+  // Stack depth + values
+  buf.extend_from_slice(&(state.stack.len() as u32).to_le_bytes());
+  for val in &state.stack {
+    buf.extend_from_slice(&val.to_le_bytes::<32>());
+  }
+  // Memory size (content is not hashed — too large; size is sufficient
+  // when combined with memory-consistency arguments in the circuit).
+  buf.extend_from_slice(&(state.memory.len() as u32).to_le_bytes());
+  // Storage key-value pairs (sorted for determinism)
+  let mut stor: Vec<_> = state.storage.iter().collect();
+  stor.sort_by_key(|(k, _)| *k);
+  buf.extend_from_slice(&(stor.len() as u32).to_le_bytes());
+  for (k, v) in &stor {
+    buf.extend_from_slice(&k.to_le_bytes::<32>());
+    buf.extend_from_slice(&v.to_le_bytes::<32>());
+  }
+  // Transient storage (sorted)
+  let mut tstor: Vec<_> = state.transient_storage.iter().collect();
+  tstor.sort_by_key(|(k, _)| *k);
+  buf.extend_from_slice(&(tstor.len() as u32).to_le_bytes());
+  for (k, v) in &tstor {
+    buf.extend_from_slice(&k.to_le_bytes::<32>());
+    buf.extend_from_slice(&v.to_le_bytes::<32>());
   }
 }

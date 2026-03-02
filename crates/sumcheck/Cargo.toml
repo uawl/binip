@@ -7,9 +7,3 @@ edition = "2024"
 field      = { path = "../field" }
 poly       = { path = "../poly" }
 transcript = { path = "../transcript" }
-gpu        = { path = "../gpu" }
-bytemuck   = { workspace = true }
-wgpu       = { workspace = true }
-
-[dev-dependencies]
-pollster   = { workspace = true }

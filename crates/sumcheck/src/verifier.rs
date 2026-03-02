@@ -28,36 +28,36 @@ use crate::proof::SumcheckProof;
 /// Returns `Some(challenges)` on success, `None` on failure.
 /// `challenges[0]` is the challenge for the first round (highest variable index).
 pub fn verify<T: Transcript>(
-    proof: &SumcheckProof,
-    oracle_eval: GF2_128,
-    transcript: &mut T,
+  proof: &SumcheckProof,
+  oracle_eval: GF2_128,
+  transcript: &mut T,
 ) -> Option<Vec<GF2_128>> {
-    transcript.absorb_field(proof.claimed_sum);
+  transcript.absorb_field(proof.claimed_sum);
 
-    let mut prev_claim = proof.claimed_sum;
-    let mut challenges = Vec::with_capacity(proof.round_polys.len());
+  let mut prev_claim = proof.claimed_sum;
+  let mut challenges = Vec::with_capacity(proof.round_polys.len());
 
-    for rp in &proof.round_polys {
-        // Consistency check: g_i(0) + g_i(1) == prev_claim
-        if rp.0[0] + rp.0[1] != prev_claim {
-            return None;
-        }
-
-        transcript.absorb_field(rp.0[0]);
-        transcript.absorb_field(rp.0[1]);
-        transcript.absorb_field(rp.0[2]);
-
-        let r = transcript.squeeze_challenge();
-        challenges.push(r);
-
-        // New claim: g_i(r)  — degree-1 interpolation for MLE variables
-        prev_claim = rp.eval(r);
+  for rp in &proof.round_polys {
+    // Consistency check: g_i(0) + g_i(1) == prev_claim
+    if rp.0[0] + rp.0[1] != prev_claim {
+      return None;
     }
 
-    // Final oracle check
-    if prev_claim != oracle_eval {
-        return None;
-    }
+    transcript.absorb_field(rp.0[0]);
+    transcript.absorb_field(rp.0[1]);
+    transcript.absorb_field(rp.0[2]);
 
-    Some(challenges)
+    let r = transcript.squeeze_challenge();
+    challenges.push(r);
+
+    // New claim: g_i(r)  — degree-1 interpolation for MLE variables
+    prev_claim = rp.eval(r);
+  }
+
+  // Final oracle check
+  if prev_claim != oracle_eval {
+    return None;
+  }
+
+  Some(challenges)
 }

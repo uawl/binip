@@ -11,6 +11,8 @@
 //! 7. Assemble into a [`Proof`].
 
 use circuit::TraceTable;
+use circuit::lookup;
+use circuit::state_constraint::{BoundaryTraceTable, extract_boundaries};
 use evm_types::{ProofNode, TypeCert, build_cert};
 use field::{FieldElem, GF2_128};
 use poly::MlePoly;
@@ -41,19 +43,20 @@ pub enum ProveError {
 struct Prepared {
   type_cert: TypeCert,
   beta: GF2_128,
+  gamma: GF2_128,
   blinded_mle: MlePoly,
   constraint_sum: GF2_128,
+  boundary_constraint_sum: GF2_128,
+  reconstruction_sum: GF2_128,
+  lookup_proofs: lookup::LookupProofs,
+  lookup_witness: lookup::LookupWitness,
   batch_commit: pcs::Commitment,
   pcs_state: pcs::PcsState,
   transcript: Blake3Transcript,
 }
 
 /// Steps 1–3: type-check, encode, blind, PCS commit.
-fn prepare(
-  rows: &[Row],
-  tree: &ProofNode,
-  params: &StarkParams,
-) -> Result<Prepared, ProveError> {
+fn prepare(rows: &[Row], tree: &ProofNode, params: &StarkParams) -> Result<Prepared, ProveError> {
   if rows.is_empty() {
     return Err(ProveError::EmptyTrace);
   }
@@ -64,29 +67,57 @@ fn prepare(
   // 2. Encode trace → constraint MLE
   let mut transcript = Blake3Transcript::new();
   transcript.absorb_bytes(&type_cert.root_hash);
+  transcript.absorb_bytes(&type_cert.state_hash);
   let beta: GF2_128 = transcript.squeeze_challenge();
 
   let table = TraceTable::from_rows(rows);
   let constraint_mle: MlePoly = table.constraint_mle(beta)?;
   let constraint_sum = constraint_mle.sum();
 
-  // 2b. ZK blinding
+  // 2a. Boundary constraint MLE (state continuity at Seq junctions)
+  let boundary_rows = extract_boundaries(tree);
+  let boundary_table = BoundaryTraceTable::from_rows(&boundary_rows);
+  let boundary_mle = boundary_table.constraint_mle(beta);
+  let boundary_constraint_sum = boundary_mle.sum();
+
+  // 2b. Reconstruction constraint (STARK ↔ LUT binding)
+  let gamma: GF2_128 = transcript.squeeze_challenge();
+  let reconstruction_mle = table.reconstruction_mle(gamma)?;
+  let reconstruction_sum = reconstruction_mle.sum();
+
+  // 2c. Lookup proofs (byte-level LUT arguments)
+  let mut lookup_witness = lookup::collect_witnesses(rows);
+  let mut lookup_transcript = transcript.clone();
+  let lookup_proofs = lookup::prove_lookups_par(&mut lookup_witness, &mut lookup_transcript);
+
+  // 2d. ZK blinding
   let blinded_mle = constraint_mle.blind(&mut rng());
 
   // 3. PCS commit
   let (batch_commit, pcs_state) =
     pcs::commit(&blinded_mle.evals, &params.pcs_params, &mut transcript);
 
-  Ok(Prepared { type_cert, beta, blinded_mle, constraint_sum, batch_commit, pcs_state, transcript })
+  Ok(Prepared {
+    type_cert,
+    beta,
+    gamma,
+    blinded_mle,
+    constraint_sum,
+    boundary_constraint_sum,
+    reconstruction_sum,
+    lookup_proofs,
+    lookup_witness,
+    batch_commit,
+    pcs_state,
+    transcript,
+  })
 }
 
-/// Steps 1–3 (GPU): type-check, encode, blind, GPU PCS commit.
-fn prepare_gpu(
+/// Steps 1–3 (parallel CPU): type-check, encode ∥, blind ∥, PCS commit ∥.
+fn prepare_par(
   rows: &[Row],
   tree: &ProofNode,
   params: &StarkParams,
-  ctx: &gpu::GpuContext,
-  cache: &mut gpu::PipelineCache,
 ) -> Result<Prepared, ProveError> {
   if rows.is_empty() {
     return Err(ProveError::EmptyTrace);
@@ -95,23 +126,53 @@ fn prepare_gpu(
   // 1. Type-check the Proof Tree
   let type_cert: TypeCert = build_cert(tree)?;
 
-  // 2. Encode trace → constraint MLE
+  // 2. Encode trace → constraint MLE (rayon parallel rows)
   let mut transcript = Blake3Transcript::new();
   transcript.absorb_bytes(&type_cert.root_hash);
+  transcript.absorb_bytes(&type_cert.state_hash);
   let beta: GF2_128 = transcript.squeeze_challenge();
 
-  let table = TraceTable::from_rows(rows);
-  let constraint_mle: MlePoly = table.constraint_mle(beta)?;
+  let table = TraceTable::from_rows_par(rows);
+  let constraint_mle: MlePoly = table.constraint_mle_par(beta)?;
   let constraint_sum = constraint_mle.sum();
 
-  // 2b. ZK blinding
-  let blinded_mle = constraint_mle.blind(&mut rng());
+  // 2a. Boundary constraint MLE (state continuity at Seq junctions)
+  let boundary_rows = extract_boundaries(tree);
+  let boundary_table = BoundaryTraceTable::from_rows(&boundary_rows);
+  let boundary_mle = boundary_table.constraint_mle(beta);
+  let boundary_constraint_sum = boundary_mle.sum();
 
-  // 3. PCS commit (GPU row encoding)
+  // 2b. Reconstruction constraint (STARK ↔ LUT binding)
+  let gamma: GF2_128 = transcript.squeeze_challenge();
+  let reconstruction_mle = table.reconstruction_mle_par(gamma)?;
+  let reconstruction_sum = reconstruction_mle.sum();
+
+  // 2c. Lookup proofs (byte-level LUT arguments)
+  let mut lookup_witness = lookup::collect_witnesses_par(rows);
+  let mut lookup_transcript = transcript.clone();
+  let lookup_proofs = lookup::prove_lookups_par(&mut lookup_witness, &mut lookup_transcript);
+
+  // 2d. ZK blinding (rayon parallel pointwise)
+  let blinded_mle = constraint_mle.blind_par(&mut rng());
+
+  // 3. PCS commit (rayon parallel row encoding + leaf hashing)
   let (batch_commit, pcs_state) =
-    pcs::commit_gpu(&blinded_mle.evals, &params.pcs_params, &mut transcript, ctx, cache);
+    pcs::commit_par(&blinded_mle.evals, &params.pcs_params, &mut transcript);
 
-  Ok(Prepared { type_cert, beta, blinded_mle, constraint_sum, batch_commit, pcs_state, transcript })
+  Ok(Prepared {
+    type_cert,
+    beta,
+    gamma,
+    blinded_mle,
+    constraint_sum,
+    boundary_constraint_sum,
+    reconstruction_sum,
+    lookup_proofs,
+    lookup_witness,
+    batch_commit,
+    pcs_state,
+    transcript,
+  })
 }
 
 /// Steps 5–7: recursive aggregation, PCS open, assemble proof.
@@ -121,15 +182,31 @@ fn assemble(
   params: &StarkParams,
   shard_transcript: Blake3Transcript,
 ) -> Result<Proof, ProveError> {
-  let Prepared { type_cert, beta, blinded_mle: _, constraint_sum,
-                 batch_commit, pcs_state, mut transcript } = prep;
+  let Prepared {
+    type_cert,
+    beta,
+    gamma,
+    blinded_mle: _,
+    constraint_sum,
+    boundary_constraint_sum,
+    reconstruction_sum,
+    lookup_proofs,
+    lookup_witness,
+    batch_commit,
+    pcs_state,
+    mut transcript,
+  } = prep;
 
   // 5. Recursive aggregation
-  let recursive_proof =
-    recursive::prove_recursive(&shard_batch, &params.config, &shard_transcript);
+  let recursive_proof = recursive::prove_recursive(&shard_batch, &params.config, &shard_transcript);
 
   // 6. PCS open
-  let open_point = derive_open_point(&shard_batch, &recursive_proof, &params.config, &shard_transcript);
+  let open_point = derive_open_point(
+    &shard_batch,
+    &recursive_proof,
+    &params.config,
+    &shard_transcript,
+  );
   let (open_eval, pcs_open) = pcs::open(&pcs_state, &open_point, &mut transcript);
 
   // 7. Assemble
@@ -138,41 +215,11 @@ fn assemble(
     batch_commit,
     beta,
     constraint_sum,
-    shard_batch,
-    recursive_proof,
-    pcs_open,
-    open_point,
-    open_eval,
-    config: params.config.clone(),
-  })
-}
-
-/// Steps 5–7 (GPU): GPU recursive aggregation, GPU PCS open, assemble proof.
-fn assemble_gpu(
-  prep: Prepared,
-  shard_batch: shard::ShardProofBatch,
-  params: &StarkParams,
-  shard_transcript: Blake3Transcript,
-  ctx: &gpu::GpuContext,
-  cache: &mut gpu::PipelineCache,
-) -> Result<Proof, ProveError> {
-  let Prepared { type_cert, beta, blinded_mle: _, constraint_sum,
-                 batch_commit, pcs_state, mut transcript } = prep;
-
-  // 5. Recursive aggregation (GPU)
-  let recursive_proof =
-    recursive::prove_recursive_gpu(&shard_batch, &params.config, &shard_transcript, ctx, cache);
-
-  // 6. PCS open (GPU)
-  let open_point = derive_open_point(&shard_batch, &recursive_proof, &params.config, &shard_transcript);
-  let (open_eval, pcs_open) = pcs::open_gpu(&pcs_state, &open_point, &mut transcript, ctx, cache);
-
-  // 7. Assemble
-  Ok(Proof {
-    type_cert,
-    batch_commit,
-    beta,
-    constraint_sum,
+    boundary_constraint_sum,
+    gamma,
+    reconstruction_sum,
+    lookup_proofs,
+    lookup_witness,
     shard_batch,
     recursive_proof,
     pcs_open,
@@ -207,36 +254,95 @@ pub fn prove_cpu(
   assemble(prep, shard_batch, params, shard_transcript)
 }
 
-/// Generate a full ZK-STARK proof using the **GPU** shard prover.
+/// Generate a full ZK-STARK proof using **parallel CPU** proving.
 ///
-/// Dispatches all shards to the GPU in parallel.  Falls back gracefully
-/// if the GPU is unavailable (caller should handle [`ProveError`]).
+/// Every phase is parallelised via rayon:
+///
+/// ```text
+///   prepare_par (constraint_mle ∥, blind ∥, PCS commit ∥)
+///       │
+///       ▼
+///   ┌─ shard_0 ─┐
+///   ├─ shard_1 ──┤  ← rayon par_iter (no split_mle copy)
+///   ├─ ...      ─┤
+///   └─ shard_N ──┘
+///       │
+///       ▼
+///   recursive DAG — each node starts as soon as its
+///   children complete (no level-wide barrier)
+///       │
+///       ▼
+///   derive_open_point → PCS open → assemble (sequential)
+/// ```
 ///
 /// # Arguments
 ///
 /// * `rows`   – the execution trace (one [`Row`] per micro-op step).
 /// * `tree`   – the structural Proof Tree for the EVM execution.
 /// * `params` – tuning knobs (shard/recursion config, PCS queries).
-/// * `ctx`    – pre-initialised GPU context.
-/// * `cache`  – pipeline cache (reuse across calls for best perf).
-pub fn prove_gpu(
+pub fn prove_cpu_par(
   rows: &[Row],
   tree: &ProofNode,
   params: &StarkParams,
-  ctx: &gpu::GpuContext,
-  cache: &mut gpu::PipelineCache,
 ) -> Result<Proof, ProveError> {
-  // 1–3 (GPU): PCS commit with GPU row encoding
-  let prep = prepare_gpu(rows, tree, params, ctx, cache)?;
+  let prep = prepare_par(rows, tree, params)?;
+  let shard_transcript: Blake3Transcript = prep.transcript.clone();
 
-  // 4. Shard proving (GPU)
-  let shard_transcript = prep.transcript.clone();
-  let shard_batch = shard::prove_all_gpu(
-    &prep.blinded_mle, &params.config, &shard_transcript, ctx, cache,
+  // ── Phase 1: parallel shard proving ────────────────────────────────────
+  let shard_batch = shard::prove_all_par(
+    &prep.blinded_mle,
+    &params.config,
+    &shard_transcript,
   );
 
-  // 5–7 (GPU): recursive aggregation + PCS open
-  assemble_gpu(prep, shard_batch, params, shard_transcript, ctx, cache)
+  // ── Phase 2..D+1: parallel recursive aggregation (per-level) ──────────
+  let recursive_proof = recursive::prove_recursive_par(
+    &shard_batch,
+    &params.config,
+    &shard_transcript,
+  );
+
+  // ── Phase D+2: PCS open + assemble (sequential) ───────────────────────
+  let Prepared {
+    type_cert,
+    beta,
+    gamma,
+    blinded_mle: _,
+    constraint_sum,
+    boundary_constraint_sum,
+    reconstruction_sum,
+    lookup_proofs,
+    lookup_witness,
+    batch_commit,
+    pcs_state,
+    mut transcript,
+  } = prep;
+
+  let open_point = derive_open_point(
+    &shard_batch,
+    &recursive_proof,
+    &params.config,
+    &shard_transcript,
+  );
+  let (open_eval, pcs_open) = pcs::open(&pcs_state, &open_point, &mut transcript);
+
+  Ok(Proof {
+    type_cert,
+    batch_commit,
+    beta,
+    constraint_sum,
+    boundary_constraint_sum,
+    gamma,
+    reconstruction_sum,
+    lookup_proofs,
+    lookup_witness,
+    shard_batch,
+    recursive_proof,
+    pcs_open,
+    open_point,
+    open_eval,
+    config: params.config.clone(),
+  })
 }
 
 /// Derive the PCS opening point from sumcheck challenges.
@@ -277,18 +383,12 @@ fn derive_open_point(
   for level_proofs in &recursive_proof.levels {
     // Node 0 at this level covers shard 0's ancestry.
     if let Some(node0) = level_proofs.first() {
-      let mut t = shard_transcript.fork(
-        "recursive",
-        node0.level * 0x1_0000 + node0.node_idx,
-      );
+      let mut t = shard_transcript.fork("recursive", node0.level * 0x1_0000 + node0.node_idx);
       t.absorb_bytes(&node0.level.to_le_bytes());
       t.absorb_bytes(&node0.node_idx.to_le_bytes());
 
-      if let Some(challenges) = sumcheck::verify(
-        &node0.sumcheck,
-        node0.sumcheck.final_eval,
-        &mut t,
-      ) {
+      if let Some(challenges) = sumcheck::verify(&node0.sumcheck, node0.sumcheck.final_eval, &mut t)
+      {
         high_challenges.extend_from_slice(&challenges);
       }
     }
@@ -310,10 +410,10 @@ mod tests {
   use evm_types::state::EvmState;
   use vm::Row;
 
-  fn xor_row(a: u32, b: u32) -> Row {
+  fn xor_row(a: u128, b: u128) -> Row {
     Row {
       pc: 0,
-      op: 3, // Xor32
+      op: 3, // Xor128
       in0: a,
       in1: b,
       in2: 0,
@@ -339,17 +439,16 @@ mod tests {
   }
 
   fn make_simple_trace_and_tree() -> (Vec<Row>, ProofNode) {
-    let rows = vec![
-      xor_row(1, 2),
-      xor_row(3, 4),
-      xor_row(5, 6),
-      xor_row(7, 8),
-    ];
+    let rows = vec![xor_row(1, 2), xor_row(3, 4), xor_row(5, 6), xor_row(7, 8)];
 
     // 4 ADD leaves chained: depth 5→4→3→2→1
     // Each leaf: pre.pc = i, post.pc = i+1
     let leaf = |i: u32, depth: usize| {
-      add_leaf(0x01, state_with_depth(depth, i), state_with_depth(depth - 1, i + 1))
+      add_leaf(
+        0x01,
+        state_with_depth(depth, i),
+        state_with_depth(depth - 1, i + 1),
+      )
     };
 
     let tree = ProofNode::Seq {
@@ -412,9 +511,7 @@ mod tests {
 
   #[test]
   fn larger_trace_proof() {
-    let rows: Vec<Row> = (0..8u32)
-      .map(|i| xor_row(i, i + 100))
-      .collect();
+    let rows: Vec<Row> = (0..8u128).map(|i| xor_row(i, i + 100)).collect();
 
     // Chain 8 ADD leaves: depth 9→8→...→1, pc 0→1→...→8
     let leaves: Vec<ProofNode> = (0..8)
@@ -426,12 +523,13 @@ mod tests {
         )
       })
       .collect();
-    let tree = leaves.into_iter().reduce(|left, right| {
-      ProofNode::Seq {
+    let tree = leaves
+      .into_iter()
+      .reduce(|left, right| ProofNode::Seq {
         left: Box::new(left),
         right: Box::new(right),
-      }
-    }).unwrap();
+      })
+      .unwrap();
 
     let params = StarkParams::for_n_vars(3);
     let proof = prove_cpu(&rows, &tree, &params).unwrap();

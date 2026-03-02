@@ -6,10 +6,8 @@ edition = "2024"
 [dependencies]
 field      = { path = "../field" }
 transcript = { path = "../transcript" }
-gpu        = { path = "../gpu" }
 blake3     = { workspace = true }
-bytemuck   = { workspace = true }
-wgpu       = { workspace = true }
+rayon      = "1"
 
 [dev-dependencies]
 poly       = { path = "../poly" }

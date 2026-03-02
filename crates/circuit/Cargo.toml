@@ -4,8 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-field     = { path = "../field" }
-poly      = { path = "../poly" }
-sumcheck  = { path = "../sumcheck" }
-vm        = { path = "../vm" }
-thiserror = { workspace = true }
+field      = { path = "../field" }
+poly       = { path = "../poly" }
+sumcheck   = { path = "../sumcheck" }
+logup      = { path = "../logup" }
+lut        = { path = "../lut" }
+transcript = { path = "../transcript" }
+vm         = { path = "../vm" }
+evm-types  = { path = "../evm-types" }
+blake3     = { workspace = true }
+rayon      = "1"
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+revm      = { workspace = true }

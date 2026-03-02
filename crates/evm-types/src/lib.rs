@@ -1,8 +1,10 @@
+pub mod consistency;
 pub mod opcode;
 pub mod proof_tree;
 pub mod state;
 pub mod type_check;
 
+pub use consistency::{ConsistencyError, consistency_check, consistency_check_all};
 pub use opcode::{StackEffect, stack_effect};
 pub use proof_tree::{LeafProof, ProofNode, TypeCert};
 pub use state::{EvmState, EvmStateType};
@@ -309,7 +311,14 @@ mod tests {
       st_mem(vec![], 1, 32),
     );
     let err = type_check::type_check(&node).unwrap_err();
-    assert!(matches!(err, TypeError::MemoryShrink { pre: 64, post: 32, .. }));
+    assert!(matches!(
+      err,
+      TypeError::MemoryShrink {
+        pre: 64,
+        post: 32,
+        ..
+      }
+    ));
   }
 
   #[test]
@@ -352,7 +361,14 @@ mod tests {
       st_stor(vec![], 1, &[1]),
     );
     let err = type_check::type_check(&node).unwrap_err();
-    assert!(matches!(err, TypeError::StorageShrink { pre: 2, post: 1, .. }));
+    assert!(matches!(
+      err,
+      TypeError::StorageShrink {
+        pre: 2,
+        post: 1,
+        ..
+      }
+    ));
   }
 
   #[test]

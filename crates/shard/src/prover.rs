@@ -15,6 +15,7 @@
 
 use field::{FieldElem, GF2_128};
 use poly::MlePoly;
+use rayon::prelude::*;
 use transcript::Blake3Transcript;
 
 use crate::config::RecursiveConfig;
@@ -54,7 +55,10 @@ pub fn prove_shard(
 ) -> ShardProof {
   let mut t = root_transcript.fork("shard", shard_idx);
   let sumcheck = sumcheck::prove(sub_mle, &mut t);
-  ShardProof { shard_idx, sumcheck }
+  ShardProof {
+    shard_idx,
+    sumcheck,
+  }
 }
 
 /// Prove all shards: split the full MLE and prove each independently.
@@ -78,44 +82,47 @@ pub fn prove_all(
     shard_proofs.push(proof);
   }
 
-  ShardProofBatch { shard_proofs, total_sum }
+  ShardProofBatch {
+    shard_proofs,
+    total_sum,
+  }
 }
 
-/// GPU-accelerated variant of [`prove_all`].
+/// Parallel CPU variant of [`prove_all`].
 ///
-/// Dispatches all shards to the GPU in parallel using
-/// [`sumcheck::prove_shards_gpu`].
-pub fn prove_all_gpu(
+/// Avoids the up-front `split_mle` copy: iterates directly over evaluation
+/// chunks via `rayon::par_iter`, constructing each sub-MLE in-place.
+pub fn prove_all_par(
   poly: &MlePoly,
   config: &RecursiveConfig,
   root_transcript: &Blake3Transcript,
-  ctx: &gpu::GpuContext,
-  cache: &mut gpu::PipelineCache,
 ) -> ShardProofBatch {
-  let n_shards = config.n_shards() as usize;
-
-  // Build per-shard forked transcripts
-  let mut transcripts: Vec<_> = (0..n_shards)
-    .map(|i| root_transcript.fork("shard", i as u32))
-    .collect();
-
-  let proofs = sumcheck::prove_shards_gpu(
-    poly,
-    &mut transcripts,
-    config.shard_vars,
-    ctx,
-    cache,
+  assert_eq!(
+    poly.n_vars, config.total_vars,
+    "MLE has {} vars but config.total_vars = {}",
+    poly.n_vars, config.total_vars
   );
 
-  let mut shard_proofs = Vec::with_capacity(n_shards);
-  let mut total_sum = GF2_128::zero();
+  let shard_size = 1usize << config.shard_vars;
+  let n_shards = config.n_shards() as usize;
 
-  for (i, sumcheck) in proofs.into_iter().enumerate() {
-    total_sum = total_sum + sumcheck.claimed_sum;
-    shard_proofs.push(ShardProof { shard_idx: i as u32, sumcheck });
+  let shard_proofs: Vec<ShardProof> = (0..n_shards)
+    .into_par_iter()
+    .map(|i| {
+      let start = i * shard_size;
+      let sub = MlePoly::new(poly.evals[start..start + shard_size].to_vec());
+      prove_shard(i as u32, &sub, root_transcript)
+    })
+    .collect();
+
+  let total_sum = shard_proofs
+    .iter()
+    .fold(GF2_128::zero(), |acc, p| acc + p.sumcheck.claimed_sum);
+
+  ShardProofBatch {
+    shard_proofs,
+    total_sum,
   }
-
-  ShardProofBatch { shard_proofs, total_sum }
 }
 
 #[cfg(test)]
@@ -128,7 +135,11 @@ mod tests {
 
   fn test_config() -> RecursiveConfig {
     // 4-var MLE split into 4 shards of 2 vars each
-    RecursiveConfig { total_vars: 4, shard_vars: 2, fan_in: 2 }
+    RecursiveConfig {
+      total_vars: 4,
+      shard_vars: 2,
+      fan_in: 2,
+    }
   }
 
   #[test]
@@ -151,7 +162,10 @@ mod tests {
     let cfg = test_config();
     let shards = split_mle(&poly, &cfg);
     // Concatenating shards should reproduce the original
-    let reassembled: Vec<GF2_128> = shards.iter().flat_map(|s| s.evals.iter().copied()).collect();
+    let reassembled: Vec<GF2_128> = shards
+      .iter()
+      .flat_map(|s| s.evals.iter().copied())
+      .collect();
     assert_eq!(reassembled, evals);
   }
 
@@ -161,7 +175,10 @@ mod tests {
     let poly = MlePoly::new(evals);
     let cfg = test_config();
     let shards = split_mle(&poly, &cfg);
-    let shard_sum: GF2_128 = shards.iter().map(|s| s.sum()).fold(GF2_128::zero(), |a, b| a + b);
+    let shard_sum: GF2_128 = shards
+      .iter()
+      .map(|s| s.sum())
+      .fold(GF2_128::zero(), |a, b| a + b);
     assert_eq!(shard_sum, poly.sum());
   }
 
@@ -206,7 +223,11 @@ mod tests {
     // total_vars == shard_vars → 1 shard = full MLE
     let evals: Vec<GF2_128> = (1u64..=8).map(g).collect();
     let poly = MlePoly::new(evals);
-    let cfg = RecursiveConfig { total_vars: 3, shard_vars: 3, fan_in: 2 };
+    let cfg = RecursiveConfig {
+      total_vars: 3,
+      shard_vars: 3,
+      fan_in: 2,
+    };
     let root_t = Blake3Transcript::new();
     let batch = prove_all(&poly, &cfg, &root_t);
     assert_eq!(batch.shard_proofs.len(), 1);

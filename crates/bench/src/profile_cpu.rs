@@ -5,62 +5,107 @@
 //!
 //! Default: 64 steps.
 
-use e2e::{EvmStep, build_witness, prove_cpu};
+use e2e::{EvmStep, build_witness, prove_cpu_par, verify};
 use revm::primitives::U256;
 
+/// Create a mixed EVM trace of `n` steps — **O(n) time and memory**.
+///
+/// Alternates PUSH0 and a binary op (ADD/SUB/AND cycle) so that the
+/// stack depth stays constant at 2, satisfying the type checker's
+/// Seq-continuity rule (`left.post_depth == right.pre_depth`).
+///
+/// ```text
+///   depth 2 → PUSH0 → depth 3 → ADD → depth 2 → PUSH0 → depth 3 → SUB → …
+/// ```
+///
+/// Each step stores only the operands it touches (≤3 elements), so
+/// total memory is O(n) regardless of trace length.
 fn mixed_trace(n: usize) -> Vec<EvmStep> {
-    use revm::bytecode::opcode::{ADD, AND, SUB};
-    let opcodes = [ADD, SUB, AND];
-    let mut steps = Vec::with_capacity(n);
+  use revm::bytecode::opcode::{ADD, AND, PUSH0, SUB};
+  let bin_ops = [ADD, SUB, AND];
+  let mut steps = Vec::with_capacity(n);
 
-    let mut stack: Vec<U256> = (0..n as u64 + 1).map(|i| U256::from(100 + i)).collect();
+  // Persistent "top of stack" values; depth stays at 2.
+  let mut top0 = U256::from(100u64);
+  let mut top1 = U256::from(101u64);
+  let mut bin_idx = 0usize;
+  let mut last_gas = 1_000_000_000u64;
 
-    for i in 0..n {
-        let opcode = opcodes[i % 3];
-        let pre_stack = stack.clone();
-        let a = stack[0];
-        let b = stack[1];
-        let result = match opcode {
-            ADD => a.overflowing_add(b).0,
-            SUB => a.overflowing_sub(b).0,
-            AND => a & b,
-            _ => unreachable!(),
-        };
-        stack.remove(0);
-        stack[0] = result;
-        steps.push(EvmStep {
-            opcode,
-            pc: i as u32,
-            gas_before: 1_000_000,
-            gas_after: 999_997,
-            pre_stack,
-            post_stack: stack.clone(),
-        });
+  for i in 0..n {
+    if i % 2 == 0 {
+      // ── PUSH0: depth 2 → 3 ────────────────────────────────────
+      steps.push(EvmStep {
+        opcode: PUSH0,
+        pc: i as u32,
+        gas_before: last_gas,
+        gas_after: last_gas - 2,
+        pre_stack: vec![top0, top1],
+        post_stack: vec![U256::ZERO, top0, top1],
+      });
+      last_gas -= 2;
+    } else {
+      // ── Binary op: depth 3 → 2 ────────────────────────────────
+      // Operands are the top two: [U256::ZERO, top0] from previous PUSH0.
+      let op = bin_ops[bin_idx % 3];
+      bin_idx += 1;
+      let a = U256::ZERO;
+      let b = top0;
+      let result = match op {
+        ADD => a.overflowing_add(b).0,
+        SUB => a.overflowing_sub(b).0,
+        AND => a & b,
+        _ => unreachable!(),
+      };
+      steps.push(EvmStep {
+        opcode: op,
+        pc: i as u32,
+        gas_before: last_gas,
+        gas_after: last_gas - 3,
+        pre_stack: vec![a, b, top1],
+        post_stack: vec![result, top1],
+      });
+      // Update running state.
+      top0 = result;
+      top1 = top1.overflowing_add(U256::from(1u64)).0;
+      last_gas -= 3;
     }
-    steps
+  }
+  steps
 }
 
 fn main() {
-    let n: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
+  let n: usize = std::env::args()
+    .nth(1)
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(1 << 20);
 
-    eprintln!("Building witness for {} steps...", n);
-    let steps = mixed_trace(n);
-    let witness = build_witness(&steps).unwrap();
+  eprintln!("Building witness for {} steps...", n);
+  let steps = mixed_trace(n);
+  let witness = build_witness(&steps).unwrap();
 
-    eprintln!("Running prove_cpu ({} steps, {} rows)...", n, witness.rows.len());
+  eprintln!(
+    "Running prove_cpu ({} steps, {} rows)...",
+    n,
+    witness.rows.len()
+  );
 
-    // Run multiple iterations for better sampling
-    for i in 0..1000 {
-        let (proof, _params) = prove_cpu(&witness).unwrap();
-        // Prevent optimizing away
-        std::hint::black_box(&proof);
-        if i == 0 {
-            eprintln!("  first proof done");
-        }
-    }
+  let t0 = std::time::Instant::now();
 
-    eprintln!("Done.");
+  let (proof, params) = prove_cpu_par(&witness).unwrap();
+
+  let t1 = std::time::Instant::now();
+
+  let res = verify(&proof, &witness.tree, &params);
+
+  let t2 = std::time::Instant::now();
+
+  eprintln!("Prover took {:.2?}", t1 - t0);
+
+  if let Err(err) = res {
+    eprintln!("Verification failed in {:.2?}", t2 - t1);
+  } else {
+    eprintln!("Verification succeeded in {:.2?}", t2 - t1);
+  }
+
+  eprintln!("Done.");
 }

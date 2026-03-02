@@ -35,7 +35,10 @@ pub fn verify_shard(
 ) -> Option<ShardVerifyResult> {
   let mut t = root_transcript.fork("shard", proof.shard_idx);
   let challenges = sumcheck::verify(&proof.sumcheck, oracle_eval, &mut t)?;
-  Some(ShardVerifyResult { shard_idx: proof.shard_idx, challenges })
+  Some(ShardVerifyResult {
+    shard_idx: proof.shard_idx,
+    challenges,
+  })
 }
 
 /// Verify all shard proofs against the original MLE.
@@ -73,11 +76,7 @@ pub fn verify_all(
     // We first extract challenges by running the verifier with final_eval
     // (same approach as the sumcheck tests).
     let mut t_tmp = root_transcript.fork("shard", proof.shard_idx);
-    let challenges = sumcheck::verify(
-      &proof.sumcheck,
-      proof.sumcheck.final_eval,
-      &mut t_tmp,
-    )?;
+    let challenges = sumcheck::verify(&proof.sumcheck, proof.sumcheck.final_eval, &mut t_tmp)?;
 
     let oracle_eval = sub.evaluate(&challenges);
 
@@ -99,7 +98,11 @@ mod tests {
   }
 
   fn test_config() -> RecursiveConfig {
-    RecursiveConfig { total_vars: 4, shard_vars: 2, fan_in: 2 }
+    RecursiveConfig {
+      total_vars: 4,
+      shard_vars: 2,
+      fan_in: 2,
+    }
   }
 
   #[test]
@@ -153,11 +156,8 @@ mod tests {
 
     // Compute oracle eval
     let mut t_tmp = root_t.fork("shard", 0);
-    let challenges = sumcheck::verify(
-      &proof.sumcheck,
-      proof.sumcheck.final_eval,
-      &mut t_tmp,
-    ).unwrap();
+    let challenges =
+      sumcheck::verify(&proof.sumcheck, proof.sumcheck.final_eval, &mut t_tmp).unwrap();
     let oracle = sub.evaluate(&challenges);
 
     let result = verify_shard(&proof, oracle, &root_t);
@@ -170,7 +170,11 @@ mod tests {
     // Instead: 6-var, 4 shards of 4 vars
     let evals: Vec<GF2_128> = (1u64..=64).map(g).collect();
     let poly = MlePoly::new(evals);
-    let cfg = RecursiveConfig { total_vars: 6, shard_vars: 4, fan_in: 2 };
+    let cfg = RecursiveConfig {
+      total_vars: 6,
+      shard_vars: 4,
+      fan_in: 2,
+    };
     assert_eq!(cfg.n_shards(), 4);
     let root_t = Blake3Transcript::new();
     let batch = prove_all(&poly, &cfg, &root_t);
@@ -184,7 +188,11 @@ mod tests {
     // total_vars == shard_vars → 1 shard
     let evals: Vec<GF2_128> = (1u64..=8).map(g).collect();
     let poly = MlePoly::new(evals);
-    let cfg = RecursiveConfig { total_vars: 3, shard_vars: 3, fan_in: 2 };
+    let cfg = RecursiveConfig {
+      total_vars: 3,
+      shard_vars: 3,
+      fan_in: 2,
+    };
     let root_t = Blake3Transcript::new();
     let batch = prove_all(&poly, &cfg, &root_t);
     let results = verify_all(&batch, &poly, &cfg, &root_t);

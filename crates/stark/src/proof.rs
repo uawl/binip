@@ -17,6 +17,8 @@ use pcs::{Commitment, OpenProof};
 use recursive::RecursiveProof;
 use shard::{RecursiveConfig, ShardProofBatch};
 
+use circuit::lookup::{LookupProofs, LookupWitness};
+
 /// Top-level ZK-STARK proof.
 #[derive(Debug, Clone)]
 pub struct Proof {
@@ -33,6 +35,31 @@ pub struct Proof {
   pub beta: GF2_128,
   /// Claimed sum of the constraint MLE (must be zero for a valid proof).
   pub constraint_sum: GF2_128,
+
+  // ── boundary constraint layer ─────────────────────────────────────────
+  /// Claimed sum of the boundary-constraint MLE (must be zero).
+  ///
+  /// This proves that every `Seq` boundary in the proof tree has
+  /// matching left-post / right-pre states (PC, gas, stack depth, …).
+  pub boundary_constraint_sum: GF2_128,
+
+  // ── decomposition / lookup layer ──────────────────────────────────────
+  /// Batching challenge for the reconstruction constraint (STARK ↔ LUT binding).
+  pub gamma: GF2_128,
+
+  /// Claimed sum of the reconstruction MLE (must be zero).
+  ///
+  /// This proves that committed byte-decomposition columns match the
+  /// main trace operands, binding the STARK and LUT witnesses together.
+  pub reconstruction_sum: GF2_128,
+
+  /// Per-table LogUp proofs for byte-level lookup arguments.
+  pub lookup_proofs: LookupProofs,
+
+  /// Lookup witnesses (needed for LogUp transcript replay during verification).
+  ///
+  /// In a production system these would be replaced by PCS commitments.
+  pub lookup_witness: LookupWitness,
 
   // ── shard layer ───────────────────────────────────────────────────────
   /// Shard-level proofs (independent sumcheck per shard).

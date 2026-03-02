@@ -140,7 +140,12 @@ impl VisionCircuit {
       }
     }
 
-    PermutationWitness { input, output: state, inverses, pre_inv }
+    PermutationWitness {
+      input,
+      output: state,
+      inverses,
+      pre_inv,
+    }
   }
 
   /// Verify a witness: check every `pre * inverse = 1`.
@@ -205,7 +210,11 @@ impl SpongeCircuit {
   /// and `n_squeeze` squeezed elements.
   pub fn new(n_absorb: usize, n_squeeze: usize) -> Self {
     // Absorb: each permutation consumes up to RATE elements.
-    let absorb_perms = if n_absorb == 0 { 0 } else { (n_absorb + RATE - 1) / RATE };
+    let absorb_perms = if n_absorb == 0 {
+      0
+    } else {
+      (n_absorb + RATE - 1) / RATE
+    };
     // After the last absorb-permutation, RATE elements are available.
     // Additional permutations are needed if we squeeze more than RATE.
     let squeeze_extra_perms = if n_squeeze <= RATE {
@@ -286,12 +295,17 @@ impl SpongeCircuit {
       squeeze_pos += 1;
     }
 
-    SpongeWitness { perm_witnesses, squeezed }
+    SpongeWitness {
+      perm_witnesses,
+      squeezed,
+    }
   }
 
   /// Verify all permutation witnesses in the sponge.
   pub fn verify_witness(&self, w: &SpongeWitness) -> bool {
-    w.perm_witnesses.iter().all(|pw| self.perm.verify_witness(pw))
+    w.perm_witnesses
+      .iter()
+      .all(|pw| self.perm.verify_witness(pw))
   }
 }
 

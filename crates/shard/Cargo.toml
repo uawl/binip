@@ -8,5 +8,5 @@ field      = { path = "../field" }
 poly       = { path = "../poly" }
 sumcheck   = { path = "../sumcheck" }
 transcript = { path = "../transcript" }
-gpu        = { path = "../gpu" }
+rayon      = "1"
 thiserror  = { workspace = true }

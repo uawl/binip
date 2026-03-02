@@ -29,7 +29,7 @@ impl GpuContext {
         | wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER, // For WSL2 dzn
       ..Default::default()
     });
-    
+
     let adapters = instance.enumerate_adapters(Backends::all()).await;
     // DiscreteGpu > IntegratedGpu > 나머지 순으로 우선 선택
     let adapter = adapters

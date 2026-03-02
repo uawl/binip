@@ -15,5 +15,5 @@ pub mod prover;
 pub mod verifier;
 
 pub use proof::{Proof, StarkParams};
-pub use prover::{ProveError, prove_cpu, prove_gpu};
+pub use prover::{ProveError, prove_cpu, prove_cpu_par};
 pub use verifier::{VerifyError, verify};

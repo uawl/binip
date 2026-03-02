@@ -75,9 +75,7 @@ impl Schedule {
 /// Errors during schedule construction.
 #[derive(Debug, thiserror::Error)]
 pub enum ScheduleError {
-  #[error(
-    "leaf count mismatch: tree has {tree} leaves but {given} row counts provided"
-  )]
+  #[error("leaf count mismatch: tree has {tree} leaves but {given} row counts provided")]
   LeafCountMismatch { tree: usize, given: usize },
 
   #[error("target workgroup size must be > 0")]
@@ -106,15 +104,27 @@ fn annotate(
       let size = row_counts[*leaf_idx] as u32;
       *leaf_idx += 1;
       *offset += size;
-      NodeSpan { start, size, children: vec![] }
+      NodeSpan {
+        start,
+        size,
+        children: vec![],
+      }
     }
     ProofNode::Seq { left, right } => {
       let start = *offset;
       let l = annotate(left, row_counts, leaf_idx, offset);
       let r = annotate(right, row_counts, leaf_idx, offset);
-      NodeSpan { start, size: l.size + r.size, children: vec![l, r] }
+      NodeSpan {
+        start,
+        size: l.size + r.size,
+        children: vec![l, r],
+      }
     }
-    ProofNode::Branch { cond, taken, not_taken } => {
+    ProofNode::Branch {
+      cond,
+      taken,
+      not_taken,
+    } => {
       let start = *offset;
       let c = annotate(cond, row_counts, leaf_idx, offset);
       let t = annotate(taken, row_counts, leaf_idx, offset);
@@ -188,7 +198,10 @@ pub fn schedule(
   let n_rows = offset;
 
   if n_rows == 0 {
-    return Ok(Schedule { workgroups: vec![], n_rows: 0 });
+    return Ok(Schedule {
+      workgroups: vec![],
+      n_rows: 0,
+    });
   }
 
   // Phase 2: atomise
@@ -196,7 +209,10 @@ pub fn schedule(
   collect_atoms(&root, target_size, &mut atoms);
 
   if atoms.is_empty() {
-    return Ok(Schedule { workgroups: vec![], n_rows: 0 });
+    return Ok(Schedule {
+      workgroups: vec![],
+      n_rows: 0,
+    });
   }
 
   // Phase 3: greedy merge
@@ -255,7 +271,10 @@ mod tests {
   }
 
   fn seq(left: ProofNode, right: ProofNode) -> ProofNode {
-    ProofNode::Seq { left: Box::new(left), right: Box::new(right) }
+    ProofNode::Seq {
+      left: Box::new(left),
+      right: Box::new(right),
+    }
   }
 
   fn branch(cond: ProofNode, taken: ProofNode, not_taken: ProofNode) -> ProofNode {
@@ -345,10 +364,7 @@ mod tests {
     // 20 leaves of 10 rows each → 200 total, target=100
     // Should get 2 workgroups of ~100 rows each.
     let leaves: Vec<ProofNode> = (0..20).map(|i| leaf(i as u8)).collect();
-    let tree = leaves
-      .into_iter()
-      .reduce(|a, b| seq(a, b))
-      .unwrap();
+    let tree = leaves.into_iter().reduce(|a, b| seq(a, b)).unwrap();
     let row_counts = vec![10usize; 20];
     let sched = schedule(&tree, &row_counts, 100).unwrap();
     assert_eq!(sched.n_rows, 200);
