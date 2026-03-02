@@ -1,0 +1,9 @@
+[package]
+name = "evm-types"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+revm      = { workspace = true }
+thiserror = { workspace = true }
+blake3    = { workspace = true }

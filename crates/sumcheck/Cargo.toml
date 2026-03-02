@@ -1,0 +1,15 @@
+[package]
+name = "sumcheck"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+field      = { path = "../field" }
+poly       = { path = "../poly" }
+transcript = { path = "../transcript" }
+gpu        = { path = "../gpu" }
+bytemuck   = { workspace = true }
+wgpu       = { workspace = true }
+
+[dev-dependencies]
+pollster   = { workspace = true }
