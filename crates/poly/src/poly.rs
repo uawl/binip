@@ -13,6 +13,7 @@
 //! Repeated folding at r_0, …, r_{n-1} yields a single scalar = MLE(r_0,…,r_{n-1}).
 
 use field::{FieldElem, GF2_128};
+use rand::Rng;
 
 /// Multilinear Extension polynomial — evaluation table over {0,1}^n.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +115,42 @@ impl MlePoly {
     let evals = self.evals.iter().zip(&other.evals).map(|(&a, &b)| a * b).collect();
     Self { evals, n_vars: self.n_vars }
   }
+
+  /// Generate a random multilinear polynomial whose sum over {0,1}^n is zero.
+  ///
+  /// Construction: sample `2^n - 1` random evaluations, then set the last
+  /// evaluation so that the XOR-sum of all evaluations is zero.
+  /// This gives a uniformly random MLE conditioned on `Σ evals = 0`.
+  pub fn random_zero_sum<R: Rng>(n_vars: u32, rng: &mut R) -> Self {
+    let size = 1usize << n_vars;
+    let mut evals = Vec::with_capacity(size);
+    let mut running_sum = GF2_128::zero();
+    for _ in 0..size - 1 {
+      let v = GF2_128::random(rng);
+      running_sum = running_sum + v;
+      evals.push(v);
+    }
+    // Last element cancels the sum: in char 2, a + a = 0.
+    evals.push(running_sum);
+    Self { evals, n_vars }
+  }
+
+  /// Return a blinded copy: `self + r * B` where `B` is a random zero-sum MLE.
+  ///
+  /// The blinded polynomial has the same sum over {0,1}^n as the original
+  /// (since `Σ B(x) = 0`), but individual evaluations are masked, providing
+  /// zero-knowledge in the sumcheck protocol.
+  pub fn blind<R: Rng>(&self, rng: &mut R) -> Self {
+    let r = GF2_128::random_nonzero(rng);
+    let mask = Self::random_zero_sum(self.n_vars, rng);
+    let evals = self
+      .evals
+      .iter()
+      .zip(&mask.evals)
+      .map(|(&w, &b)| w + r * b)
+      .collect();
+    Self { evals, n_vars: self.n_vars }
+  }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -182,5 +219,68 @@ mod tests {
       assert_eq!(sum.evals[i], a[i] + b[i]);
       assert_eq!(prod.evals[i], a[i] * b[i]);
     }
+  }
+
+  // ─── Blinding tests ──────────────────────────────────────────────────
+
+  #[test]
+  fn random_zero_sum_has_zero_sum() {
+    let mut rng = rand::rng();
+    for n_vars in 1..=6 {
+      let b = MlePoly::random_zero_sum(n_vars, &mut rng);
+      assert_eq!(b.evals.len(), 1 << n_vars);
+      assert_eq!(b.n_vars, n_vars);
+      assert!(b.sum().is_zero(), "random_zero_sum n_vars={n_vars} should have sum=0");
+    }
+  }
+
+  #[test]
+  fn random_zero_sum_is_nontrivial() {
+    let mut rng = rand::rng();
+    let b = MlePoly::random_zero_sum(4, &mut rng);
+    // With 16 evaluations over GF(2^128), all being zero is negligible.
+    assert!(b.evals.iter().any(|e| !e.is_zero()));
+  }
+
+  #[test]
+  fn blind_preserves_sum() {
+    let mut rng = rand::rng();
+    let evals: Vec<GF2_128> = (1u64..=16).map(g).collect();
+    let poly = MlePoly::new(evals);
+    let original_sum = poly.sum();
+    for _ in 0..5 {
+      let blinded = poly.blind(&mut rng);
+      assert_eq!(blinded.sum(), original_sum, "blinding must preserve sum");
+    }
+  }
+
+  #[test]
+  fn blind_changes_evaluations() {
+    let mut rng = rand::rng();
+    let evals: Vec<GF2_128> = (1u64..=8).map(g).collect();
+    let poly = MlePoly::new(evals);
+    let blinded = poly.blind(&mut rng);
+    // At least one evaluation should differ (overwhelmingly likely).
+    assert_ne!(poly.evals, blinded.evals);
+  }
+
+  #[test]
+  fn blind_zero_poly_produces_zero_sum() {
+    let mut rng = rand::rng();
+    let poly = MlePoly::zero(4);
+    let blinded = poly.blind(&mut rng);
+    assert!(blinded.sum().is_zero(), "blinded zero-poly should still sum to 0");
+    // But evaluations should be nonzero (the blinding mask).
+    assert!(blinded.evals.iter().any(|e| !e.is_zero()));
+  }
+
+  #[test]
+  fn two_blindings_differ() {
+    let mut rng = rand::rng();
+    let evals: Vec<GF2_128> = (1u64..=4).map(g).collect();
+    let poly = MlePoly::new(evals);
+    let b1 = poly.blind(&mut rng);
+    let b2 = poly.blind(&mut rng);
+    assert_ne!(b1.evals, b2.evals, "independent blindings should differ");
   }
 }

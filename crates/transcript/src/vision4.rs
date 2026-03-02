@@ -176,7 +176,7 @@ const B_INV: [u128; 129] = [
 // ─── Round constants ──────────────────────────────────────────────────────────
 // 17 arrays of 4 u128 each (1 + 2*NUM_ROUNDS).
 
-const ROUND_CONSTANTS: [[u128; 4]; 1 + 2 * NUM_ROUNDS] = [
+pub(crate) const ROUND_CONSTANTS: [[u128; 4]; 1 + 2 * NUM_ROUNDS] = [
     [
         0xd0e015190f5e0795f4a1d28234ffdf87,
         0x6111731acd9a89f6b93ec3a23ec7681b,
@@ -285,7 +285,7 @@ const ROUND_CONSTANTS: [[u128; 4]; 1 + 2 * NUM_ROUNDS] = [
 
 /// B_fwd(x) = C0 + C1*x + C2*x^2 + C3*x^4 (linearized degree-4 polynomial).
 #[inline]
-fn b_fwd(x: u128) -> u128 {
+pub(crate) fn b_fwd(x: u128) -> u128 {
     let x2 = gcm_sq(x);
     let x4 = gcm_sq(x2);
     B_FWD[0] ^ gcm_mul(B_FWD[1], x) ^ gcm_mul(B_FWD[2], x2) ^ gcm_mul(B_FWD[3], x4)
@@ -293,7 +293,7 @@ fn b_fwd(x: u128) -> u128 {
 
 /// B_inv(x) = C0 + sum_{i=0}^{127} C_{i+1} * x^(2^i) (Frobenius series, 128 terms).
 #[inline]
-fn b_inv(x: u128) -> u128 {
+pub(crate) fn b_inv(x: u128) -> u128 {
     let mut result = B_INV[0];
     let mut xp = x; // x^(2^i) — starts at x^1
     for i in 0..128 {
@@ -325,7 +325,7 @@ fn mul_x(a: u128) -> u128 {
 }
 
 #[inline]
-fn mds(s: &mut [u128; M]) {
+pub(crate) fn mds(s: &mut [u128; M]) {
     let sum = s[0] ^ s[1] ^ s[2] ^ s[3];
     let a0 = s[0]; // save original s[0] for row-3
     // binius64: a[i] += sum + mul_x(a[i] + a[i+1])  (GF(2): += is ^=)
@@ -399,5 +399,71 @@ mod tests {
         assert_eq!(s[1], 0xc9bae4f4c782d46ed28245525f04fb3c);
         assert_eq!(s[2], 0xf4fea518a1e62f97748266e86acac536);
         assert_eq!(s[3], 0x22b25c68a52fef4b855f8862bdd418c4);
+    }
+
+    #[test]
+    fn test_b_fwd_inv_roundtrip() {
+        // b_fwd(b_inv(x)) should equal x for arbitrary inputs.
+        let vals = [
+            0u128,
+            1u128,
+            0xdeadbeefcafebabe1234567890abcdefu128,
+            0xffffffffffffffffffffffffffffffffu128,
+            0x80000000000000000000000000000001u128,
+        ];
+        for &x in &vals {
+            let roundtrip = b_fwd(b_inv(x));
+            assert_eq!(roundtrip, x, "b_fwd(b_inv({x:#x})) != {x:#x}");
+        }
+    }
+
+    #[test]
+    fn test_b_inv_fwd_roundtrip() {
+        // b_inv(b_fwd(x)) should also equal x (the polynomials are mutual inverses).
+        let vals = [0u128, 1, 0xabcdef, 0x1234_5678_9abc_def0_u128 << 64 | 0xcafe];
+        for &x in &vals {
+            let roundtrip = b_inv(b_fwd(x));
+            assert_eq!(roundtrip, x, "b_inv(b_fwd({x:#x})) != {x:#x}");
+        }
+    }
+
+    #[test]
+    fn test_mds_not_identity() {
+        let mut s = [1u128, 0, 0, 0];
+        mds(&mut s);
+        // MDS of [1,0,0,0] should NOT be [1,0,0,0].
+        assert_ne!(s, [1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_mds_matches_matrix() {
+        // MDS matrix [2,3,1,1] circulant.
+        // Row 0: 2*a[0] + 3*a[1] + a[2] + a[3]
+        let a = [0x11u128, 0x22, 0x33, 0x44];
+        let mut s = a;
+        mds(&mut s);
+        // Verify row 0: 2*0x11 + 3*0x22 + 0x33 + 0x44
+        let two_a0 = mul_x(a[0]);
+        let three_a1 = mul_x(a[1]) ^ a[1];
+        let expected_0 = two_a0 ^ three_a1 ^ a[2] ^ a[3];
+        assert_eq!(s[0], expected_0, "MDS row 0 mismatch");
+    }
+
+    #[test]
+    fn test_permutation_deterministic() {
+        let mut s1 = [0x42u128; M];
+        let mut s2 = [0x42u128; M];
+        permutation(&mut s1);
+        permutation(&mut s2);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_permutation_different_inputs_differ() {
+        let mut s1 = [0u128; M];
+        let mut s2 = [1u128, 0, 0, 0];
+        permutation(&mut s1);
+        permutation(&mut s2);
+        assert_ne!(s1, s2);
     }
 }

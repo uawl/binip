@@ -1,0 +1,17 @@
+[package]
+name = "e2e"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+field      = { path = "../field" }
+vm         = { path = "../vm" }
+evm-types  = { path = "../evm-types" }
+circuit    = { path = "../circuit" }
+stark      = { path = "../stark" }
+gpu        = { path = "../gpu" }
+revm       = { workspace = true }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+revm       = { workspace = true }

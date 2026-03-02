@@ -1,0 +1,12 @@
+[package]
+name = "shard"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+field      = { path = "../field" }
+poly       = { path = "../poly" }
+sumcheck   = { path = "../sumcheck" }
+transcript = { path = "../transcript" }
+gpu        = { path = "../gpu" }
+thiserror  = { workspace = true }

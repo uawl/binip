@@ -2,11 +2,13 @@ pub mod proof;
 pub mod prover;
 pub mod verifier;
 pub mod gpu_prover;
+pub mod shard_gpu_prover;
 
 pub use proof::{RoundPoly, SumcheckProof};
 pub use prover::prove;
 pub use verifier::verify;
 pub use gpu_prover::prove_gpu;
+pub use shard_gpu_prover::prove_shards_gpu;
 
 #[cfg(test)]
 mod tests {

@@ -55,6 +55,11 @@ impl PipelineCache {
     })
   }
 
+  /// 캐시에서 이미 컴파일된 파이프라인을 불변 참조로 꺼낸다.
+  pub fn get(&self, label: &str) -> Option<&wgpu::ComputePipeline> {
+    self.pipelines.get(label)
+  }
+
   /// 캐시에서 파이프라인을 제거한다 (셰이더 핫-리로드 등에 사용).
   pub fn invalidate(&mut self, label: &str) {
     self.pipelines.remove(label);

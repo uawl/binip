@@ -2,11 +2,13 @@ pub mod buffer;
 pub mod context;
 pub mod error;
 pub mod pipeline;
+pub mod shaders;
 
 pub use buffer::GpuBuffer;
 pub use context::GpuContext;
 pub use error::GpuError;
 pub use pipeline::{Dispatcher, PipelineCache};
+pub use shaders::{GF128_WGSL, shader_with_gf128};
 
 #[cfg(test)]
 mod tests {

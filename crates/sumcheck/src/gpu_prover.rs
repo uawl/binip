@@ -9,22 +9,24 @@
 //! 3. Get challenge from transcript.
 //! 4. Launch `sumcheck_fold` kernel to fold the table in-place.
 //!
-//! The GPU table buffer is sized for the full `2^n_vars` evaluation table.
-//! After each fold the active region shrinks by half; we track this with
-//! `current_half` and keep the buffer at full size (unused upper half ignored).
+//! # Resource reuse
+//!
+//! Uniform buffers, bind groups, and the staging readback buffer are
+//! allocated once before the round loop and updated via `write_buffer`.
+//! This eliminates per-round allocation and bind-group creation overhead.
 
 use bytemuck::{Pod, Zeroable};
 use field::GF2_128;
-use gpu::{GpuBuffer, GpuContext, Dispatcher, PipelineCache};
+use gpu::{GpuBuffer, GpuContext, PipelineCache, shader_with_gf128};
 use poly::MlePoly;
 use transcript::Transcript;
-use wgpu::{util::DeviceExt, BufferUsages};
+use wgpu::BufferUsages;
 
 use crate::proof::{RoundPoly, SumcheckProof, alpha};
 
 // ─── Shader sources ──────────────────────────────────────────────────────────
 
-const SHADER_SRC: &str = include_str!("shaders/sumcheck.wgsl");
+const SUMCHECK_KERNEL_SRC: &str = include_str!("shaders/sumcheck.wgsl");
 const ROUND_ENTRY: &str = "sumcheck_round";
 const FOLD_ENTRY: &str  = "sumcheck_fold";
 
@@ -78,67 +80,109 @@ pub fn prove_gpu<T: Transcript>(
     ctx: &GpuContext,
     cache: &mut PipelineCache,
 ) -> SumcheckProof {
-    let claimed_sum = poly.sum(); // cheap CPU sum; GPU for large polys handled by fold
+    let claimed_sum = poly.sum();
     transcript.absorb_field(claimed_sum);
 
-    // Upload evaluation table to GPU (packed as u32)
-    let flat: Vec<u32> = poly
-        .evals
-        .iter()
-        .flat_map(|&e| to_u32x4(e))
-        .collect();
-    let table_buf: GpuBuffer<u32> = GpuBuffer::from_slice(
-        ctx,
-        &flat,
-        BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-    );
+    let shader_src = shader_with_gf128(SUMCHECK_KERNEL_SRC);
+    let _a = alpha();
 
-    // Output buffer for round: [g0, g1, ga] = 3 × vec4<u32> = 12 u32
-    let out_buf: GpuBuffer<u32> = GpuBuffer::zeroed(ctx, 12, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+    // ── Pre-allocate GPU buffers (reused every round) ────────────────────
 
-    let _a = alpha(); // α = GF2_128::from(2) — computed on GPU side
+    // Evaluation table
+    let flat: Vec<u32> = poly.evals.iter().flat_map(|&e| to_u32x4(e)).collect();
+    let table_buf = GpuBuffer::from_slice(ctx, &flat, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+
+    // Round output: [g0, g1, ga] = 3 × vec4<u32> = 12 u32
+    let out_buf = GpuBuffer::<u32>::zeroed(ctx, 12, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+
+    // Round uniform (written each round)
+    let round_uniform = GpuBuffer::<RoundParams>::zeroed(ctx, 1, BufferUsages::UNIFORM);
+
+    // Fold uniform (written each round)
+    let fold_uniform = GpuBuffer::<FoldParams>::zeroed(ctx, 1, BufferUsages::UNIFORM);
+
+    // Staging buffer for output readback (reused every round)
+    let staging_size = out_buf.size_bytes();
+    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sc_staging"),
+        size: staging_size,
+        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // ── Create bind groups once ──────────────────────────────────────────
+
+    // ── Pre-compile pipelines (warm the cache) ──────────────────────────
+    // Separate scopes so mutable borrows of `cache` don't overlap.
+    cache.get_or_compile(ctx, ROUND_ENTRY, &shader_src, ROUND_ENTRY);
+    cache.get_or_compile(ctx, FOLD_ENTRY, &shader_src, FOLD_ENTRY);
+
+    // Now take shared references (pipelines are already in the cache).
+    let round_pipeline = cache.get(ROUND_ENTRY).unwrap();
+    let fold_pipeline = cache.get(FOLD_ENTRY).unwrap();
+
+    let round_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("round_bg"),
+        layout: &round_pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: round_uniform.inner.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: table_buf.inner.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out_buf.inner.as_entire_binding() },
+        ],
+    });
+
+    // (fold_pipeline already obtained above)
+    let fold_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fold_bg"),
+        layout: &fold_pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: fold_uniform.inner.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: table_buf.inner.as_entire_binding() },
+        ],
+    });
+
+    // ── Round loop ───────────────────────────────────────────────────────
+
     let mut round_polys = Vec::with_capacity(poly.n_vars as usize);
     let mut current_half = 1u32 << (poly.n_vars - 1);
 
     for _ in 0..poly.n_vars {
-        // ── Round: compute g(0), g(1), g(α) ─────────────────────────────────
-        let round_params = RoundParams { half: current_half, _pad: [0; 3] };
-        let round_uniform = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("round_params"),
-            contents: bytemuck::bytes_of(&round_params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        // 1. Write round params
+        round_uniform.write(ctx, &[RoundParams { half: current_half, _pad: [0; 3] }]);
 
-        let round_pipeline = cache.get_or_compile(ctx, ROUND_ENTRY, SHADER_SRC, ROUND_ENTRY);
-        let bg_layout = round_pipeline.get_bind_group_layout(0);
-        let round_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("round_bg"),
-            layout: &bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: round_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: table_buf.inner.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: out_buf.inner.as_entire_binding(),
-                },
-            ],
-        });
+        // 2. Dispatch round + copy to staging in one command buffer
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(round_pipeline);
+                pass.set_bind_group(0, &round_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&out_buf.inner, 0, &staging, 0, staging_size);
+            ctx.queue.submit(std::iter::once(encoder.finish()));
+        }
 
-        // Single workgroup: covers up to 256 elements per thread via stride loop
-        let dispatcher = Dispatcher::new(ctx);
-        dispatcher.dispatch(&round_pipeline, &[&round_bg], [1, 1, 1]);
-
-        // Read g(0), g(1), g(α) from GPU
-        let out_data = out_buf.read(ctx).expect("round out read");
-        let g0 = from_u32x4([out_data[0], out_data[1], out_data[2],  out_data[3]]);
-        let g1 = from_u32x4([out_data[4], out_data[5], out_data[6],  out_data[7]]);
-        let ga = from_u32x4([out_data[8], out_data[9], out_data[10], out_data[11]]);
+        // 3. Readback via reused staging buffer
+        let (g0, g1, ga) = {
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| { let _ = tx.send(res); });
+            ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+                .expect("poll");
+            rx.recv().unwrap().expect("map");
+            let view = slice.get_mapped_range();
+            let d: &[u32] = bytemuck::cast_slice(&view[..48]);
+            let g0 = from_u32x4([d[0], d[1], d[2],  d[3]]);
+            let g1 = from_u32x4([d[4], d[5], d[6],  d[7]]);
+            let ga = from_u32x4([d[8], d[9], d[10], d[11]]);
+            drop(view);
+            staging.unmap();
+            (g0, g1, ga)
+        };
 
         let rp = RoundPoly([g0, g1, ga]);
         transcript.absorb_field(rp.0[0]);
@@ -148,42 +192,32 @@ pub fn prove_gpu<T: Transcript>(
 
         let r = transcript.squeeze_challenge();
 
-        // ── Fold: fix current variable to r ──────────────────────────────────
-        let fold_params = FoldParams {
+        // 4. Write fold params + dispatch fold
+        fold_uniform.write(ctx, &[FoldParams {
             half: current_half,
             _pad: [0; 3],
             r: to_u32x4(r),
-        };
-        let fold_uniform = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("fold_params"),
-            contents: bytemuck::bytes_of(&fold_params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
-        let fold_pipeline = cache.get_or_compile(ctx, FOLD_ENTRY, SHADER_SRC, FOLD_ENTRY);
-        let fold_bg_layout = fold_pipeline.get_bind_group_layout(0);
-        let fold_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fold_bg"),
-            layout: &fold_bg_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: fold_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: table_buf.inner.as_entire_binding(),
-                },
-            ],
-        });
+        }]);
 
         let wg = current_half.div_ceil(256);
-        dispatcher.dispatch(&fold_pipeline, &[&fold_bg], [wg, 1, 1]);
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(fold_pipeline);
+                pass.set_bind_group(0, &fold_bg, &[]);
+                pass.dispatch_workgroups(wg, 1, 1);
+            }
+            ctx.queue.submit(std::iter::once(encoder.finish()));
+        }
 
         current_half >>= 1;
     }
 
-    // final_eval = table[0]: download first 4 u32s
+    // final_eval = table[0]
     let final_data = table_buf.read(ctx).expect("final read");
     let final_eval = from_u32x4([final_data[0], final_data[1], final_data[2], final_data[3]]);
 

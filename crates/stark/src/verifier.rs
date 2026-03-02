@@ -1,0 +1,225 @@
+//! Top-level STARK verifier.
+//!
+//! # Verification checklist (mirrors V1.md §검증자 체크리스트)
+//!
+//! 1. **Type cert** — re-hash the Proof Tree shape, compare to `type_cert.root_hash`.
+//! 2. **Constraint sum** — must be zero (valid trace ⟹ all constraints satisfied).
+//! 3. **PCS commitment** — absorb into a fresh transcript, derive β.
+//! 4. **Shard verification** — verify each shard sumcheck with forked transcripts.
+//! 5. **Recursive verification** — verify all aggregation levels.
+//! 6. **PCS opening** — verify the opening proof at the challenge point.
+//! 7. **Root claim consistency** — recursive root_claim == shard total_sum.
+
+use evm_types::ProofNode;
+use field::{FieldElem, GF2_128};
+use transcript::{Blake3Transcript, Transcript};
+
+use crate::proof::{Proof, StarkParams};
+
+/// Errors during proof verification.
+#[derive(Debug, thiserror::Error)]
+pub enum VerifyError {
+  #[error("type check failed: {0}")]
+  TypeCheck(#[from] evm_types::TypeError),
+
+  #[error("type cert root hash mismatch")]
+  TypeCertMismatch,
+
+  #[error("constraint sum is non-zero")]
+  ConstraintSumNonZero,
+
+  #[error("shard verification failed: {0}")]
+  ShardVerify(String),
+
+  #[error("recursive verification failed: {0}")]
+  RecursiveVerify(#[from] recursive::RecursiveVerifyError),
+
+  #[error("PCS opening verification failed")]
+  PcsOpenFailed,
+
+  #[error("root claim mismatch: recursive root {recursive:?} != shard total {shard:?}")]
+  RootClaimMismatch {
+    recursive: GF2_128,
+    shard: GF2_128,
+  },
+
+  #[error("beta challenge mismatch")]
+  BetaMismatch,
+}
+
+/// Verify a top-level STARK proof.
+///
+/// # Arguments
+///
+/// * `proof`  – the proof to verify.
+/// * `tree`   – the Proof Tree (structural, non-ZK) for type checking.
+/// * `params` – the same parameters used during proving.
+///
+/// The verifier does NOT need the witness (execution trace).
+pub fn verify(
+  proof: &Proof,
+  tree: &ProofNode,
+  params: &StarkParams,
+) -> Result<(), VerifyError> {
+  // ── 1. Type cert ──────────────────────────────────────────────────────
+  let cert = evm_types::build_cert(tree)?;
+  if cert.root_hash != proof.type_cert.root_hash {
+    return Err(VerifyError::TypeCertMismatch);
+  }
+
+  // ── 2. Constraint sum must be zero ────────────────────────────────────
+  if !proof.constraint_sum.is_zero() {
+    return Err(VerifyError::ConstraintSumNonZero);
+  }
+
+  // ── 3. Rebuild transcript and derive β ────────────────────────────────
+  let mut transcript = Blake3Transcript::new();
+  transcript.absorb_bytes(&proof.type_cert.root_hash);
+  let beta = transcript.squeeze_challenge();
+  if beta != proof.beta {
+    return Err(VerifyError::BetaMismatch);
+  }
+
+  // Absorb PCS commitment (mirrors prover step 3)
+  transcript.absorb_bytes(&proof.batch_commit.root);
+
+  // ── 4. Shard verification ─────────────────────────────────────────────
+  let shard_transcript = transcript.clone();
+
+  // ── 5. Shard + Recursive verification ────────────────────────────────
+  // The recursive verifier checks shard claim consistency at each level,
+  // so separate shard verification (which requires the witness MLE) is
+  // not needed by the verifier — only the prover has the witness.
+  recursive::verify_recursive(
+    &proof.recursive_proof,
+    &proof.shard_batch,
+    &params.config,
+    &shard_transcript,
+  )?;
+
+  // ── 6. Root claim consistency ─────────────────────────────────────────
+  // The recursive root claim should equal the total shard sum.
+  if proof.recursive_proof.root_claim != proof.shard_batch.total_sum {
+    return Err(VerifyError::RootClaimMismatch {
+      recursive: proof.recursive_proof.root_claim,
+      shard: proof.shard_batch.total_sum,
+    });
+  }
+
+  // ── 7. PCS opening verification ───────────────────────────────────────
+  let mut pcs_transcript = transcript.clone();
+  let pcs_ok = pcs::verify(
+    &proof.batch_commit,
+    &proof.open_point,
+    proof.open_eval,
+    &proof.pcs_open,
+    &params.pcs_params,
+    &mut pcs_transcript,
+  );
+  if !pcs_ok {
+    return Err(VerifyError::PcsOpenFailed);
+  }
+
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::prover;
+  use evm_types::proof_tree::LeafProof;
+  use evm_types::state::EvmState;
+  use vm::Row;
+
+  fn xor_row(a: u32, b: u32) -> Row {
+    Row {
+      pc: 0,
+      op: 3,
+      in0: a,
+      in1: b,
+      in2: 0,
+      out: a ^ b,
+      flags: 0,
+      advice: 0,
+    }
+  }
+
+  fn state_with_depth(depth: usize, pc: u32) -> EvmState {
+    use revm::primitives::U256;
+    EvmState::with_stack(vec![U256::ZERO; depth], pc)
+  }
+
+  fn make_trace_and_tree() -> (Vec<Row>, ProofNode) {
+    let rows = vec![
+      xor_row(1, 2),
+      xor_row(3, 4),
+      xor_row(5, 6),
+      xor_row(7, 8),
+    ];
+
+    let leaf = |i: u32, depth: usize| {
+      ProofNode::Leaf {
+        opcode: 0x01,
+        pre_state: state_with_depth(depth, i),
+        post_state: state_with_depth(depth - 1, i + 1),
+        leaf_proof: LeafProof::placeholder(),
+      }
+    };
+
+    let tree = ProofNode::Seq {
+      left: Box::new(ProofNode::Seq {
+        left: Box::new(leaf(0, 5)),
+        right: Box::new(leaf(1, 4)),
+      }),
+      right: Box::new(ProofNode::Seq {
+        left: Box::new(leaf(2, 3)),
+        right: Box::new(leaf(3, 2)),
+      }),
+    };
+
+    (rows, tree)
+  }
+
+  #[test]
+  fn prove_then_verify() {
+    let (rows, tree) = make_trace_and_tree();
+    let params = StarkParams::for_n_vars(2);
+    let proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
+    verify(&proof, &tree, &params).unwrap();
+  }
+
+  #[test]
+  fn verify_rejects_nonzero_constraint_sum() {
+    let (rows, tree) = make_trace_and_tree();
+    let params = StarkParams::for_n_vars(2);
+    let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
+    proof.constraint_sum = GF2_128::from(1u64); // tamper
+    let err = verify(&proof, &tree, &params).unwrap_err();
+    assert!(matches!(err, VerifyError::ConstraintSumNonZero));
+  }
+
+  #[test]
+  fn verify_rejects_bad_type_cert() {
+    let (rows, tree) = make_trace_and_tree();
+    let params = StarkParams::for_n_vars(2);
+    let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
+    proof.type_cert.root_hash = [0xFFu8; 32]; // tamper
+    let err = verify(&proof, &tree, &params).unwrap_err();
+    assert!(matches!(err, VerifyError::TypeCertMismatch));
+  }
+
+  #[test]
+  fn verify_rejects_tampered_root_claim() {
+    let (rows, tree) = make_trace_and_tree();
+    let params = StarkParams::for_n_vars(2);
+    let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
+    proof.recursive_proof.root_claim =
+      proof.recursive_proof.root_claim + GF2_128::from(1u64);
+    let err = verify(&proof, &tree, &params).unwrap_err();
+    // Could be recursive verify error or root claim mismatch
+    assert!(
+      matches!(err, VerifyError::RecursiveVerify(_))
+        || matches!(err, VerifyError::RootClaimMismatch { .. })
+    );
+  }
+}

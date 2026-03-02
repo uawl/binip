@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 field = { path = "../field" }
+blake3 = { workspace = true }
 
 [dev-dependencies]

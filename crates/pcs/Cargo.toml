@@ -1,12 +1,15 @@
 [package]
 name = "pcs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 field      = { path = "../field" }
 transcript = { path = "../transcript" }
+gpu        = { path = "../gpu" }
 blake3     = { workspace = true }
+bytemuck   = { workspace = true }
+wgpu       = { workspace = true }
 
 [dev-dependencies]
 poly       = { path = "../poly" }

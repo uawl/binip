@@ -18,6 +18,16 @@ pub struct VisionSponge {
     pub(crate) filled: usize, // bytes written into buf
 }
 
+impl Clone for VisionSponge {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state,
+            buf: self.buf,
+            filled: self.filled,
+        }
+    }
+}
+
 impl VisionSponge {
     pub fn new() -> Self {
         Self {

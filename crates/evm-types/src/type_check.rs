@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::{
-  opcode::stack_effect,
+  opcode::{self, stack_effect},
   proof_tree::{ProofNode, TypeCert},
   state::EvmStateType,
 };
@@ -42,6 +42,29 @@ pub enum TypeError {
          not_taken depth={not_taken}"
   )]
   BranchTypeMismatch { taken: usize, not_taken: usize },
+
+  #[error(
+    "memory shrank: opcode 0x{opcode:02x} post memory_size {post} < pre memory_size {pre}"
+  )]
+  MemoryShrink {
+    opcode: u8,
+    pre: usize,
+    post: usize,
+  },
+
+  #[error(
+    "storage touched count decreased: opcode 0x{opcode:02x} post {post} < pre {pre}"
+  )]
+  StorageShrink {
+    opcode: u8,
+    pre: usize,
+    post: usize,
+  },
+
+  #[error(
+    "invalid jump destination: opcode 0x{opcode:02x} target pc={target} not in jumpdest table"
+  )]
+  InvalidJumpDest { opcode: u8, target: u32 },
 }
 
 /// Type-check a [`ProofNode`] tree.
@@ -97,21 +120,60 @@ pub fn type_check(node: &ProofNode) -> Result<(EvmStateType, EvmStateType), Type
         });
       }
 
-      Ok((
-        EvmStateType {
-          stack_depth: pre_depth,
-        },
-        EvmStateType {
-          stack_depth: actual,
-        },
-      ))
+      // ── Memory: can only grow ──────────────────────────────────────
+      let pre_mem = pre_state.memory.len();
+      let post_mem = post_state.memory.len();
+      if post_mem < pre_mem {
+        return Err(TypeError::MemoryShrink {
+          opcode: op,
+          pre: pre_mem,
+          post: post_mem,
+        });
+      }
+
+      // ── Storage: touched count can only grow ───────────────────────
+      let pre_stor = pre_state.storage.len();
+      let post_stor = post_state.storage.len();
+      if post_stor < pre_stor {
+        return Err(TypeError::StorageShrink {
+          opcode: op,
+          pre: pre_stor,
+          post: post_stor,
+        });
+      }
+
+      // ── Jump destination validation ────────────────────────────────
+      if op == opcode::JUMP || op == opcode::JUMPI {
+        // post_state.pc must be in the jumpdest table
+        let target = post_state.pc;
+        if !pre_state.jumpdest_table.contains(&target) {
+          return Err(TypeError::InvalidJumpDest {
+            opcode: op,
+            target,
+          });
+        }
+      }
+
+      let pre_ty = EvmStateType::from(pre_state);
+      let post_ty = EvmStateType::from(post_state);
+      Ok((pre_ty, post_ty))
     }
 
     ProofNode::Seq { left, right } => {
       let (pre_l, post_l) = type_check(left)?;
       let (pre_r, post_r) = type_check(right)?;
 
-      if post_l.stack_depth != pre_r.stack_depth {
+      if post_l != pre_r {
+        // Check which field disagrees to give a targeted error.
+        if post_l.stack_depth != pre_r.stack_depth {
+          return Err(TypeError::SeqMismatch {
+            left: post_l.stack_depth,
+            right: pre_r.stack_depth,
+          });
+        }
+        // Memory/storage/pc mismatches at seq boundary reported as
+        // stack-depth mismatch with the same values (both sides equal)
+        // — the caller sees the SeqMismatch variant which is sufficient.
         return Err(TypeError::SeqMismatch {
           left: post_l.stack_depth,
           right: pre_r.stack_depth,
@@ -185,6 +247,10 @@ fn write_shape(node: &ProofNode, buf: &mut Vec<u8>) {
       buf.push(*opcode);
       buf.extend_from_slice(&(pre_state.stack.len() as u32).to_le_bytes());
       buf.extend_from_slice(&(post_state.stack.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&(pre_state.memory.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&(post_state.memory.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&pre_state.pc.to_le_bytes());
+      buf.extend_from_slice(&post_state.pc.to_le_bytes());
     }
     ProofNode::Seq { left, right } => {
       buf.push(0x01); // tag: Seq

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use revm::primitives::U256;
 
@@ -30,6 +30,11 @@ pub struct EvmState {
   /// Transient storage slots touched by TLOAD / TSTORE (EIP-1153).
   /// Same shape as `storage` but reset to zero at the end of each transaction.
   pub transient_storage: HashMap<U256, U256>,
+  /// Set of valid JUMPDEST offsets in the deployed bytecode.
+  ///
+  /// Shared across all states in the same execution context.  The type
+  /// checker uses this table to validate JUMP / JUMPI targets.
+  pub jumpdest_table: BTreeSet<u32>,
 }
 
 impl EvmState {
@@ -41,6 +46,7 @@ impl EvmState {
       gas,
       storage: HashMap::new(),
       transient_storage: HashMap::new(),
+      jumpdest_table: BTreeSet::new(),
     }
   }
 
@@ -53,24 +59,50 @@ impl EvmState {
       gas: 1_000_000,
       storage: HashMap::new(),
       transient_storage: HashMap::new(),
+      jumpdest_table: BTreeSet::new(),
+    }
+  }
+
+  /// Constructor with an explicit jumpdest table.
+  pub fn with_jumpdests(stack: Vec<U256>, pc: u32, jumpdests: BTreeSet<u32>) -> Self {
+    Self {
+      stack,
+      memory: Vec::new(),
+      pc,
+      gas: 1_000_000,
+      storage: HashMap::new(),
+      transient_storage: HashMap::new(),
+      jumpdest_table: jumpdests,
     }
   }
 }
 
 /// Type-level abstraction of an [`EvmState`].
 ///
-/// Because every EVM stack slot is a U256, the only structural type
-/// information relevant to the derivation tree is the **stack depth**.
-/// Memory layout typing is elided (treated uniformly as bytes).
+/// Tracks the structural properties needed to validate derivation trees:
+/// - **Stack depth**: the only "type" of EVM stack slots.
+/// - **Memory size**: number of accessible 32-byte words (monotonically grows).
+/// - **Storage touched**: number of unique storage slots accessed.
+/// - **PC**: included so jump-target validation can be checked structurally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvmStateType {
+  /// Current number of items on the operand stack.
   pub stack_depth: usize,
+  /// Memory size in bytes (always a multiple of 32).
+  pub memory_size: usize,
+  /// Number of persistent storage slots touched.
+  pub storage_touched: usize,
+  /// Current program counter.
+  pub pc: u32,
 }
 
 impl From<&EvmState> for EvmStateType {
   fn from(s: &EvmState) -> Self {
     Self {
       stack_depth: s.stack.len(),
+      memory_size: s.memory.len(),
+      storage_touched: s.storage.len(),
+      pc: s.pc,
     }
   }
 }

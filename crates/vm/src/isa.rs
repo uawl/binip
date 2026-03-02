@@ -104,6 +104,71 @@ pub enum MicroOp {
     divisor: Reg,
   },
 
+  /// Assert `(a as u64) * (b as u64) == ((q_hi as u64) << 32) | (q_lo as u64)`.
+  /// Used for multi-limb U256 multiplication verification.  Cost: ~64 AND.
+  CheckMul {
+    q_lo: Reg,
+    q_hi: Reg,
+    a: Reg,
+    b: Reg,
+  },
+
+  /// Assert `regs[a] * regs[a_inv] ≡ 1 (mod 2^32)`.
+  /// Used for modular inverse verification.  Cost: ~64 AND.
+  CheckInv {
+    a: Reg,
+    a_inv: Reg,
+  },
+
+  /// Assert `regs[r] < 2^bits`.  Cost: ~`bits` AND.
+  RangeCheck {
+    r: Reg,
+    bits: u8,
+  },
+
+  // ── Memory ────────────────────────────────────────────────────────────────
+  /// Load a 32-bit word from VM memory at `addr` into `dst`.
+  Load { dst: Reg, addr: u32 },
+
+  /// Store the 32-bit value in `src` to VM memory at `addr`.
+  Store { addr: u32, src: Reg },
+
+  /// Load a U256 (8 consecutive u32 words) from VM memory at the byte
+  /// offset in `regs[offset_reg] / 4` into `dst..dst+7`.
+  MLoad { dst: Reg, offset_reg: Reg },
+
+  /// Store a U256 (8 words from `src..src+7`) to VM memory at the byte
+  /// offset in `regs[offset_reg] / 4`.
+  MStore { offset_reg: Reg, src: Reg },
+
+  /// Store the low byte of `regs[src]` to VM memory at the byte offset
+  /// in `regs[offset_reg]`.  The surrounding u32 word is read-modify-written.
+  MStore8 { offset_reg: Reg, src: Reg },
+
+  // ── Storage ────────────────────────────────────────────────────────────────
+  /// Load a U256 value from persistent storage by key.
+  /// Key = 8 limbs at `key_reg..key_reg+7`, result written to `dst..dst+7`.
+  SLoad { dst: Reg, key_reg: Reg },
+
+  /// Store a U256 value to persistent storage.
+  /// Key = 8 limbs at `key_reg..key_reg+7`, value = 8 limbs at `val_reg..val_reg+7`.
+  SStore { key_reg: Reg, val_reg: Reg },
+
+  // ── Transient storage (EIP-1153) ──────────────────────────────────────────
+  /// Load a U256 value from transient storage by key.
+  /// Key = 8 limbs at `key_reg..key_reg+7`, result written to `dst..dst+7`.
+  /// Transient storage is reset at the end of each transaction.
+  TLoad { dst: Reg, key_reg: Reg },
+
+  /// Store a U256 value to transient storage.
+  /// Key = 8 limbs at `key_reg..key_reg+7`, value = 8 limbs at `val_reg..val_reg+7`.
+  TStore { key_reg: Reg, val_reg: Reg },
+
+  // ── Keccak sub-proof ──────────────────────────────────────────────────────
+  /// Absorb a Keccak sub-proof commitment.  The Keccak circuit is proved
+  /// separately; the main circuit only sees the commitment.  Cost: 0 AND.
+  KeccakLeaf { dst_commit: Reg, input: Reg },
+
   // ── Proof-tree / EVM structural ───────────────────────────────────────────
   /// Sequential composition: `dst` receives a handle to `Seq(left, right)`.
   /// At VM level this is a structural annotation; the circuit enforces typing.
@@ -112,6 +177,10 @@ pub enum MicroOp {
   /// EVM opcode structural type-check annotation.
   /// `pre` / `post` registers hold opaque `EvmStateType` handles.
   TypeCheck { opcode: u8, pre: Reg, post: Reg },
+
+  // ── Control ───────────────────────────────────────────────────────────────
+  /// Halt execution.  Any remaining program ops are skipped.
+  Done,
 }
 
 impl MicroOp {
@@ -131,8 +200,22 @@ impl MicroOp {
       Self::Mov { .. } => 10,
       Self::AdviceLoad { .. } => 11,
       Self::CheckDiv { .. } => 12,
-      Self::Compose { .. } => 13,
-      Self::TypeCheck { .. } => 14,
+      Self::CheckMul { .. } => 13,
+      Self::CheckInv { .. } => 14,
+      Self::RangeCheck { .. } => 15,
+      Self::Load { .. } => 16,
+      Self::Store { .. } => 17,
+      Self::KeccakLeaf { .. } => 18,
+      Self::Compose { .. } => 19,
+      Self::TypeCheck { .. } => 20,
+      Self::Done => 21,
+      Self::MLoad { .. } => 22,
+      Self::MStore { .. } => 23,
+      Self::MStore8 { .. } => 24,
+      Self::SLoad { .. } => 25,
+      Self::SStore { .. } => 26,
+      Self::TLoad { .. } => 27,
+      Self::TStore { .. } => 28,
     }
   }
 }

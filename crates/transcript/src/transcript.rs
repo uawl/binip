@@ -15,6 +15,7 @@ pub trait Transcript {
 }
 
 /// Vision-4 based Fiat-Shamir transcript.
+#[derive(Clone)]
 pub struct VisionTranscript {
     sponge: VisionSponge,
 }
@@ -24,6 +25,20 @@ impl VisionTranscript {
         Self {
             sponge: VisionSponge::new(),
         }
+    }
+
+    /// Create a domain-separated child transcript.
+    ///
+    /// The child absorbs the parent’s current state plus a unique
+    /// `(label, idx)` tag, producing a challenge stream that is
+    /// cryptographically independent of other forks.
+    pub fn fork(&self, label: &str, idx: u32) -> Self {
+        let mut child = self.clone();
+        child.sponge.absorb(b"binip:fork:");
+        child.sponge.absorb(label.as_bytes());
+        child.sponge.absorb(b":");
+        child.sponge.absorb(&idx.to_le_bytes());
+        child
     }
 }
 
@@ -115,5 +130,46 @@ mod tests {
         let c1 = t.squeeze_challenge();
         let c2 = t.squeeze_challenge();
         assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn test_fork_produces_different_challenges() {
+        let mut parent = VisionTranscript::new();
+        parent.absorb_bytes(b"setup");
+        let mut f1 = parent.fork("shard", 0);
+        let mut f2 = parent.fork("shard", 1);
+        assert_ne!(f1.squeeze_challenge(), f2.squeeze_challenge());
+    }
+
+    #[test]
+    fn test_fork_different_labels_differ() {
+        let parent = VisionTranscript::new();
+        let mut fa = parent.fork("alpha", 0);
+        let mut fb = parent.fork("beta", 0);
+        assert_ne!(fa.squeeze_challenge(), fb.squeeze_challenge());
+    }
+
+    #[test]
+    fn test_fork_does_not_mutate_parent() {
+        let mut t = VisionTranscript::new();
+        t.absorb_bytes(b"data");
+        let c_before = {
+            let mut tmp = t.clone();
+            tmp.squeeze_challenge()
+        };
+        let _child = t.fork("x", 42);
+        let c_after = {
+            let mut tmp = t.clone();
+            tmp.squeeze_challenge()
+        };
+        assert_eq!(c_before, c_after);
+    }
+
+    #[test]
+    fn test_fork_deterministic() {
+        let parent = VisionTranscript::new();
+        let mut f1 = parent.fork("test", 7);
+        let mut f2 = parent.fork("test", 7);
+        assert_eq!(f1.squeeze_challenge(), f2.squeeze_challenge());
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gpu", "crates/vm", "crates/evm-types", "crates/field", "crates/poly", "crates/transcript", "crates/sumcheck", "crates/pcs"]
+members = ["crates/gpu", "crates/vm", "crates/evm-types", "crates/field", "crates/poly", "crates/transcript", "crates/sumcheck", "crates/pcs", "crates/circuit", "crates/shard", "crates/recursive", "crates/stark", "crates/e2e", "crates/bench"]
 
 [workspace.dependencies]
 wgpu      = "28.0.0"
@@ -13,3 +13,6 @@ bincode   = "2"
 rand      = "0.9"
 zeroize   = "1"
 revm      = "34"
+
+[profile.release]
+debug = true

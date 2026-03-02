@@ -1,0 +1,23 @@
+[package]
+name = "stark"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+field      = { path = "../field" }
+poly       = { path = "../poly" }
+sumcheck   = { path = "../sumcheck" }
+shard      = { path = "../shard" }
+recursive  = { path = "../recursive" }
+pcs        = { path = "../pcs" }
+circuit    = { path = "../circuit" }
+evm-types  = { path = "../evm-types" }
+vm         = { path = "../vm" }
+transcript = { path = "../transcript" }
+gpu        = { path = "../gpu" }
+thiserror  = { workspace = true }
+blake3     = { workspace = true }
+rand       = { workspace = true }
+
+[dev-dependencies]
+revm       = { workspace = true }

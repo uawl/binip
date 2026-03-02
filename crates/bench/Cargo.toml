@@ -1,0 +1,21 @@
+[package]
+name = "bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bench]]
+name = "e2e_bench"
+harness = false
+
+[[bin]]
+name = "profile_cpu"
+path = "src/profile_cpu.rs"
+
+[dependencies]
+e2e        = { path = "../e2e" }
+gpu        = { path = "../gpu" }
+vm         = { path = "../vm" }
+evm-types  = { path = "../evm-types" }
+stark      = { path = "../stark" }
+revm       = { workspace = true }
+criterion  = { version = "0.5", features = ["html_reports"] }

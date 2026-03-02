@@ -145,8 +145,6 @@ impl GF2_128 {
   }
 }
 
-// (The placeholder code above in FieldElem impl is replaced entirely here.)
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -226,4 +224,5 @@ mod tests {
       assert_eq!(x * x.inv(), GF2_128::one());
     }
   }
+
 }

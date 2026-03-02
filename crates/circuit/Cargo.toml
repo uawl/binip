@@ -1,0 +1,11 @@
+[package]
+name = "circuit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+field     = { path = "../field" }
+poly      = { path = "../poly" }
+sumcheck  = { path = "../sumcheck" }
+vm        = { path = "../vm" }
+thiserror = { workspace = true }

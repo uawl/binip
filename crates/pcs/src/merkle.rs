@@ -87,3 +87,97 @@ impl MerkleProof {
         current == root
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf_hash(data: &[u8]) -> Hash {
+        *blake3::hash(data).as_bytes()
+    }
+
+    #[test]
+    fn build_and_root_deterministic() {
+        let leaves: Vec<Hash> = (0u8..4).map(|i| leaf_hash(&[i])).collect();
+        let t1 = MerkleTree::build(&leaves);
+        let t2 = MerkleTree::build(&leaves);
+        assert_eq!(t1.root(), t2.root());
+    }
+
+    #[test]
+    fn prove_verify_all_leaves() {
+        let leaves: Vec<Hash> = (0u8..8).map(|i| leaf_hash(&[i])).collect();
+        let tree = MerkleTree::build(&leaves);
+        let root = tree.root();
+        for (i, &lf) in leaves.iter().enumerate() {
+            let proof = tree.prove(i);
+            assert!(proof.verify(lf, root, tree.n), "leaf {i} should verify");
+        }
+    }
+
+    #[test]
+    fn proof_rejects_wrong_leaf() {
+        let leaves: Vec<Hash> = (0u8..4).map(|i| leaf_hash(&[i])).collect();
+        let tree = MerkleTree::build(&leaves);
+        let root = tree.root();
+        let proof = tree.prove(0);
+        let wrong_leaf = leaf_hash(&[0xFF]);
+        assert!(!proof.verify(wrong_leaf, root, tree.n));
+    }
+
+    #[test]
+    fn proof_rejects_wrong_root() {
+        let leaves: Vec<Hash> = (0u8..4).map(|i| leaf_hash(&[i])).collect();
+        let tree = MerkleTree::build(&leaves);
+        let proof = tree.prove(1);
+        let wrong_root = [0xAB; 32];
+        assert!(!proof.verify(leaves[1], wrong_root, tree.n));
+    }
+
+    #[test]
+    fn non_power_of_two_leaves() {
+        // 3 leaves → padded to 4
+        let leaves: Vec<Hash> = (0u8..3).map(|i| leaf_hash(&[i])).collect();
+        let tree = MerkleTree::build(&leaves);
+        assert_eq!(tree.n, 4);
+        let root = tree.root();
+        for (i, &lf) in leaves.iter().enumerate() {
+            let proof = tree.prove(i);
+            assert!(proof.verify(lf, root, tree.n), "leaf {i} should verify");
+        }
+    }
+
+    #[test]
+    fn single_leaf() {
+        let leaves = vec![leaf_hash(b"only")];
+        let tree = MerkleTree::build(&leaves);
+        assert_eq!(tree.n, 1);
+        let proof = tree.prove(0);
+        assert!(proof.verify(leaves[0], tree.root(), tree.n));
+        assert_eq!(proof.siblings.len(), 0);
+    }
+
+    #[test]
+    fn two_leaves_sibling_swap() {
+        let leaves = vec![leaf_hash(b"L"), leaf_hash(b"R")];
+        let tree = MerkleTree::build(&leaves);
+        let root = tree.root();
+        // Proof for index 0 should have sibling = leaves[1] hash
+        let p0 = tree.prove(0);
+        let p1 = tree.prove(1);
+        assert!(p0.verify(leaves[0], root, tree.n));
+        assert!(p1.verify(leaves[1], root, tree.n));
+        // Cross-verify must fail
+        assert!(!p0.verify(leaves[1], root, tree.n));
+        assert!(!p1.verify(leaves[0], root, tree.n));
+    }
+
+    #[test]
+    fn proof_depth_is_log2() {
+        let leaves: Vec<Hash> = (0u8..16).map(|i| leaf_hash(&[i])).collect();
+        let tree = MerkleTree::build(&leaves);
+        let proof = tree.prove(5);
+        // log2(16) = 4 siblings
+        assert_eq!(proof.siblings.len(), 4);
+    }
+}

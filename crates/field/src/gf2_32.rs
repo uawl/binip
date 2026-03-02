@@ -47,9 +47,66 @@ impl SubAssign for GF2_32 {
 
 // ─── carry-less multiplication ────────────────────────────────────────────────
 
-/// Portable 32×32 → 64-bit carry-less multiply.
-#[inline]
+/// 32×32 → 64-bit carry-less multiply.
+///
+/// Dispatches at runtime to hardware intrinsics when available:
+///   - x86_64: PCLMULQDQ
+///   - aarch64: PMULL (via AES extension)
+///   - fallback: portable bit-loop
+#[inline(always)]
 fn clmul32(a: u32, b: u32) -> u64 {
+  // Compile-time fast path: if the target already enables the feature,
+  // skip the runtime check entirely.
+  #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+  { return unsafe { clmul32_pclmul(a, b) }; }
+
+  #[cfg(all(target_arch = "x86_64", not(target_feature = "pclmulqdq")))]
+  {
+    if std::arch::is_x86_feature_detected!("pclmulqdq") {
+      return unsafe { clmul32_pclmul(a, b) };
+    }
+  }
+
+  #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+  { return unsafe { clmul32_pmull(a, b) }; }
+
+  #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+  {
+    if std::arch::is_aarch64_feature_detected!("aes") {
+      return unsafe { clmul32_pmull(a, b) };
+    }
+  }
+
+  clmul32_portable(a, b)
+}
+
+// ── x86_64 PCLMULQDQ ─────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq")]
+#[inline]
+unsafe fn clmul32_pclmul(a: u32, b: u32) -> u64 {
+  use std::arch::x86_64::*;
+  let va = _mm_set_epi64x(0, a as i64);
+  let vb = _mm_set_epi64x(0, b as i64);
+  let r  = _mm_clmulepi64_si128(va, vb, 0x00);
+  _mm_cvtsi128_si64(r) as u64
+}
+
+// ── aarch64 PMULL ─────────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[inline]
+unsafe fn clmul32_pmull(a: u32, b: u32) -> u64 {
+  use std::arch::aarch64::*;
+  vmull_p64(a as u64, b as u64) as u64
+}
+
+// ── portable fallback ─────────────────────────────────────────────────────────
+
+#[inline]
+fn clmul32_portable(a: u32, b: u32) -> u64 {
   let mut lo: u32 = 0;
   let mut hi: u32 = 0;
   for i in 0..32u32 {
