@@ -89,8 +89,10 @@ pub struct Commitment {
 pub struct PcsState {
   pub commitment: Commitment,
   params: PcsParams,
-  raw_rows: Vec<Vec<GF2_128>>,     // [n_rows][k]
-  encoded_rows: Vec<Vec<GF2_128>>, // [n_rows][4k]
+  /// Flat row-major buffer: `raw_flat[i * k + j]` = `M[i][j]`.
+  raw_flat: Vec<GF2_128>,
+  /// Flat row-major buffer: `enc_flat[i * n_enc + j]` = encoded row `i`, column `j`.
+  enc_flat: Vec<GF2_128>,
   tree: merkle::MerkleTree,
 }
 
@@ -126,19 +128,23 @@ pub fn commit<T: Transcript>(
   let n_enc = params.n_enc_cols();
   assert_eq!(evals.len(), n_rows * k, "evals.len() must equal 2^n_vars");
 
-  // Split into rows: row i = evals[i*k .. (i+1)*k]
-  let raw_rows: Vec<Vec<GF2_128>> = (0..n_rows)
-    .map(|i| evals[i * k..(i + 1) * k].to_vec())
-    .collect();
+  // Keep raw evals as flat buffer (already row-major).
+  let raw_flat = evals.to_vec();
 
-  // Encode every row
+  // Encode every row into a flat buffer.
   let code = code::LinearCode::new(k);
-  let encoded_rows: Vec<Vec<GF2_128>> = raw_rows.iter().map(|row| code.encode(row)).collect();
+  let mut enc_flat = vec![GF2_128::zero(); n_rows * n_enc];
+  for i in 0..n_rows {
+    code.encode_into(
+      &raw_flat[i * k..(i + 1) * k],
+      &mut enc_flat[i * n_enc..(i + 1) * n_enc],
+    );
+  }
 
   // Hash each column to form Merkle leaves
   let leaf_hashes: Vec<Hash> = (0..n_enc)
     .map(|j| {
-      let col: Vec<GF2_128> = encoded_rows.iter().map(|row| row[j]).collect();
+      let col: Vec<GF2_128> = (0..n_rows).map(|i| enc_flat[i * n_enc + j]).collect();
       hash_column(&col)
     })
     .collect();
@@ -158,8 +164,8 @@ pub fn commit<T: Transcript>(
   let state = PcsState {
     commitment: commitment.clone(),
     params: params.clone(),
-    raw_rows,
-    encoded_rows,
+    raw_flat,
+    enc_flat,
     tree,
   };
 
@@ -180,23 +186,24 @@ pub fn commit_par<T: Transcript>(
   let n_enc = params.n_enc_cols();
   assert_eq!(evals.len(), n_rows * k, "evals.len() must equal 2^n_vars");
 
-  // Split into rows
-  let raw_rows: Vec<Vec<GF2_128>> = (0..n_rows)
-    .map(|i| evals[i * k..(i + 1) * k].to_vec())
-    .collect();
+  // Keep raw evals as flat buffer (already row-major).
+  let raw_flat = evals.to_vec();
 
-  // Encode every row — PARALLEL
+  // Encode every row into a single flat buffer — PARALLEL
   let code = code::LinearCode::new(k);
-  let encoded_rows: Vec<Vec<GF2_128>> = raw_rows
-    .par_iter()
-    .map(|row| code.encode(row))
-    .collect();
+  let mut enc_flat = vec![GF2_128::zero(); n_rows * n_enc];
+  enc_flat
+    .par_chunks_mut(n_enc)
+    .enumerate()
+    .for_each(|(i, dest)| {
+      code.encode_into(&raw_flat[i * k..(i + 1) * k], dest);
+    });
 
   // Hash each column to form Merkle leaves — PARALLEL
   let leaf_hashes: Vec<Hash> = (0..n_enc)
     .into_par_iter()
     .map(|j| {
-      let col: Vec<GF2_128> = encoded_rows.iter().map(|row| row[j]).collect();
+      let col: Vec<GF2_128> = (0..n_rows).map(|i| enc_flat[i * n_enc + j]).collect();
       hash_column(&col)
     })
     .collect();
@@ -216,8 +223,8 @@ pub fn commit_par<T: Transcript>(
   let state = PcsState {
     commitment: commitment.clone(),
     params: params.clone(),
-    raw_rows,
-    encoded_rows,
+    raw_flat,
+    enc_flat,
     tree,
   };
 
@@ -248,11 +255,11 @@ pub fn open<T: Transcript>(
   let eq_hi = eq::eq_evals(&r[..m_rows]);
   let eq_lo = eq::eq_evals(&r[m_rows..]);
 
-  // t_raw[j] = Σ_i eq_hi[i] · M[i][j]
+  // t_raw[j] = Σ_i eq_hi[i] · M[i][j]  (flat buffer indexed)
   let t_raw: Vec<GF2_128> = (0..k)
     .map(|j| {
       (0..n_rows).fold(GF2_128::zero(), |acc, i| {
-        acc + eq_hi[i] * state.raw_rows[i][j]
+        acc + eq_hi[i] * state.raw_flat[i * k + j]
       })
     })
     .collect();
@@ -270,11 +277,11 @@ pub fn open<T: Transcript>(
     .map(|_| (transcript.squeeze_challenge().lo as usize) % n_enc)
     .collect();
 
-  // Build column openings
+  // Build column openings  (strided access into flat enc buffer)
   let column_openings = queries
     .into_iter()
     .map(|j| {
-      let col_elems: Vec<GF2_128> = state.encoded_rows.iter().map(|row| row[j]).collect();
+      let col_elems: Vec<GF2_128> = (0..n_rows).map(|i| state.enc_flat[i * n_enc + j]).collect();
       let proof = state.tree.prove(j);
       ColumnOpening {
         col_idx: j,
@@ -374,9 +381,25 @@ pub fn verify<T: Transcript>(
 fn hash_column(col: &[GF2_128]) -> Hash {
   let mut h = blake3::Hasher::new();
   h.update(b"binip:pcs:col:");
-  for elem in col {
-    h.update(&elem.lo.to_le_bytes());
-    h.update(&elem.hi.to_le_bytes());
+  // GF2_128 is #[repr(C)] { lo: u64, hi: u64 } — on little-endian this is
+  // exactly the 16-byte wire format.  A single bulk update lets blake3 use
+  // its SIMD multi-chunk path without per-element function-call overhead.
+  #[cfg(target_endian = "little")]
+  {
+    let bytes: &[u8] = unsafe {
+      std::slice::from_raw_parts(
+        col.as_ptr() as *const u8,
+        col.len() * std::mem::size_of::<GF2_128>(),
+      )
+    };
+    h.update(bytes);
+  }
+  #[cfg(not(target_endian = "little"))]
+  {
+    for elem in col {
+      h.update(&elem.lo.to_le_bytes());
+      h.update(&elem.hi.to_le_bytes());
+    }
   }
   *h.finalize().as_bytes()
 }

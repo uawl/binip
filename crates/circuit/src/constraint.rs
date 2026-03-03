@@ -120,22 +120,30 @@ pub fn eval_constraint(tag: u32, cols: &[GF2_128; 8]) -> Result<GF2_128, Constra
     // ── Check (tag 12): CheckDiv ────────────────────────────────────────
     // dividend == divisor * quot + rem
     // Columns: in0 = quot, in1 = rem, in2 = dividend, advice = divisor
-    // Constraint: in2 + advice * in0 + in1 = 0  (char 2: sub = add)
+    // Integer multiplication cannot be checked algebraically in GF(2^128).
+    // Soundness is enforced by:
+    //   1. Byte-level Mul LUT for divisor×quot products
+    //   2. Mul accumulation Add LUT for column-sum verification
+    //   3. Add LUT carry chain for product+rem = dividend
+    //   4. Reconstruction binds all operands to committed trace
     // Note: range check (rem < divisor) is a separate RangeCheck op.
-    12 => Ok(in2 + _advice * in0 + in1),
+    12 => Ok(GF2_128::zero()),
 
     // ── Check (tag 13): CheckMul ────────────────────────────────────────
     // a * b == (q_hi << 128) | q_lo
     // Columns: in0 = q_lo, in1 = q_hi, in2 = a, advice = b
-    // Constraint: in2 * advice + in1 * shift128 + in0 = 0
-    13 => {
-      let shift128 = GF2_128::new(0x87, 0);
-      Ok(in2 * _advice + in1 * shift128 + in0)
-    }
+    // Integer multiplication cannot be checked algebraically in GF(2^128).
+    // Soundness is enforced by Mul LUT byte products + accumulation
+    // Add LUT + reconstruction binding.
+    13 => Ok(GF2_128::zero()),
 
     // ── Check (tag 14): CheckInv ────────────────────────────────────────
-    // a * a_inv ≡ 1  →  in0 * in1 + 1 = 0
-    14 => Ok(in0 * in1 + GF2_128::one()),
+    // a * a_inv ≡ 1 mod 2^128 → widening_mul(a, a_inv).lo = 1
+    // Columns: in0 = a, in1 = a_inv
+    // Integer multiplication cannot be checked algebraically in GF(2^128).
+    // Soundness is enforced by Mul LUT byte products + accumulation
+    // Add LUT proving the low 128 bits of a×a_inv equal 1.
+    14 => Ok(GF2_128::zero()),
 
     // ── Check (tag 15): RangeCheck ──────────────────────────────────────
     // Verify in0 < 2^bits.  At the field level the prover provides a
@@ -295,6 +303,25 @@ pub fn batched_constraint_with_tag(
   Ok(selector(tag, beta) * c)
 }
 
+/// Precompute selector values for all tags at a fixed `beta`.
+///
+/// `result[t] = sel(t, beta)` for `t` in `0..NUM_TAGS`.
+/// Avoids 28 GF multiplications per row when the selector table is reused.
+pub fn precompute_selectors(beta: GF2_128) -> [GF2_128; NUM_TAGS as usize] {
+  std::array::from_fn(|t| selector(t as u32, beta))
+}
+
+/// Like [`batched_constraint_with_tag`] but uses a precomputed selector value.
+#[inline]
+pub fn batched_constraint_with_precomputed_sel(
+  tag: u32,
+  cols: &[GF2_128; 8],
+  sel: GF2_128,
+) -> Result<GF2_128, ConstraintError> {
+  let c = eval_constraint(tag, cols)?;
+  Ok(sel * c)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -387,26 +414,32 @@ mod tests {
     assert_eq!(eval_constraint(21, &cols).unwrap(), GF2_128::zero());
   }
 
-  // ── CheckInv ──────────────────────────────────────────────────────────
+  // ── CheckInv, CheckMul, CheckDiv ────────────────────────────────────────
+  // Tags 12, 13, 14 now return zero() — soundness is delegated to LogUp.
+  // The algebraic constraint no longer rejects invalid values; this is
+  // tested at the lookup level instead.
 
   #[test]
-  fn check_inv_valid() {
-    // in0 * in1 = 1
-    let a = f(7);
-    let a_inv = a.inv();
+  fn check_inv_returns_zero() {
+    // Tag 14 always returns zero (delegated to LogUp)
     let mut cols = zero_cols();
-    cols[2] = a;
-    cols[3] = a_inv;
+    cols[2] = f(3);
+    cols[3] = f(5);
     assert_eq!(eval_constraint(14, &cols).unwrap(), GF2_128::zero());
   }
 
   #[test]
-  fn check_inv_invalid() {
-    // in0 * in1 ≠ 1
-    let mut cols = zero_cols();
-    cols[2] = f(3);
-    cols[3] = f(5);
-    assert_ne!(eval_constraint(14, &cols).unwrap(), GF2_128::zero());
+  fn check_div_returns_zero() {
+    // Tag 12 always returns zero (delegated to LogUp)
+    let cols = zero_cols();
+    assert_eq!(eval_constraint(12, &cols).unwrap(), GF2_128::zero());
+  }
+
+  #[test]
+  fn check_mul_returns_zero() {
+    // Tag 13 always returns zero (delegated to LogUp)
+    let cols = zero_cols();
+    assert_eq!(eval_constraint(13, &cols).unwrap(), GF2_128::zero());
   }
 
   // ── Unknown tag ───────────────────────────────────────────────────────

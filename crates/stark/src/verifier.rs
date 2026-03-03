@@ -11,6 +11,7 @@
 //! 7. **Root claim consistency** — recursive root_claim == shard total_sum.
 
 use circuit::lookup;
+use circuit::state_constraint::extract_boundaries;
 use evm_types::ProofNode;
 use field::{FieldElem, GF2_128};
 use transcript::{Blake3Transcript, Transcript};
@@ -61,6 +62,21 @@ pub enum VerifyError {
 
   #[error("lookup verification failed")]
   LookupVerifyFailed,
+
+  #[error("boundary PCS proof missing (Seq junctions exist)")]
+  MissingBoundaryPcs,
+
+  #[error("boundary PCS proof present but no Seq junctions")]
+  UnexpectedBoundaryPcs,
+
+  #[error("boundary sumcheck verification failed")]
+  BoundarySumcheckFailed,
+
+  #[error("boundary sumcheck claimed non-zero sum")]
+  BoundarySumcheckNonZero,
+
+  #[error("boundary PCS opening verification failed")]
+  BoundaryPcsOpenFailed,
 }
 
 /// Verify a top-level STARK proof.
@@ -86,7 +102,11 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
   let errors = evm_types::consistency_check_all(tree);
   if !errors.is_empty() {
     return Err(VerifyError::ConsistencyCheck(
-      errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+      errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; "),
     ));
   }
 
@@ -109,8 +129,47 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
     return Err(VerifyError::BetaMismatch);
   }
 
+  // ── 3a. Boundary PCS verification (H-1 binding) ──────────────────────
+  // Must come BEFORE γ squeeze to match prover transcript ordering.
+  let boundary_rows = extract_boundaries(tree);
+  let has_boundaries = !boundary_rows.is_empty();
+
+  match (&proof.boundary_pcs, has_boundaries) {
+    (Some(bnd), true) => {
+      // Absorb boundary PCS commitment root (mirrors prover ordering)
+      transcript.absorb_bytes(&bnd.commit.root);
+
+      // Verify boundary sumcheck
+      if !bnd.sumcheck.claimed_sum.is_zero() {
+        return Err(VerifyError::BoundarySumcheckNonZero);
+      }
+
+      let mut bnd_sc_t = transcript.fork("boundary_sc", 0);
+      let bnd_challenges =
+        sumcheck::verify(&bnd.sumcheck, bnd.open_eval, &mut bnd_sc_t)
+          .ok_or(VerifyError::BoundarySumcheckFailed)?;
+
+      // Verify boundary PCS opening
+      let bnd_pcs_params = pcs::PcsParams { n_vars: bnd.n_vars, n_queries: 40 };
+      let mut bnd_pcs_t = transcript.fork("boundary_pcs_open", 0);
+      let bnd_ok = pcs::verify(
+        &bnd.commit,
+        &bnd_challenges,
+        bnd.open_eval,
+        &bnd.pcs_open,
+        &bnd_pcs_params,
+        &mut bnd_pcs_t,
+      );
+      if !bnd_ok {
+        return Err(VerifyError::BoundaryPcsOpenFailed);
+      }
+    }
+    (None, false) => { /* trivially zero, already checked above */ }
+    (None, true) => return Err(VerifyError::MissingBoundaryPcs),
+    (Some(_), false) => return Err(VerifyError::UnexpectedBoundaryPcs),
+  }
+
   // ── 3b. Derive γ and verify reconstruction + lookups ──────────────────
-  // (γ is squeezed BEFORE PCS commit, matching prover ordering)
   let gamma = transcript.squeeze_challenge();
   if gamma != proof.gamma {
     return Err(VerifyError::GammaMismatch);
@@ -118,7 +177,11 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
   if !proof.reconstruction_sum.is_zero() {
     return Err(VerifyError::ReconstructionSumNonZero);
   }
-  if !lookup::verify_lookups_par(&proof.lookup_proofs, &mut proof.lookup_witness.clone(), &mut transcript.clone()) {
+  if !lookup::verify_lookups_par(
+    &proof.lookup_proofs,
+    &proof.lookup_commits,
+    &mut transcript.clone(),
+  ) {
     return Err(VerifyError::LookupVerifyFailed);
   }
 

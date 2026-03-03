@@ -31,9 +31,9 @@ pub mod table;
 pub mod verifier;
 
 pub use proof::LogUpProof;
-pub use prover::prove;
+pub use prover::{hash_witness, prove, prove_committed};
 pub use table::LookupTable;
-pub use verifier::{LogUpClaims, verify};
+pub use verifier::{LogUpClaims, verify, verify_committed};
 
 #[cfg(test)]
 mod tests {

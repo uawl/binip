@@ -31,4 +31,20 @@ pub struct LogUpProof {
   /// Sumcheck proof for `Σ_{x ∈ {0,1}^t} h_t(x)`.
   /// Here `h_t[i] = M_i / (β + t_i)`.
   pub table_sumcheck: sumcheck::SumcheckProof,
+
+  // ── PCS evaluation binding (committed path only) ──────────────────────
+  /// PCS commitment to the witness-side fractional MLE h_w.
+  /// Present only in the committed proof variant.
+  pub h_w_commit: Option<pcs::Commitment>,
+
+  /// PCS commitment to the table-side fractional MLE h_t.
+  pub h_t_commit: Option<pcs::Commitment>,
+
+  /// PCS opening proof for h_w at the witness sumcheck challenge point.
+  /// `(evaluation, opening_proof)` — evaluation must equal `witness_sumcheck.final_eval`.
+  pub h_w_opening: Option<(GF2_128, pcs::OpenProof)>,
+
+  /// PCS opening proof for h_t at the table sumcheck challenge point.
+  /// `(evaluation, opening_proof)` — evaluation must equal `table_sumcheck.final_eval`.
+  pub h_t_opening: Option<(GF2_128, pcs::OpenProof)>,
 }

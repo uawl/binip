@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 blake3     = { workspace = true }
 field      = { path = "../field" }
+pcs        = { path = "../pcs" }
 poly       = { path = "../poly" }
 sumcheck   = { path = "../sumcheck" }
 transcript = { path = "../transcript" }

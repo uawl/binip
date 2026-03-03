@@ -89,15 +89,13 @@ pub fn gas_cost(op: u8) -> Option<GasCostInfo> {
     STOP | RETURN | REVERT => (ZERO, false),
 
     // ── W_base: 2 gas ──────────────────────────────────────────────────
-    ADDRESS | ORIGIN | CALLER | CALLVALUE | CALLDATASIZE | CODESIZE
-    | GASPRICE | COINBASE | TIMESTAMP | NUMBER | DIFFICULTY | GASLIMIT
-    | CHAINID | SELFBALANCE | BASEFEE | POP | PC | MSIZE | GAS
-    | RETURNDATASIZE | PUSH0 | BLOBBASEFEE => (BASE, false),
+    ADDRESS | ORIGIN | CALLER | CALLVALUE | CALLDATASIZE | CODESIZE | GASPRICE | COINBASE
+    | TIMESTAMP | NUMBER | DIFFICULTY | GASLIMIT | CHAINID | SELFBALANCE | BASEFEE | POP | PC
+    | MSIZE | GAS | RETURNDATASIZE | PUSH0 | BLOBBASEFEE => (BASE, false),
 
     // ── W_verylow: 3 gas ───────────────────────────────────────────────
-    ADD | SUB | NOT | LT | GT | SLT | SGT | EQ | ISZERO | AND | OR
-    | XOR | BYTE | SHL | SHR | SAR | CALLDATALOAD
-    | SIGNEXTEND => (VERYLOW, false),
+    ADD | SUB | NOT | LT | GT | SLT | SGT | EQ | ISZERO | AND | OR | XOR | BYTE | SHL | SHR
+    | SAR | CALLDATALOAD | SIGNEXTEND => (VERYLOW, false),
 
     // MLOAD/MSTORE/MSTORE8: verylow base but may expand memory (dynamic)
     MLOAD | MSTORE | MSTORE8 => (VERYLOW, true),
@@ -122,8 +120,8 @@ pub fn gas_cost(op: u8) -> Option<GasCostInfo> {
     JUMPDEST => (1, false),
 
     // ── Dynamic opcodes (base + memory/context) ────────────────────────
-    EXP => (10, true),          // 10 + 50 * byte_len(exponent)
-    KECCAK256 => (30, true),    // 30 + 6 * ceil(size/32)
+    EXP => (10, true),       // 10 + 50 * byte_len(exponent)
+    KECCAK256 => (30, true), // 30 + 6 * ceil(size/32)
     BLOCKHASH => (20, false),
 
     // Memory copy opcodes: base 3 + dynamic
@@ -131,8 +129,8 @@ pub fn gas_cost(op: u8) -> Option<GasCostInfo> {
     MCOPY => (VERYLOW, true),
 
     // ── Storage (EIP-2929 warm/cold) ───────────────────────────────────
-    SLOAD => (0, true),   // 100 warm, 2100 cold — always dynamic
-    SSTORE => (0, true),  // complex EIP-2200/2929 rules
+    SLOAD => (0, true),    // 100 warm, 2100 cold — always dynamic
+    SSTORE => (0, true),   // complex EIP-2200/2929 rules
     TLOAD => (100, false), // EIP-1153
     TSTORE => (100, false),
 
@@ -156,7 +154,10 @@ pub fn gas_cost(op: u8) -> Option<GasCostInfo> {
     _ => return None,
   };
 
-  Some(GasCostInfo { static_gas, dynamic })
+  Some(GasCostInfo {
+    static_gas,
+    dynamic,
+  })
 }
 
 #[cfg(test)]

@@ -20,6 +20,9 @@ use crate::encoder::{self, NUM_COLS};
 pub struct TraceTable {
   /// Column-major data.  `columns.len() == NUM_COLS`.
   pub columns: Vec<Vec<GF2_128>>,
+  /// Row-major interleaved data for cache-friendly per-row access.
+  /// `row_major[i]` = 8 field elements of row `i` (same order as `COL_*`).
+  pub row_major: Vec<[GF2_128; NUM_COLS]>,
   /// Byte decomposition of operands for LUT binding.
   pub decomps: Vec<DecompRow>,
   /// Number of rows (before padding).
@@ -31,15 +34,22 @@ impl TraceTable {
   pub fn from_rows(rows: &[Row]) -> Self {
     let n = rows.len();
     let mut columns = vec![Vec::with_capacity(n); NUM_COLS];
+    let mut row_major = Vec::with_capacity(n);
     let mut decomps = Vec::with_capacity(n);
     for row in rows {
       let encoded = encoder::encode_row(row);
       for (c, val) in encoded.iter().enumerate() {
         columns[c].push(*val);
       }
+      row_major.push(encoded);
       decomps.push(DecompRow::compute(row));
     }
-    TraceTable { columns, decomps, n_rows: n }
+    TraceTable {
+      columns,
+      row_major,
+      decomps,
+      n_rows: n,
+    }
   }
 
   /// Parallel variant of [`from_rows`] — encode + decomp via rayon, then
@@ -52,16 +62,23 @@ impl TraceTable {
       .map(|row| (encoder::encode_row(row), DecompRow::compute(row)))
       .collect();
 
-    // Phase 2: scatter into column-major (sequential, but cheap)
+    // Phase 2: scatter into column-major + keep row-major
     let mut columns = vec![Vec::with_capacity(n); NUM_COLS];
+    let mut row_major = Vec::with_capacity(n);
     let mut decomps = Vec::with_capacity(n);
     for (encoded, d) in row_data {
       for (c, val) in encoded.iter().enumerate() {
         columns[c].push(*val);
       }
+      row_major.push(encoded);
       decomps.push(d);
     }
-    TraceTable { columns, decomps, n_rows: n }
+    TraceTable {
+      columns,
+      row_major,
+      decomps,
+      n_rows: n,
+    }
   }
 
   /// Convert each column into an [`MlePoly`] by padding the evaluation
@@ -90,15 +107,12 @@ impl TraceTable {
     let n_vars = n_vars_for(self.n_rows);
     let padded_len = 1usize << n_vars;
     let mut evals = Vec::with_capacity(padded_len);
+    let sels = constraint::precompute_selectors(beta);
 
-    for i in 0..self.n_rows {
-      let cols = std::array::from_fn::<GF2_128, 8, _>(|c| self.columns[c][i]);
-      // Recover tag from the op column.
-      // We stored `op` as GF2_128::from(tag as u64), so for small tags
-      // the value is just the tag integer embedded in the field.
-      let tag = row_tag(&cols);
+    for cols in &self.row_major {
+      let tag = row_tag(cols);
       let val = if tag < NUM_TAGS {
-        constraint::batched_constraint_with_tag(tag, &cols, beta)?
+        constraint::batched_constraint_with_precomputed_sel(tag, cols, sels[tag as usize])?
       } else {
         return Err(ConstraintError::UnknownTag(tag));
       };
@@ -114,14 +128,15 @@ impl TraceTable {
   pub fn constraint_mle_par(&self, beta: GF2_128) -> Result<MlePoly, ConstraintError> {
     let n_vars = n_vars_for(self.n_rows);
     let padded_len = 1usize << n_vars;
+    let sels = constraint::precompute_selectors(beta);
 
-    let row_evals: Result<Vec<GF2_128>, ConstraintError> = (0..self.n_rows)
-      .into_par_iter()
-      .map(|i| {
-        let cols = std::array::from_fn::<GF2_128, 8, _>(|c| self.columns[c][i]);
-        let tag = row_tag(&cols);
+    let row_evals: Result<Vec<GF2_128>, ConstraintError> = self
+      .row_major
+      .par_iter()
+      .map(|cols| {
+        let tag = row_tag(cols);
         if tag < NUM_TAGS {
-          constraint::batched_constraint_with_tag(tag, &cols, beta)
+          constraint::batched_constraint_with_precomputed_sel(tag, cols, sels[tag as usize])
         } else {
           Err(ConstraintError::UnknownTag(tag))
         }
@@ -141,23 +156,17 @@ impl TraceTable {
   /// powers of `gamma`.
   ///
   /// If the polynomial sums to zero, every row's binding holds (w.h.p.).
-  pub fn reconstruction_mle(
-    &self,
-    gamma: GF2_128,
-  ) -> Result<MlePoly, ConstraintError> {
+  pub fn reconstruction_mle(&self, gamma: GF2_128) -> Result<MlePoly, ConstraintError> {
     let n_vars = n_vars_for(self.n_rows);
     let padded_len = 1usize << n_vars;
     let mut evals = Vec::with_capacity(padded_len);
 
-    for i in 0..self.n_rows {
-      let cols = std::array::from_fn::<GF2_128, 8, _>(|c| self.columns[c][i]);
-      let tag = row_tag(&cols);
+    for (cols, d) in self.row_major.iter().zip(self.decomps.iter()) {
+      let tag = row_tag(cols);
       if tag >= NUM_TAGS {
         return Err(ConstraintError::UnknownTag(tag));
       }
-      evals.push(decomp::eval_reconstruction(
-        tag, &cols, &self.decomps[i], gamma,
-      ));
+      evals.push(decomp::eval_reconstruction(tag, cols, d, gamma));
     }
 
     evals.resize(padded_len, GF2_128::zero());
@@ -165,22 +174,20 @@ impl TraceTable {
   }
 
   /// Parallel variant of [`reconstruction_mle`].
-  pub fn reconstruction_mle_par(
-    &self,
-    gamma: GF2_128,
-  ) -> Result<MlePoly, ConstraintError> {
+  pub fn reconstruction_mle_par(&self, gamma: GF2_128) -> Result<MlePoly, ConstraintError> {
     let n_vars = n_vars_for(self.n_rows);
     let padded_len = 1usize << n_vars;
 
-    let row_evals: Result<Vec<GF2_128>, ConstraintError> = (0..self.n_rows)
-      .into_par_iter()
-      .map(|i| {
-        let cols = std::array::from_fn::<GF2_128, 8, _>(|c| self.columns[c][i]);
-        let tag = row_tag(&cols);
+    let row_evals: Result<Vec<GF2_128>, ConstraintError> = self
+      .row_major
+      .par_iter()
+      .zip(self.decomps.par_iter())
+      .map(|(cols, d)| {
+        let tag = row_tag(cols);
         if tag >= NUM_TAGS {
           return Err(ConstraintError::UnknownTag(tag));
         }
-        Ok(decomp::eval_reconstruction(tag, &cols, &self.decomps[i], gamma))
+        Ok(decomp::eval_reconstruction(tag, cols, d, gamma))
       })
       .collect();
 
@@ -191,26 +198,25 @@ impl TraceTable {
 
   /// Convert decomposition byte columns into MLE polynomials.
   ///
-  /// Returns `NUM_DECOMP_COLS` (80) polynomials — one per byte position
-  /// across 5 operand banks.  These are committed alongside the main
-  /// trace to bind the LUT witness to the STARK.
+  /// Returns `NUM_DECOMP_COLS` (128) polynomials — one per byte position
+  /// across 6 operand banks plus 32 multiplication carry columns.  These
+  /// are committed alongside the main trace to bind the LUT witness to
+  /// the STARK.
   pub fn decomp_mle_polys(&self) -> Vec<MlePoly> {
     let n_vars = n_vars_for(self.n_rows);
     let padded_len = 1usize << n_vars;
+    let n = self.n_rows;
 
-    let mut columns = vec![Vec::with_capacity(padded_len); decomp::NUM_DECOMP_COLS];
-    for d in &self.decomps {
-      let encoded = decomp::encode_decomp(d);
-      for (c, val) in encoded.iter().enumerate() {
-        columns[c].push(*val);
-      }
-    }
-
-    columns
-      .into_iter()
-      .map(|mut col| {
-        col.resize(padded_len, GF2_128::zero());
-        MlePoly::new(col)
+    // Build each of the 128 decomp columns in parallel.
+    (0..decomp::NUM_DECOMP_COLS)
+      .into_par_iter()
+      .map(|c| {
+        let mut evals = Vec::with_capacity(padded_len);
+        for d in &self.decomps[..n] {
+          evals.push(decomp::decomp_col_value(d, c));
+        }
+        evals.resize(padded_len, GF2_128::zero());
+        MlePoly::new(evals)
       })
       .collect()
   }
@@ -223,12 +229,11 @@ impl TraceTable {
 /// matches.
 fn row_tag(cols: &[GF2_128; 8]) -> u32 {
   let op = cols[1];
-  for t in 0..NUM_TAGS {
-    if op == GF2_128::from(t as u64) {
-      return t;
-    }
+  if op.hi == 0 && op.lo < NUM_TAGS as u64 {
+    op.lo as u32
+  } else {
+    u32::MAX
   }
-  u32::MAX
 }
 
 /// Minimum number of variables so that `2^n >= len`.
@@ -416,15 +421,45 @@ mod tests {
   fn reconstruction_mle_zero_for_valid_trace() {
     // Mix of LUT-backed and algebraic ops — reconstruction should be zero.
     let rows = vec![
-      make_xor_row(5, 3),                        // tag 3: no decomp
-      Row { pc: 1, op: 2, in0: 0xFF, in1: 0x0F, in2: 0, out: 0x0F, flags: 0, advice: 0 }, // And128
-      Row { pc: 2, op: 0, in0: 100, in1: 200, in2: 0, out: 300, flags: 0, advice: 0 },   // Add128
-      Row { pc: 3, op: 10, in0: 42, in1: 0, in2: 0, out: 42, flags: 0, advice: 0 },      // Mov
+      make_xor_row(5, 3), // tag 3: no decomp
+      Row {
+        pc: 1,
+        op: 2,
+        in0: 0xFF,
+        in1: 0x0F,
+        in2: 0,
+        out: 0x0F,
+        flags: 0,
+        advice: 0,
+      }, // And128
+      Row {
+        pc: 2,
+        op: 0,
+        in0: 100,
+        in1: 200,
+        in2: 0,
+        out: 300,
+        flags: 0,
+        advice: 0,
+      }, // Add128
+      Row {
+        pc: 3,
+        op: 10,
+        in0: 42,
+        in1: 0,
+        in2: 0,
+        out: 42,
+        flags: 0,
+        advice: 0,
+      }, // Mov
     ];
     let table = TraceTable::from_rows(&rows);
     let gamma = GF2_128::from(9999);
     let rmle = table.reconstruction_mle(gamma).unwrap();
-    assert!(rmle.sum().is_zero(), "valid trace should have zero reconstruction sum");
+    assert!(
+      rmle.sum().is_zero(),
+      "valid trace should have zero reconstruction sum"
+    );
   }
 
   #[test]

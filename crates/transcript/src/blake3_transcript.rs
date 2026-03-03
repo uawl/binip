@@ -70,6 +70,31 @@ impl Transcript for Blake3Transcript {
     self.hasher.update(&buf);
   }
 
+  fn absorb_fields(&mut self, elems: &[GF2_128]) {
+    // GF2_128 is #[repr(C)] { lo: u64, hi: u64 }.  On little-endian the
+    // in-memory byte layout matches absorb_field's encoding, so we can
+    // feed the entire slice as one contiguous update.  This lets blake3
+    // use its multi-chunk AVX2/AVX-512 paths instead of per-element
+    // SSE4.1 compress_in_place.
+    #[cfg(target_endian = "little")]
+    {
+      // SAFETY: GF2_128 is #[repr(C)] with two u64 fields, no padding.
+      let bytes = unsafe {
+        std::slice::from_raw_parts(
+          elems.as_ptr() as *const u8,
+          elems.len() * std::mem::size_of::<GF2_128>(),
+        )
+      };
+      self.hasher.update(bytes);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+      for &v in elems {
+        self.absorb_field(v);
+      }
+    }
+  }
+
   fn squeeze_challenge(&mut self) -> GF2_128 {
     // Finalize (non-destructive) → 32 bytes via XOF, take first 16.
     let digest = self.hasher.finalize();

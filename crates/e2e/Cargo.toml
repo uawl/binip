@@ -8,6 +8,7 @@ field      = { path = "../field" }
 vm         = { path = "../vm" }
 evm-types  = { path = "../evm-types" }
 circuit    = { path = "../circuit" }
+shard      = { path = "../shard" }
 stark      = { path = "../stark" }
 revm       = { workspace = true }
 thiserror  = { workspace = true }

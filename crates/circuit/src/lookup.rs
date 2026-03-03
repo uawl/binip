@@ -64,6 +64,19 @@ pub struct LookupProofs {
   pub mul_op: Option<(LogUpProof, LookupTable)>,
 }
 
+/// Succinct witness commitments for the lookup tables.
+///
+/// Replaces [`LookupWitness`] in the proof: O(1) instead of O(n).
+/// Each active table stores a 32-byte blake3 digest of the padded
+/// witness and its padded length (needed for transcript replay).
+#[derive(Debug, Clone)]
+pub struct LookupCommitments {
+  pub range: Option<([u8; 32], usize)>,
+  pub and_op: Option<([u8; 32], usize)>,
+  pub add_op: Option<([u8; 32], usize)>,
+  pub mul_op: Option<([u8; 32], usize)>,
+}
+
 #[inline]
 fn bytes_of(v: u128) -> [u8; 16] {
   v.to_le_bytes()
@@ -83,9 +96,24 @@ pub fn collect_witnesses(rows: &[Row]) -> LookupWitness {
     emit_decomp_ranges(&mut w, row);
     match row.op as u32 {
       0 => emit_add128(&mut w, row),
-      1 => emit_mul128(&mut w, row),
+      1 => {
+        emit_mul128(&mut w, row);
+        emit_mul_accum(&mut w, row);
+      }
       2 => emit_and128(&mut w, row),
       8 => emit_chi128(&mut w, row),
+      12 => {
+        emit_check_div(&mut w, row);
+        emit_mul_accum(&mut w, row);
+      }
+      13 => {
+        emit_check_mul(&mut w, row);
+        emit_mul_accum(&mut w, row);
+      }
+      14 => {
+        emit_check_inv(&mut w, row);
+        emit_mul_accum(&mut w, row);
+      }
       15 => emit_range_check(&mut w, row),
       _ => {}
     }
@@ -95,34 +123,60 @@ pub fn collect_witnesses(rows: &[Row]) -> LookupWitness {
 
 /// Parallel variant of [`collect_witnesses`] — per-row witnesses computed
 /// via rayon, then concatenated.
+///
+/// Uses per-chunk accumulation with pre-sized buffers to reduce allocation
+/// overhead: instead of 786k tiny Vecs, we get ~12 chunk-sized Vecs.
 pub fn collect_witnesses_par(rows: &[Row]) -> LookupWitness {
-  let per_row: Vec<LookupWitness> = rows
-    .par_iter()
-    .map(|row| {
+  let n_threads = rayon::current_num_threads().max(1);
+  let chunk_size = (rows.len() + n_threads - 1) / n_threads;
+
+  let chunks: Vec<LookupWitness> = rows
+    .par_chunks(chunk_size.max(1))
+    .map(|chunk| {
+      // Pre-allocate based on average entries per row:
+      // ~50 range + ~16 and + ~32 add + ~256 mul (conservative upper bound)
+      let n = chunk.len();
       let mut w = LookupWitness {
-        range: Vec::new(),
-        and_op: Vec::new(),
-        add_op: Vec::new(),
-        mul_op: Vec::new(),
+        range: Vec::with_capacity(n * 50),
+        and_op: Vec::with_capacity(n * 4),
+        add_op: Vec::with_capacity(n * 8),
+        mul_op: Vec::with_capacity(n * 8),
       };
-      emit_decomp_ranges(&mut w, row);
-      match row.op as u32 {
-        0 => emit_add128(&mut w, row),
-        1 => emit_mul128(&mut w, row),
-        2 => emit_and128(&mut w, row),
-        8 => emit_chi128(&mut w, row),
-        15 => emit_range_check(&mut w, row),
-        _ => {}
+      for row in chunk {
+        emit_decomp_ranges(&mut w, row);
+        match row.op as u32 {
+          0 => emit_add128(&mut w, row),
+          1 => {
+            emit_mul128(&mut w, row);
+            emit_mul_accum(&mut w, row);
+          }
+          2 => emit_and128(&mut w, row),
+          8 => emit_chi128(&mut w, row),
+          12 => {
+            emit_check_div(&mut w, row);
+            emit_mul_accum(&mut w, row);
+          }
+          13 => {
+            emit_check_mul(&mut w, row);
+            emit_mul_accum(&mut w, row);
+          }
+          14 => {
+            emit_check_inv(&mut w, row);
+            emit_mul_accum(&mut w, row);
+          }
+          15 => emit_range_check(&mut w, row),
+          _ => {}
+        }
       }
       w
     })
     .collect();
 
-  // Merge: pre-compute total sizes, then concatenate.
-  let total_range: usize = per_row.iter().map(|w| w.range.len()).sum();
-  let total_and: usize = per_row.iter().map(|w| w.and_op.len()).sum();
-  let total_add: usize = per_row.iter().map(|w| w.add_op.len()).sum();
-  let total_mul: usize = per_row.iter().map(|w| w.mul_op.len()).sum();
+  // Merge ~12 chunk results: pre-compute sizes, single allocation for final buffers.
+  let total_range: usize = chunks.iter().map(|w| w.range.len()).sum();
+  let total_and: usize = chunks.iter().map(|w| w.and_op.len()).sum();
+  let total_add: usize = chunks.iter().map(|w| w.add_op.len()).sum();
+  let total_mul: usize = chunks.iter().map(|w| w.mul_op.len()).sum();
 
   let mut merged = LookupWitness {
     range: Vec::with_capacity(total_range),
@@ -130,7 +184,7 @@ pub fn collect_witnesses_par(rows: &[Row]) -> LookupWitness {
     add_op: Vec::with_capacity(total_add),
     mul_op: Vec::with_capacity(total_mul),
   };
-  for w in per_row {
+  for w in chunks {
     merged.range.extend(w.range);
     merged.and_op.extend(w.and_op);
     merged.add_op.extend(w.add_op);
@@ -145,19 +199,29 @@ fn emit_decomp_ranges(w: &mut LookupWitness, row: &Row) {
   let tag = row.op as u32;
   let mask = decomp::decomp_mask(tag);
   if mask.in0 {
-    for b in row.in0.to_le_bytes() { w.range.push(lut::encode_range(b)); }
+    for b in row.in0.to_le_bytes() {
+      w.range.push(lut::encode_range(b));
+    }
   }
   if mask.in1 {
-    for b in row.in1.to_le_bytes() { w.range.push(lut::encode_range(b)); }
+    for b in row.in1.to_le_bytes() {
+      w.range.push(lut::encode_range(b));
+    }
   }
   if mask.in2 {
-    for b in row.in2.to_le_bytes() { w.range.push(lut::encode_range(b)); }
+    for b in row.in2.to_le_bytes() {
+      w.range.push(lut::encode_range(b));
+    }
   }
   if mask.out {
-    for b in row.out.to_le_bytes() { w.range.push(lut::encode_range(b)); }
+    for b in row.out.to_le_bytes() {
+      w.range.push(lut::encode_range(b));
+    }
   }
   if mask.flags {
-    for b in row.flags.to_le_bytes() { w.range.push(lut::encode_range(b)); }
+    for b in row.flags.to_le_bytes() {
+      w.range.push(lut::encode_range(b));
+    }
   }
 }
 
@@ -265,6 +329,187 @@ fn recover_cin(a: u128, b: u128, result: u128) -> u8 {
   }
 }
 
+// ── Integer multiplication helpers (tags 1, 12, 13, 14) ──────────────────────
+
+/// Resolve the (a, b) operands and 32-byte result for multiplication rows.
+///
+/// Returns `(a_bytes, b_bytes, result_bytes_32)` where result_bytes_32 is
+/// the expected 256-bit product laid out as 32 little-endian bytes.
+fn mul_operands(row: &Row) -> ([u8; 16], [u8; 16], [u8; 32]) {
+  let tag = row.op as u32;
+  match tag {
+    // Mul128: in0 × in1 → out (lo) || flags (hi)
+    1 => {
+      let mut result = [0u8; 32];
+      result[..16].copy_from_slice(&row.out.to_le_bytes());
+      result[16..].copy_from_slice(&row.flags.to_le_bytes());
+      (bytes_of(row.in0), bytes_of(row.in1), result)
+    }
+    // CheckDiv: advice (divisor) × in0 (quot) → product (dividend − rem)
+    // Result = in2 (dividend), but carry chain proves product only.
+    // The product + rem = dividend is checked separately via Add LUT.
+    12 => {
+      // Product bytes are recomputed deterministically (not stored in trace)
+      let (lo, hi) = widening_mul(row.advice, row.in0);
+      let mut result = [0u8; 32];
+      result[..16].copy_from_slice(&lo.to_le_bytes());
+      result[16..].copy_from_slice(&hi.to_le_bytes());
+      (bytes_of(row.advice), bytes_of(row.in0), result)
+    }
+    // CheckMul: in2 × advice → in1 (hi) || in0 (lo)
+    13 => {
+      let mut result = [0u8; 32];
+      result[..16].copy_from_slice(&row.in0.to_le_bytes());
+      result[16..].copy_from_slice(&row.in1.to_le_bytes());
+      (bytes_of(row.in2), bytes_of(row.advice), result)
+    }
+    // CheckInv: in0 × in1 ≡ 1 mod 2^128, full product low = 1, high = k
+    14 => {
+      let (lo, hi) = widening_mul(row.in0, row.in1);
+      let mut result = [0u8; 32];
+      result[..16].copy_from_slice(&lo.to_le_bytes());
+      result[16..].copy_from_slice(&hi.to_le_bytes());
+      (bytes_of(row.in0), bytes_of(row.in1), result)
+    }
+    _ => unreachable!("mul_operands called with non-mul tag {}", tag),
+  }
+}
+
+/// Emit byte×byte schoolbook products for any integer multiplication row.
+///
+/// Works for Mul128, CheckMul, CheckDiv, CheckInv — the (a, b) operands
+/// are resolved by [`mul_operands`].
+fn emit_mul_products(w: &mut LookupWitness, a: &[u8; 16], b: &[u8; 16]) {
+  for i in 0..16 {
+    for j in 0..16 {
+      let prod = a[i] as u16 * b[j] as u16;
+      let lo = (prod & 0xFF) as u8;
+      let hi = ((prod >> 8) & 0xFF) as u8;
+      w.mul_op.push(lut::encode_mul(a[i], b[j], lo, hi));
+    }
+  }
+}
+
+/// Emit the accumulation Add LUT entries that prove the schoolbook
+/// multiplication column sums match the committed result bytes + carries.
+///
+/// For each output byte position `k` (0..32), verifies:
+///
+/// ```text
+/// col_sum_lo[k] + carry[k-1] = result[k] + c1 * 256    (Add LUT)
+/// col_sum_hi[k] + c1         = carry[k]                 (Add LUT)
+/// ```
+///
+/// Where `col_sum[k] = Σ lo[i][j] for i+j=k  +  Σ hi[i][j] for i+j=k−1`
+/// from the schoolbook byte products, and `result[k]`/`carry[k]` are
+/// committed via the decomposition system.
+fn emit_mul_accum(w: &mut LookupWitness, row: &Row) {
+  let (a_bs, b_bs, result_bs) = mul_operands(row);
+  let d = decomp::DecompRow::compute(row);
+
+  let mut carry: u8 = 0;
+  for k in 0u32..32 {
+    // Sum contributions: lo bytes from products at position k,
+    // hi bytes from products at position k-1.
+    let mut col_sum: u32 = 0;
+    let i_min = k.saturating_sub(15) as usize;
+    let i_max = (k as usize).min(15);
+    for i in i_min..=i_max {
+      let j = k as usize - i;
+      if j < 16 {
+        let prod = a_bs[i] as u32 * b_bs[j] as u32;
+        col_sum += prod & 0xFF;
+      }
+    }
+    if k > 0 {
+      let pk = k - 1;
+      let pi_min = pk.saturating_sub(15) as usize;
+      let pi_max = (pk as usize).min(15);
+      for i in pi_min..=pi_max {
+        let j = pk as usize - i;
+        if j < 16 {
+          let prod = a_bs[i] as u32 * b_bs[j] as u32;
+          col_sum += (prod >> 8) & 0xFF;
+        }
+      }
+    }
+
+    let col_sum_lo = (col_sum & 0xFF) as u8;
+    let col_sum_hi = ((col_sum >> 8) & 0xFF) as u8;
+
+    // Step 1: col_sum_lo + carry_in → (result[k], c1)
+    let full1 = col_sum_lo as u16 + carry as u16;
+    let c1 = (full1 >> 8) as u8;
+    w.add_op.push(lut::encode_add(
+      col_sum_lo,
+      carry,
+      result_bs[k as usize],
+      c1,
+    ));
+
+    // Step 2: col_sum_hi + c1 → (carry_out, 0)
+    let new_carry = col_sum_hi.wrapping_add(c1);
+    w.add_op.push(lut::encode_add(col_sum_hi, c1, new_carry, 0));
+
+    debug_assert_eq!(result_bs[k as usize], (full1 & 0xFF) as u8);
+    debug_assert_eq!(new_carry, d.mul_carries[k as usize]);
+    carry = new_carry;
+  }
+}
+
+/// CheckDiv (tag 12): divisor × quot byte products + product+rem=dividend via Add LUT.
+///
+/// Columns: in0=quot, in1=rem, in2=dividend, advice=divisor.
+fn emit_check_div(w: &mut LookupWitness, row: &Row) {
+  // 1. Byte products for divisor × quot.
+  let a = bytes_of(row.advice);
+  let b = bytes_of(row.in0);
+  emit_mul_products(w, &a, &b);
+
+  // 2. product + rem = dividend via byte-level Add carry chain.
+  //    product_lo = (advice * in0) & mask128, rem = in1, dividend = in2.
+  let (product_lo, _product_hi) = widening_mul(row.advice, row.in0);
+  let p_bs = bytes_of(product_lo);
+  let rem_bs = bytes_of(row.in1);
+  let div_bs = bytes_of(row.in2);
+
+  let mut carry: u8 = 0;
+  for k in 0..16 {
+    // Step 1: product_byte + rem_byte → (partial, c1)
+    let sum1 = p_bs[k] as u16 + rem_bs[k] as u16;
+    let p = (sum1 & 0xFF) as u8;
+    let c1 = (sum1 >> 8) as u8;
+    w.add_op.push(lut::encode_add(p_bs[k], rem_bs[k], p, c1));
+
+    // Step 2: partial + carry_in → (dividend_byte, c2)
+    let sum2 = p as u16 + carry as u16;
+    let s = (sum2 & 0xFF) as u8;
+    let c2 = (sum2 >> 8) as u8;
+    w.add_op.push(lut::encode_add(p, carry, s, c2));
+
+    debug_assert_eq!(s, div_bs[k]);
+    carry = c1 ^ c2;
+  }
+}
+
+/// CheckMul (tag 13): a × b byte products.
+///
+/// Columns: in0=q_lo, in1=q_hi, in2=a, advice=b.
+fn emit_check_mul(w: &mut LookupWitness, row: &Row) {
+  let a = bytes_of(row.in2);
+  let b = bytes_of(row.advice);
+  emit_mul_products(w, &a, &b);
+}
+
+/// CheckInv (tag 14): a × a_inv byte products.
+///
+/// Columns: in0=a, in1=a_inv.
+fn emit_check_inv(w: &mut LookupWitness, row: &Row) {
+  let a = bytes_of(row.in0);
+  let b = bytes_of(row.in1);
+  emit_mul_products(w, &a, &b);
+}
+
 // ── Deterministic checks ─────────────────────────────────────────────────────
 
 /// Verify conditions that don't need lookups:
@@ -331,10 +576,7 @@ fn widening_mul(a: u128, b: u128) -> (u128, u128) {
 /// Prove all lookup arguments.
 ///
 /// Witnesses in `w` are padded to powers of two after this call.
-pub fn prove_lookups(
-  w: &mut LookupWitness,
-  transcript: &mut Blake3Transcript,
-) -> LookupProofs {
+pub fn prove_lookups(w: &mut LookupWitness, transcript: &mut Blake3Transcript) -> LookupProofs {
   transcript.absorb_bytes(b"circuit:lookups");
 
   let range = if !w.range.is_empty() {
@@ -369,38 +611,48 @@ pub fn prove_lookups(
     None
   };
 
-  LookupProofs { range, and_op, add_op, mul_op }
+  LookupProofs {
+    range,
+    and_op,
+    add_op,
+    mul_op,
+  }
 }
 
 /// Parallel variant of [`prove_lookups`] — each table gets a forked
 /// transcript so the four LogUp proofs can run concurrently via rayon.
+///
+/// Returns `(proofs, commitments)` where commitments contain succinct
+/// 32-byte digests of each padded witness table.
 pub fn prove_lookups_par(
   w: &mut LookupWitness,
   transcript: &mut Blake3Transcript,
-) -> LookupProofs {
+) -> (LookupProofs, LookupCommitments) {
   transcript.absorb_bytes(b"circuit:lookups");
 
   // Fork transcripts — independent and deterministic per table.
   let mut t_range = transcript.fork("lut:range", 0);
-  let mut t_and   = transcript.fork("lut:and",   1);
-  let mut t_add   = transcript.fork("lut:add",   2);
-  let mut t_mul   = transcript.fork("lut:mul",   3);
+  let mut t_and = transcript.fork("lut:and", 1);
+  let mut t_add = transcript.fork("lut:add", 2);
+  let mut t_mul = transcript.fork("lut:mul", 3);
 
-  let ((range, and_op), (add_op, mul_op)) = rayon::join(
+  let ((range_res, and_res), (add_res, mul_res)) = rayon::join(
     || {
       rayon::join(
         || {
-          if w.range.is_empty() { None }
-          else {
-            let (p, t) = lut::prove(lut::Op8::Range, &mut w.range, &mut t_range);
-            Some((p, t))
+          if w.range.is_empty() {
+            None
+          } else {
+            let (p, t, d) = lut::prove_committed(lut::Op8::Range, &mut w.range, &mut t_range);
+            Some((p, t, d, w.range.len()))
           }
         },
         || {
-          if w.and_op.is_empty() { None }
-          else {
-            let (p, t) = lut::prove(lut::Op8::And, &mut w.and_op, &mut t_and);
-            Some((p, t))
+          if w.and_op.is_empty() {
+            None
+          } else {
+            let (p, t, d) = lut::prove_committed(lut::Op8::And, &mut w.and_op, &mut t_and);
+            Some((p, t, d, w.and_op.len()))
           }
         },
       )
@@ -408,24 +660,42 @@ pub fn prove_lookups_par(
     || {
       rayon::join(
         || {
-          if w.add_op.is_empty() { None }
-          else {
-            let (p, t) = lut::prove(lut::Op8::Add, &mut w.add_op, &mut t_add);
-            Some((p, t))
+          if w.add_op.is_empty() {
+            None
+          } else {
+            let (p, t, d) = lut::prove_committed(lut::Op8::Add, &mut w.add_op, &mut t_add);
+            Some((p, t, d, w.add_op.len()))
           }
         },
         || {
-          if w.mul_op.is_empty() { None }
-          else {
-            let (p, t) = lut::prove(lut::Op8::Mul, &mut w.mul_op, &mut t_mul);
-            Some((p, t))
+          if w.mul_op.is_empty() {
+            None
+          } else {
+            let (p, t, d) = lut::prove_committed(lut::Op8::Mul, &mut w.mul_op, &mut t_mul);
+            Some((p, t, d, w.mul_op.len()))
           }
         },
       )
     },
   );
 
-  LookupProofs { range, and_op, add_op, mul_op }
+  let proofs = LookupProofs {
+    range: range_res
+      .as_ref()
+      .map(|(p, t, _, _)| (p.clone(), t.clone())),
+    and_op: and_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
+    add_op: add_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
+    mul_op: mul_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
+  };
+
+  let commits = LookupCommitments {
+    range: range_res.map(|(_, _, d, n)| (d, n)),
+    and_op: and_res.map(|(_, _, d, n)| (d, n)),
+    add_op: add_res.map(|(_, _, d, n)| (d, n)),
+    mul_op: mul_res.map(|(_, _, d, n)| (d, n)),
+  };
+
+  (proofs, commits)
 }
 
 /// Verify all lookup proofs.
@@ -487,55 +757,68 @@ pub fn verify_lookups(
 
 /// Parallel variant of [`verify_lookups`] — uses forked transcripts
 /// matching [`prove_lookups_par`].
+///
+/// Accepts [`LookupCommitments`] (succinct digests) instead of raw
+/// witness data.
 pub fn verify_lookups_par(
   proofs: &LookupProofs,
-  w: &mut LookupWitness,
+  commits: &LookupCommitments,
   transcript: &mut Blake3Transcript,
 ) -> bool {
   transcript.absorb_bytes(b"circuit:lookups");
 
   let mut t_range = transcript.fork("lut:range", 0);
-  let mut t_and   = transcript.fork("lut:and",   1);
-  let mut t_add   = transcript.fork("lut:add",   2);
-  let mut t_mul   = transcript.fork("lut:mul",   3);
+  let mut t_and = transcript.fork("lut:and", 1);
+  let mut t_add = transcript.fork("lut:add", 2);
+  let mut t_mul = transcript.fork("lut:mul", 3);
 
-  // Pad witnesses (must happen before verify reads them).
-  if let Some((_, table)) = &proofs.range {
-    let n = w.range.len().next_power_of_two();
-    w.range.resize(n, table.entries[0]);
+  // Check presence consistency first (proof ↔ commit non-emptiness).
+  if proofs.range.is_none() != commits.range.is_none() {
+    return false;
   }
-  if let Some((_, table)) = &proofs.and_op {
-    let n = w.and_op.len().next_power_of_two();
-    w.and_op.resize(n, table.entries[0]);
+  if proofs.and_op.is_none() != commits.and_op.is_none() {
+    return false;
   }
-  if let Some((_, table)) = &proofs.add_op {
-    let n = w.add_op.len().next_power_of_two();
-    w.add_op.resize(n, table.entries[0]);
+  if proofs.add_op.is_none() != commits.add_op.is_none() {
+    return false;
   }
-  if let Some((_, table)) = &proofs.mul_op {
-    let n = w.mul_op.len().next_power_of_two();
-    w.mul_op.resize(n, table.entries[0]);
+  if proofs.mul_op.is_none() != commits.mul_op.is_none() {
+    return false;
   }
-
-  // Check presence consistency first (proof ↔ witness non-emptiness).
-  if proofs.range.is_none() && !w.range.is_empty() { return false; }
-  if proofs.and_op.is_none() && !w.and_op.is_empty() { return false; }
-  if proofs.add_op.is_none() && !w.add_op.is_empty() { return false; }
-  if proofs.mul_op.is_none() && !w.mul_op.is_empty() { return false; }
 
   let ((r1, r2), (r3, r4)) = rayon::join(
-    || rayon::join(
-      || proofs.range.as_ref().map_or(true, |(proof, table)|
-        lut::verify(proof, &w.range, table, &mut t_range).is_some()),
-      || proofs.and_op.as_ref().map_or(true, |(proof, table)|
-        lut::verify(proof, &w.and_op, table, &mut t_and).is_some()),
-    ),
-    || rayon::join(
-      || proofs.add_op.as_ref().map_or(true, |(proof, table)|
-        lut::verify(proof, &w.add_op, table, &mut t_add).is_some()),
-      || proofs.mul_op.as_ref().map_or(true, |(proof, table)|
-        lut::verify(proof, &w.mul_op, table, &mut t_mul).is_some()),
-    ),
+    || {
+      rayon::join(
+        || {
+          proofs.range.as_ref().map_or(true, |(proof, table)| {
+            let (digest, n) = commits.range.as_ref().unwrap();
+            lut::verify_committed(proof, *n, table, &mut t_range, digest).is_some()
+          })
+        },
+        || {
+          proofs.and_op.as_ref().map_or(true, |(proof, table)| {
+            let (digest, n) = commits.and_op.as_ref().unwrap();
+            lut::verify_committed(proof, *n, table, &mut t_and, digest).is_some()
+          })
+        },
+      )
+    },
+    || {
+      rayon::join(
+        || {
+          proofs.add_op.as_ref().map_or(true, |(proof, table)| {
+            let (digest, n) = commits.add_op.as_ref().unwrap();
+            lut::verify_committed(proof, *n, table, &mut t_add, digest).is_some()
+          })
+        },
+        || {
+          proofs.mul_op.as_ref().map_or(true, |(proof, table)| {
+            let (digest, n) = commits.mul_op.as_ref().unwrap();
+            lut::verify_committed(proof, *n, table, &mut t_mul, digest).is_some()
+          })
+        },
+      )
+    },
   );
 
   r1 && r2 && r3 && r4
@@ -548,7 +831,16 @@ mod tests {
   use transcript::Blake3Transcript;
 
   fn make_row(op: u32, in0: u128, in1: u128, in2: u128, out: u128, flags: u128) -> Row {
-    Row { pc: 0, op: op as u128, in0, in1, in2, out, flags, advice: 0 }
+    Row {
+      pc: 0,
+      op: op as u128,
+      in0,
+      in1,
+      in2,
+      out,
+      flags,
+      advice: 0,
+    }
   }
 
   /// Helper: collect → prove → verify.
@@ -578,10 +870,7 @@ mod tests {
 
   #[test]
   fn range_check_1bit_boolean() {
-    let rows = vec![
-      make_row(15, 0, 1, 0, 0, 0),
-      make_row(15, 1, 1, 0, 1, 0),
-    ];
+    let rows = vec![make_row(15, 0, 1, 0, 0, 0), make_row(15, 1, 1, 0, 1, 0)];
     // bits=1 → no LUT (algebraic), but deterministic check should pass.
     assert!(verify_deterministic_checks(&rows));
   }
@@ -756,12 +1045,10 @@ mod tests {
   fn run_lookup_par(rows: &[Row]) -> bool {
     let mut w_prover = collect_witnesses_par(rows);
     let mut tp = Blake3Transcript::new();
-    let proofs = prove_lookups_par(&mut w_prover, &mut tp);
+    let (proofs, commits) = prove_lookups_par(&mut w_prover, &mut tp);
 
-    let mut w_verifier = collect_witnesses_par(rows);
     let mut tv = Blake3Transcript::new();
-    verify_lookups_par(&proofs, &mut w_verifier, &mut tv)
-      && verify_deterministic_checks(rows)
+    verify_lookups_par(&proofs, &commits, &mut tv) && verify_deterministic_checks(rows)
   }
 
   #[test]

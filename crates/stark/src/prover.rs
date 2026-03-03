@@ -20,7 +20,7 @@ use rand::rng;
 use transcript::{Blake3Transcript, Transcript};
 use vm::Row;
 
-use crate::proof::{Proof, StarkParams};
+use crate::proof::{BoundaryPcsProof, Proof, StarkParams};
 
 /// Errors during proof generation.
 #[derive(Debug, thiserror::Error)]
@@ -47,9 +47,10 @@ struct Prepared {
   blinded_mle: MlePoly,
   constraint_sum: GF2_128,
   boundary_constraint_sum: GF2_128,
+  boundary_pcs: Option<BoundaryPcsProof>,
   reconstruction_sum: GF2_128,
   lookup_proofs: lookup::LookupProofs,
-  lookup_witness: lookup::LookupWitness,
+  lookup_commits: lookup::LookupCommitments,
   batch_commit: pcs::Commitment,
   pcs_state: pcs::PcsState,
   transcript: Blake3Transcript,
@@ -80,6 +81,43 @@ fn prepare(rows: &[Row], tree: &ProofNode, params: &StarkParams) -> Result<Prepa
   let boundary_mle = boundary_table.constraint_mle(beta);
   let boundary_constraint_sum = boundary_mle.sum();
 
+  // 2a′. Boundary PCS + sumcheck (H-1 binding)
+  let boundary_pcs = if !boundary_rows.is_empty() {
+    let bnd_blinded = boundary_mle.blind(&mut rng());
+    let bnd_n_vars = (bnd_blinded.n_vars as u32).max(2);
+    let bnd_padded = if (bnd_blinded.n_vars as u32) < bnd_n_vars {
+      let mut e = bnd_blinded.evals;
+      e.resize(1 << bnd_n_vars, GF2_128::zero());
+      MlePoly::new(e)
+    } else {
+      bnd_blinded
+    };
+    let bnd_pcs_params = pcs::PcsParams { n_vars: bnd_n_vars, n_queries: 40 };
+    let (bnd_commit, bnd_pcs_state) =
+      pcs::commit(&bnd_padded.evals, &bnd_pcs_params, &mut transcript);
+    // Prove sumcheck (fork from transcript state right after PCS commit)
+    let mut bnd_sc_t = transcript.fork("boundary_sc", 0);
+    let bnd_sumcheck = sumcheck::prove(bnd_padded, &mut bnd_sc_t);
+    // Replay sumcheck to recover challenge point (same fork state)
+    let mut bnd_sc_t2 = transcript.fork("boundary_sc", 0);
+    let bnd_challenges =
+      sumcheck::verify(&bnd_sumcheck, bnd_sumcheck.final_eval, &mut bnd_sc_t2)
+        .expect("own boundary sumcheck should verify");
+    // PCS open at challenge point (fork from same parent state)
+    let mut bnd_pcs_t = transcript.fork("boundary_pcs_open", 0);
+    let (bnd_open_eval, bnd_pcs_open) =
+      pcs::open(&bnd_pcs_state, &bnd_challenges, &mut bnd_pcs_t);
+    Some(BoundaryPcsProof {
+      commit: bnd_commit,
+      sumcheck: bnd_sumcheck,
+      pcs_open: bnd_pcs_open,
+      open_eval: bnd_open_eval,
+      n_vars: bnd_n_vars,
+    })
+  } else {
+    None
+  };
+
   // 2b. Reconstruction constraint (STARK ↔ LUT binding)
   let gamma: GF2_128 = transcript.squeeze_challenge();
   let reconstruction_mle = table.reconstruction_mle(gamma)?;
@@ -88,7 +126,8 @@ fn prepare(rows: &[Row], tree: &ProofNode, params: &StarkParams) -> Result<Prepa
   // 2c. Lookup proofs (byte-level LUT arguments)
   let mut lookup_witness = lookup::collect_witnesses(rows);
   let mut lookup_transcript = transcript.clone();
-  let lookup_proofs = lookup::prove_lookups_par(&mut lookup_witness, &mut lookup_transcript);
+  let (lookup_proofs, lookup_commits) =
+    lookup::prove_lookups_par(&mut lookup_witness, &mut lookup_transcript);
 
   // 2d. ZK blinding
   let blinded_mle = constraint_mle.blind(&mut rng());
@@ -104,9 +143,10 @@ fn prepare(rows: &[Row], tree: &ProofNode, params: &StarkParams) -> Result<Prepa
     blinded_mle,
     constraint_sum,
     boundary_constraint_sum,
+    boundary_pcs,
     reconstruction_sum,
     lookup_proofs,
-    lookup_witness,
+    lookup_commits,
     batch_commit,
     pcs_state,
     transcript,
@@ -142,6 +182,43 @@ fn prepare_par(
   let boundary_mle = boundary_table.constraint_mle(beta);
   let boundary_constraint_sum = boundary_mle.sum();
 
+  // 2a′. Boundary PCS + sumcheck (H-1 binding)
+  let boundary_pcs = if !boundary_rows.is_empty() {
+    let bnd_blinded = boundary_mle.blind_par(&mut rng());
+    let bnd_n_vars = (bnd_blinded.n_vars as u32).max(2);
+    let bnd_padded = if (bnd_blinded.n_vars as u32) < bnd_n_vars {
+      let mut e = bnd_blinded.evals;
+      e.resize(1 << bnd_n_vars, GF2_128::zero());
+      MlePoly::new(e)
+    } else {
+      bnd_blinded
+    };
+    let bnd_pcs_params = pcs::PcsParams { n_vars: bnd_n_vars, n_queries: 40 };
+    let (bnd_commit, bnd_pcs_state) =
+      pcs::commit_par(&bnd_padded.evals, &bnd_pcs_params, &mut transcript);
+    // Prove sumcheck (fork from transcript state right after PCS commit)
+    let mut bnd_sc_t = transcript.fork("boundary_sc", 0);
+    let bnd_sumcheck = sumcheck::prove(bnd_padded, &mut bnd_sc_t);
+    // Replay sumcheck to recover challenge point (same fork state)
+    let mut bnd_sc_t2 = transcript.fork("boundary_sc", 0);
+    let bnd_challenges =
+      sumcheck::verify(&bnd_sumcheck, bnd_sumcheck.final_eval, &mut bnd_sc_t2)
+        .expect("own boundary sumcheck should verify");
+    // PCS open at challenge point (fork from same parent state)
+    let mut bnd_pcs_t = transcript.fork("boundary_pcs_open", 0);
+    let (bnd_open_eval, bnd_pcs_open) =
+      pcs::open(&bnd_pcs_state, &bnd_challenges, &mut bnd_pcs_t);
+    Some(BoundaryPcsProof {
+      commit: bnd_commit,
+      sumcheck: bnd_sumcheck,
+      pcs_open: bnd_pcs_open,
+      open_eval: bnd_open_eval,
+      n_vars: bnd_n_vars,
+    })
+  } else {
+    None
+  };
+
   // 2b. Reconstruction constraint (STARK ↔ LUT binding)
   let gamma: GF2_128 = transcript.squeeze_challenge();
   let reconstruction_mle = table.reconstruction_mle_par(gamma)?;
@@ -150,7 +227,8 @@ fn prepare_par(
   // 2c. Lookup proofs (byte-level LUT arguments)
   let mut lookup_witness = lookup::collect_witnesses_par(rows);
   let mut lookup_transcript = transcript.clone();
-  let lookup_proofs = lookup::prove_lookups_par(&mut lookup_witness, &mut lookup_transcript);
+  let (lookup_proofs, lookup_commits) =
+    lookup::prove_lookups_par(&mut lookup_witness, &mut lookup_transcript);
 
   // 2d. ZK blinding (rayon parallel pointwise)
   let blinded_mle = constraint_mle.blind_par(&mut rng());
@@ -166,9 +244,10 @@ fn prepare_par(
     blinded_mle,
     constraint_sum,
     boundary_constraint_sum,
+    boundary_pcs,
     reconstruction_sum,
     lookup_proofs,
-    lookup_witness,
+    lookup_commits,
     batch_commit,
     pcs_state,
     transcript,
@@ -189,9 +268,10 @@ fn assemble(
     blinded_mle: _,
     constraint_sum,
     boundary_constraint_sum,
+    boundary_pcs,
     reconstruction_sum,
     lookup_proofs,
-    lookup_witness,
+    lookup_commits,
     batch_commit,
     pcs_state,
     mut transcript,
@@ -216,10 +296,11 @@ fn assemble(
     beta,
     constraint_sum,
     boundary_constraint_sum,
+    boundary_pcs,
     gamma,
     reconstruction_sum,
     lookup_proofs,
-    lookup_witness,
+    lookup_commits,
     shard_batch,
     recursive_proof,
     pcs_open,
@@ -289,18 +370,11 @@ pub fn prove_cpu_par(
   let shard_transcript: Blake3Transcript = prep.transcript.clone();
 
   // ── Phase 1: parallel shard proving ────────────────────────────────────
-  let shard_batch = shard::prove_all_par(
-    &prep.blinded_mle,
-    &params.config,
-    &shard_transcript,
-  );
+  let shard_batch = shard::prove_all_par(&prep.blinded_mle, &params.config, &shard_transcript);
 
   // ── Phase 2..D+1: parallel recursive aggregation (per-level) ──────────
-  let recursive_proof = recursive::prove_recursive_par(
-    &shard_batch,
-    &params.config,
-    &shard_transcript,
-  );
+  let recursive_proof =
+    recursive::prove_recursive_par(&shard_batch, &params.config, &shard_transcript);
 
   // ── Phase D+2: PCS open + assemble (sequential) ───────────────────────
   let Prepared {
@@ -310,9 +384,10 @@ pub fn prove_cpu_par(
     blinded_mle: _,
     constraint_sum,
     boundary_constraint_sum,
+    boundary_pcs,
     reconstruction_sum,
     lookup_proofs,
-    lookup_witness,
+    lookup_commits,
     batch_commit,
     pcs_state,
     mut transcript,
@@ -332,10 +407,11 @@ pub fn prove_cpu_par(
     beta,
     constraint_sum,
     boundary_constraint_sum,
+    boundary_pcs,
     gamma,
     reconstruction_sum,
     lookup_proofs,
-    lookup_witness,
+    lookup_commits,
     shard_batch,
     recursive_proof,
     pcs_open,

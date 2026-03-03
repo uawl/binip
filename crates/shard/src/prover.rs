@@ -50,7 +50,7 @@ pub fn split_mle(poly: &MlePoly, config: &RecursiveConfig) -> Vec<MlePoly> {
 /// Prove a single shard: run sumcheck on the sub-MLE with a forked transcript.
 pub fn prove_shard(
   shard_idx: u32,
-  sub_mle: &MlePoly,
+  sub_mle: MlePoly,
   root_transcript: &Blake3Transcript,
 ) -> ShardProof {
   let mut t = root_transcript.fork("shard", shard_idx);
@@ -76,7 +76,7 @@ pub fn prove_all(
   let mut shard_proofs = Vec::with_capacity(n);
   let mut total_sum = GF2_128::zero();
 
-  for (i, sub) in sub_mles.iter().enumerate() {
+  for (i, sub) in sub_mles.into_iter().enumerate() {
     let proof = prove_shard(i as u32, sub, root_transcript);
     total_sum = total_sum + proof.sumcheck.claimed_sum;
     shard_proofs.push(proof);
@@ -111,7 +111,7 @@ pub fn prove_all_par(
     .map(|i| {
       let start = i * shard_size;
       let sub = MlePoly::new(poly.evals[start..start + shard_size].to_vec());
-      prove_shard(i as u32, &sub, root_transcript)
+      prove_shard(i as u32, sub, root_transcript)
     })
     .collect();
 
@@ -187,7 +187,7 @@ mod tests {
     let evals: Vec<GF2_128> = (1u64..=4).map(g).collect();
     let sub = MlePoly::new(evals);
     let root_t = Blake3Transcript::new();
-    let proof = prove_shard(0, &sub, &root_t);
+    let proof = prove_shard(0, sub.clone(), &root_t);
     assert_eq!(proof.shard_idx, 0);
     assert_eq!(proof.sumcheck.claimed_sum, sub.sum());
     assert_eq!(proof.sumcheck.round_polys.len(), 2); // 2 vars

@@ -10,6 +10,12 @@ pub trait Transcript {
   fn absorb_bytes(&mut self, data: &[u8]);
   /// Feed a field element (16 bytes, little-endian lo||hi).
   fn absorb_field(&mut self, v: GF2_128);
+  /// Feed many field elements at once.  Default: per-element fallback.
+  fn absorb_fields(&mut self, elems: &[GF2_128]) {
+    for &v in elems {
+      self.absorb_field(v);
+    }
+  }
   /// Derive a challenge field element from the current state.
   fn squeeze_challenge(&mut self) -> GF2_128;
 }

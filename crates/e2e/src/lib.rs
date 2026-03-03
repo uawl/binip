@@ -26,6 +26,7 @@ pub use inspector::{EvmStep, TracingInspector};
 pub use witness::{Witness, WitnessError, build_witness};
 
 use evm_types::ProofNode;
+use shard::RecursiveConfig;
 use stark::{Proof, StarkParams};
 
 /// Errors from the E2E pipeline.
@@ -41,16 +42,52 @@ pub enum E2eError {
   Verify(#[from] stark::VerifyError),
 }
 
+/// Optional tuning knobs exposed to callers.
+///
+/// All fields default to `None`, which falls back to the built-in
+/// heuristics in [`StarkParams::for_n_vars`].
+#[derive(Debug, Clone, Default)]
+pub struct ProveConfig {
+  /// Override the number of MLE variables per shard (`shard_vars`).
+  ///
+  /// Default heuristic: `total_vars / 2`.  Smaller values create more
+  /// (and cheaper) shards; larger values create fewer but heavier shards.
+  /// Must satisfy `1 ≤ shard_vars ≤ total_vars`.
+  pub shard_vars: Option<u32>,
+}
+
 /// Compute [`StarkParams`] for a witness.
 fn params_for(witness: &Witness) -> StarkParams {
+  params_for_with_config(witness, &ProveConfig::default())
+}
+
+/// Compute [`StarkParams`] for a witness, applying [`ProveConfig`] overrides.
+fn params_for_with_config(witness: &Witness, cfg: &ProveConfig) -> StarkParams {
   let n_rows = witness.rows.len().max(1);
   let n_vars = (usize::BITS - (n_rows - 1).max(1).leading_zeros()) as u32;
-  StarkParams::for_n_vars(n_vars)
+  let mut params = StarkParams::for_n_vars(n_vars);
+  if let Some(sv) = cfg.shard_vars {
+    params.config = RecursiveConfig {
+      shard_vars: sv.max(1).min(n_vars),
+      ..params.config
+    };
+  }
+  params
 }
 
 /// Generate a ZK-STARK proof from a witness (CPU path).
 pub fn prove_cpu(witness: &Witness) -> Result<(Proof, StarkParams), E2eError> {
   let params = params_for(witness);
+  let proof = stark::prove_cpu(&witness.rows, &witness.tree, &params)?;
+  Ok((proof, params))
+}
+
+/// Like [`prove_cpu`] but with explicit [`ProveConfig`] overrides.
+pub fn prove_cpu_with(
+  witness: &Witness,
+  cfg: &ProveConfig,
+) -> Result<(Proof, StarkParams), E2eError> {
+  let params = params_for_with_config(witness, cfg);
   let proof = stark::prove_cpu(&witness.rows, &witness.tree, &params)?;
   Ok((proof, params))
 }
@@ -65,6 +102,16 @@ pub fn prove_cpu_par(witness: &Witness) -> Result<(Proof, StarkParams), E2eError
   Ok((proof, params))
 }
 
+/// Like [`prove_cpu_par`] but with explicit [`ProveConfig`] overrides.
+pub fn prove_cpu_par_with(
+  witness: &Witness,
+  cfg: &ProveConfig,
+) -> Result<(Proof, StarkParams), E2eError> {
+  let params = params_for_with_config(witness, cfg);
+  let proof = stark::prove_cpu_par(&witness.rows, &witness.tree, &params)?;
+  Ok((proof, params))
+}
+
 /// Verify a ZK-STARK proof against a Proof Tree.
 pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(), E2eError> {
   stark::verify(proof, tree, params)?;
@@ -75,6 +122,17 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
 pub fn prove_and_verify(steps: &[EvmStep]) -> Result<Proof, E2eError> {
   let witness = build_witness(steps)?;
   let (proof, params) = prove_cpu(&witness)?;
+  verify(&proof, &witness.tree, &params)?;
+  Ok(proof)
+}
+
+/// Like [`prove_and_verify`] but with explicit [`ProveConfig`] overrides.
+pub fn prove_and_verify_with(
+  steps: &[EvmStep],
+  cfg: &ProveConfig,
+) -> Result<Proof, E2eError> {
+  let witness = build_witness(steps)?;
+  let (proof, params) = prove_cpu_with(&witness, cfg)?;
   verify(&proof, &witness.tree, &params)?;
   Ok(proof)
 }

@@ -45,14 +45,7 @@ pub const BOUNDARY_COLS: usize = 8;
 /// forces each pair to be equal.
 #[derive(Debug, Clone, Copy)]
 pub struct BoundaryRow {
-  pub cols: [u32; BOUNDARY_COLS],
-}
-
-impl BoundaryRow {
-  /// Encode this row into GF(2^128) field elements.
-  pub fn encode(&self) -> [GF2_128; BOUNDARY_COLS] {
-    std::array::from_fn(|i| GF2_128::from(self.cols[i] as u64))
-  }
+  pub cols: [GF2_128; BOUNDARY_COLS],
 }
 
 /// Column-major boundary trace table.
@@ -68,8 +61,7 @@ impl BoundaryTraceTable {
     let n = rows.len();
     let mut columns = vec![Vec::with_capacity(n); BOUNDARY_COLS];
     for row in rows {
-      let encoded = row.encode();
-      for (c, val) in encoded.iter().enumerate() {
+      for (c, val) in row.cols.iter().enumerate() {
         columns[c].push(*val);
       }
     }
@@ -155,6 +147,8 @@ fn walk_boundaries(node: &ProofNode, rows: &mut Vec<BoundaryRow>) {
 }
 
 fn emit_boundary_rows(left: &EvmState, right: &EvmState, rows: &mut Vec<BoundaryRow>) {
+  let f = |v: u32| GF2_128::from(v as u64);
+
   let left_gas_lo = left.gas as u32;
   let left_gas_hi = (left.gas >> 32) as u32;
   let right_gas_lo = right.gas as u32;
@@ -163,47 +157,50 @@ fn emit_boundary_rows(left: &EvmState, right: &EvmState, rows: &mut Vec<Boundary
   // Row 0: PC, stack depth, gas (lo + hi)
   rows.push(BoundaryRow {
     cols: [
-      left.pc,
-      right.pc,
-      left.stack.len() as u32,
-      right.stack.len() as u32,
-      left_gas_lo,
-      right_gas_lo,
-      left_gas_hi,
-      right_gas_hi,
+      f(left.pc),
+      f(right.pc),
+      f(left.stack.len() as u32),
+      f(right.stack.len() as u32),
+      f(left_gas_lo),
+      f(right_gas_lo),
+      f(left_gas_hi),
+      f(right_gas_hi),
     ],
   });
 
-  // Row 1: memory size, storage count, jumpdest table hash
+  // Row 1: memory size, storage count, jumpdest table hash (128-bit)
   let left_jd_hash = jumpdest_hash(&left.jumpdest_table);
   let right_jd_hash = jumpdest_hash(&right.jumpdest_table);
 
   rows.push(BoundaryRow {
     cols: [
-      left.memory.len() as u32,
-      right.memory.len() as u32,
-      left.storage.len() as u32,
-      right.storage.len() as u32,
+      f(left.memory.len() as u32),
+      f(right.memory.len() as u32),
+      f(left.storage.len() as u32),
+      f(right.storage.len() as u32),
       left_jd_hash,
       right_jd_hash,
-      0,
-      0,
+      GF2_128::zero(),
+      GF2_128::zero(),
     ],
   });
 }
 
-/// Hash a jumpdest table into a single u32 for concise comparison.
+/// Hash a jumpdest table into a GF(2^128) element for concise comparison.
 ///
-/// Two tables are equal iff their hashes match (collision-resistant via Blake3,
-/// truncated to 32 bits for the boundary row column — sufficient for the
-/// Schwartz-Zippel + Fiat-Shamir soundness argument).
-fn jumpdest_hash(table: &std::collections::BTreeSet<u32>) -> u32 {
+/// Two tables are equal iff their hashes match.  Using the full 128-bit
+/// Blake3 output provides ~2^64 collision resistance (birthday bound),
+/// eliminating the old 32-bit truncation weakness (H-2).
+fn jumpdest_hash(table: &std::collections::BTreeSet<u32>) -> GF2_128 {
   let mut hasher = blake3::Hasher::new();
   for &offset in table {
     hasher.update(&offset.to_le_bytes());
   }
   let hash = hasher.finalize();
-  u32::from_le_bytes(hash.as_bytes()[..4].try_into().unwrap())
+  let bytes = hash.as_bytes();
+  let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+  let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+  GF2_128::new(lo, hi)
 }
 
 /// Leftmost pre-state in a subtree.

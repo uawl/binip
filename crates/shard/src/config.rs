@@ -35,10 +35,9 @@ impl RecursiveConfig {
   ///
   /// Uses `fan_in = 64` and `shard_vars = max(1, total_vars / 2)`.
   pub fn for_n_vars(total_vars: u32) -> Self {
-    let shard_vars = (total_vars / 2).max(1).min(total_vars);
     Self {
       total_vars,
-      shard_vars,
+      shard_vars: 4.min(total_vars),
       fan_in: 64,
     }
   }

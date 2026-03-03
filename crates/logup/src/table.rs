@@ -24,7 +24,10 @@ impl LookupTable {
   /// Padding entries are set to `entries[0]` (a valid entry) so that
   /// `β + pad ≠ 0` with overwhelming probability for random β.
   pub fn new(entries: Vec<GF2_128>) -> Self {
-    assert!(!entries.is_empty(), "LookupTable: entries must not be empty");
+    assert!(
+      !entries.is_empty(),
+      "LookupTable: entries must not be empty"
+    );
     let len = entries.len().next_power_of_two();
     let n_vars = len.trailing_zeros();
     let pad_val = entries[0];
@@ -58,22 +61,38 @@ pub fn witness_fractional_evals(
   beta: GF2_128,
   gamma: GF2_128,
 ) -> Vec<GF2_128> {
-  // Denominators: β + w_j
-  let denoms: Vec<GF2_128> = witness.iter().map(|&w_j| beta + w_j).collect();
+  let n = witness.len();
+  if n == 0 {
+    return vec![];
+  }
 
-  // Batch-invert all denominators at once (3N mults + 1 inv vs. N invs).
-  let inv_denoms = batch_inv(&denoms);
+  // ── Single alloc: prefix products → reused as result ─────────────────
+  // buf[i] = (β+w_0) * (β+w_1) * … * (β+w_i)
+  let mut buf = Vec::with_capacity(n);
+  buf.push(beta + witness[0]);
+  for i in 1..n {
+    buf.push(buf[i - 1] * (beta + witness[i]));
+  }
 
-  // h_w[j] = γ^j / (β + w_j)
+  // ── Single inversion of the full product ─────────────────────────────
+  let mut inv_acc = buf[n - 1].inv();
+
+  // ── Backward pass: overwrite buf in-place ────────────────────────────
+  // At iteration i (n-1 → 1): read buf[i-1] (untouched), write buf[i].
+  for i in (1..n).rev() {
+    let inv_i = inv_acc * buf[i - 1]; // 1/(β+w_i)
+    inv_acc = inv_acc * (beta + witness[i]);
+    buf[i] = inv_i;
+  }
+  buf[0] = inv_acc; // 1/(β+w_0)
+
+  // ── In-place γ^j weighting: buf[j] *= γ^j ───────────────────────────
   let mut gamma_pow = GF2_128::one();
-  inv_denoms
-    .into_iter()
-    .map(|inv_d| {
-      let val = gamma_pow * inv_d;
-      gamma_pow *= gamma;
-      val
-    })
-    .collect()
+  for val in buf.iter_mut() {
+    *val *= gamma_pow;
+    gamma_pow *= gamma;
+  }
+  buf
 }
 
 /// Compute the γ-weighted table fractional evaluations:

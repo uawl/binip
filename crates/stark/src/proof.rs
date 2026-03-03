@@ -16,8 +16,27 @@ use field::GF2_128;
 use pcs::{Commitment, OpenProof};
 use recursive::RecursiveProof;
 use shard::{RecursiveConfig, ShardProofBatch};
+use sumcheck::SumcheckProof;
 
-use circuit::lookup::{LookupProofs, LookupWitness};
+use circuit::lookup::{LookupCommitments, LookupProofs};
+
+/// Cryptographic binding for the boundary-constraint MLE.
+///
+/// When Seq junctions exist in the proof tree, this sub-proof ensures
+/// that the boundary MLE was honestly committed and sums to zero.
+#[derive(Debug, Clone)]
+pub struct BoundaryPcsProof {
+  /// PCS commitment over the blinded boundary MLE.
+  pub commit: Commitment,
+  /// Sumcheck proof that `Σ boundary_blinded(x) = 0`.
+  pub sumcheck: SumcheckProof,
+  /// PCS opening at the sumcheck challenge point.
+  pub pcs_open: OpenProof,
+  /// Evaluation of the boundary MLE at the challenge point.
+  pub open_eval: GF2_128,
+  /// Number of MLE variables used for the boundary PCS.
+  pub n_vars: u32,
+}
 
 /// Top-level ZK-STARK proof.
 #[derive(Debug, Clone)]
@@ -43,6 +62,12 @@ pub struct Proof {
   /// matching left-post / right-pre states (PC, gas, stack depth, …).
   pub boundary_constraint_sum: GF2_128,
 
+  /// PCS + sumcheck binding for the boundary MLE.
+  ///
+  /// Present when the proof tree contains at least one `Seq` node.
+  /// Cryptographically proves `boundary_constraint_sum` is honest.
+  pub boundary_pcs: Option<BoundaryPcsProof>,
+
   // ── decomposition / lookup layer ──────────────────────────────────────
   /// Batching challenge for the reconstruction constraint (STARK ↔ LUT binding).
   pub gamma: GF2_128,
@@ -56,10 +81,8 @@ pub struct Proof {
   /// Per-table LogUp proofs for byte-level lookup arguments.
   pub lookup_proofs: LookupProofs,
 
-  /// Lookup witnesses (needed for LogUp transcript replay during verification).
-  ///
-  /// In a production system these would be replaced by PCS commitments.
-  pub lookup_witness: LookupWitness,
+  /// Succinct witness commitments (blake3 digests) for lookup tables.
+  pub lookup_commits: LookupCommitments,
 
   // ── shard layer ───────────────────────────────────────────────────────
   /// Shard-level proofs (independent sumcheck per shard).

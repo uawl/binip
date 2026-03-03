@@ -23,12 +23,16 @@ pub fn batch_inv<F: FieldElem>(elems: &[F]) -> Vec<F> {
   }
   // Single inversion of the product of all elements.
   let mut inv_acc = prefix[n - 1].inv();
-  let mut out = vec![F::zero(); n];
-  // Walk backwards: out[i] = inv_acc * prefix[i-1]
-  for i in (1..n).rev() {
-    out[i] = inv_acc * prefix[i - 1];
-    inv_acc = inv_acc * elems[i];
+  // Allocate without zero-init: every slot is written exactly once.
+  let mut out: Vec<F> = Vec::with_capacity(n);
+  unsafe {
+    let ptr = out.as_mut_ptr();
+    for i in (1..n).rev() {
+      ptr.add(i).write(inv_acc * prefix[i - 1]);
+      inv_acc = inv_acc * elems[i];
+    }
+    ptr.write(inv_acc);
+    out.set_len(n);
   }
-  out[0] = inv_acc;
   out
 }

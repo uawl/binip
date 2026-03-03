@@ -5,7 +5,6 @@
 //! cargo bench -p bench
 //! ```
 
-
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use e2e::{EvmStep, build_witness, prove_cpu, prove_cpu_par};
 use revm::primitives::U256;

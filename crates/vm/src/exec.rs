@@ -343,7 +343,10 @@ impl Vm {
 
       // ── AdviceLoad ──────────────────────────────────────────────────────────
       MicroOp::AdviceLoad { dst } => {
-        let val = self.advice.next().ok_or(VmError::AdviceExhausted(self.pc))?;
+        let val = self
+          .advice
+          .next()
+          .ok_or(VmError::AdviceExhausted(self.pc))?;
         self.regs.write(*dst, val);
         Row {
           pc,
@@ -419,7 +422,10 @@ impl Vm {
         let va = self.regs.read(*a);
         let vi = self.regs.read(*a_inv);
         if va.wrapping_mul(vi) != 1 {
-          return Err(VmError::AdviceCheckFailed(self.pc, "a * a_inv ≠ 1 (mod 2^128)"));
+          return Err(VmError::AdviceCheckFailed(
+            self.pc,
+            "a * a_inv ≠ 1 (mod 2^128)",
+          ));
         }
         Row {
           pc,

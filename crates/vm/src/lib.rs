@@ -540,10 +540,7 @@ mod tests {
         key_reg: 0,
         val_reg: 2,
       },
-      MicroOp::SLoad {
-        dst: 4,
-        key_reg: 0,
-      },
+      MicroOp::SLoad { dst: 4, key_reg: 0 },
     ])
     .unwrap();
     assert_eq!(vm.regs.read(4), 42u128);
@@ -578,11 +575,7 @@ mod tests {
     }])
     .unwrap();
     vm.pc = 0;
-    vm.run(&[MicroOp::SLoad {
-      dst: 4,
-      key_reg: 0,
-    }])
-    .unwrap();
+    vm.run(&[MicroOp::SLoad { dst: 4, key_reg: 0 }]).unwrap();
     assert_eq!(vm.regs.read(4), 20u128);
     assert_eq!(vm.storage.len(), 1);
   }

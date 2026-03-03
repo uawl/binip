@@ -95,7 +95,7 @@ fn prove_level(
     t.absorb_bytes(&level.to_le_bytes());
     t.absorb_bytes(&(node_idx as u32).to_le_bytes());
 
-    let sumcheck = sumcheck::prove(&agg_mle, &mut t);
+    let sumcheck = sumcheck::prove(agg_mle, &mut t);
 
     level_proofs.push(LevelProof {
       level,
@@ -175,10 +175,7 @@ pub fn prove_recursive_par(
     })
     .collect();
 
-  RecursiveProof {
-    levels,
-    root_claim,
-  }
+  RecursiveProof { levels, root_claim }
 }
 
 /// Recursively prove a single DAG node.
@@ -231,7 +228,7 @@ fn prove_dag_node(
   t.absorb_bytes(&level.to_le_bytes());
   t.absorb_bytes(&(node_idx as u32).to_le_bytes());
 
-  let sumcheck = sumcheck::prove(&agg_mle, &mut t);
+  let sumcheck = sumcheck::prove(agg_mle, &mut t);
 
   collectors[level as usize].lock().unwrap().push(LevelProof {
     level,

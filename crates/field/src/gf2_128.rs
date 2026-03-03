@@ -18,6 +18,7 @@ use crate::traits::FieldElem;
 
 /// An element of GF(2^128) = GF(2)[x] / (x^128 + x^7 + x^2 + x + 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[repr(C)]
 pub struct GF2_128 {
   pub lo: u64, // bits 0..63
   pub hi: u64, // bits 64..127
@@ -78,19 +79,67 @@ impl Mul for GF2_128 {
   type Output = Self;
   #[inline]
   fn mul(self, rhs: Self) -> Self {
-    // Karatsuba: 3× clmul64 → 256-bit product → reduce mod p(x).
-    let m0 = clmul64(self.lo, rhs.lo); // a_lo × b_lo
-    let m1 = clmul64(self.hi, rhs.hi); // a_hi × b_hi
-    let m2 = clmul64(self.lo ^ self.hi, rhs.lo ^ rhs.hi); // (a_lo⊕a_hi)(b_lo⊕b_hi)
-    let mid = m2 ^ m0 ^ m1;
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    {
+      // Fused Karatsuba: pack once → 3× PCLMULQDQ → recombine → reduce.
+      unsafe {
+        use std::arch::x86_64::*;
+        let va = _mm_set_epi64x(self.hi as i64, self.lo as i64);
+        let vb = _mm_set_epi64x(rhs.hi as i64, rhs.lo as i64);
 
-    // 256-bit product: [d0 : d1 : d2 : d3] (each 64 bits)
-    let d0 = m0 as u64;
-    let d1 = (m0 >> 64) as u64 ^ mid as u64;
-    let d2 = (mid >> 64) as u64 ^ m1 as u64;
-    let d3 = (m1 >> 64) as u64;
+        let m0 = _mm_clmulepi64_si128(va, vb, 0x00); // lo×lo
+        let m1 = _mm_clmulepi64_si128(va, vb, 0x11); // hi×hi
+        let a_xor = _mm_xor_si128(va, _mm_bsrli_si128(va, 8));
+        let b_xor = _mm_xor_si128(vb, _mm_bsrli_si128(vb, 8));
+        let m2 = _mm_clmulepi64_si128(a_xor, b_xor, 0x00);
 
-    reduce256(d0, d1, d2, d3)
+        let mid = _mm_xor_si128(_mm_xor_si128(m2, m0), m1);
+        let low = _mm_xor_si128(m0, _mm_bslli_si128(mid, 8));
+        let high = _mm_xor_si128(m1, _mm_bsrli_si128(mid, 8));
+
+        let d0 = _mm_cvtsi128_si64(low) as u64;
+        let d1 = _mm_cvtsi128_si64(_mm_bsrli_si128(low, 8)) as u64;
+        let d2 = _mm_cvtsi128_si64(high) as u64;
+        let d3 = _mm_cvtsi128_si64(_mm_bsrli_si128(high, 8)) as u64;
+
+        reduce256(d0, d1, d2, d3)
+      }
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+      // Fused Karatsuba: 3× PMULL → recombine → scalar reduce.
+      unsafe {
+        use std::arch::aarch64::*;
+
+        // vmull_p64 does poly-mul 64×64 → 128.
+        let m0: u128 = std::mem::transmute(vmull_p64(self.lo, rhs.lo));
+        let m1: u128 = std::mem::transmute(vmull_p64(self.hi, rhs.hi));
+        let m2: u128 = std::mem::transmute(vmull_p64(self.lo ^ self.hi, rhs.lo ^ rhs.hi));
+
+        let mid = m2 ^ m0 ^ m1;
+        let d0 = m0 as u64;
+        let d1 = (m0 >> 64) as u64 ^ mid as u64;
+        let d2 = (mid >> 64) as u64 ^ m1 as u64;
+        let d3 = (m1 >> 64) as u64;
+
+        reduce256(d0, d1, d2, d3)
+      }
+    }
+    #[cfg(not(any(
+      all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+      all(target_arch = "aarch64", target_feature = "aes"),
+    )))]
+    {
+      let m0 = clmul64(self.lo, rhs.lo);
+      let m1 = clmul64(self.hi, rhs.hi);
+      let m2 = clmul64(self.lo ^ self.hi, rhs.lo ^ rhs.hi);
+      let mid = m2 ^ m0 ^ m1;
+      let d0 = m0 as u64;
+      let d1 = (m0 >> 64) as u64 ^ mid as u64;
+      let d2 = (mid >> 64) as u64 ^ m1 as u64;
+      let d3 = (m1 >> 64) as u64;
+      reduce256(d0, d1, d2, d3)
+    }
   }
 }
 impl MulAssign for GF2_128 {
@@ -131,6 +180,7 @@ fn reduce256(d0: u64, d1: u64, d2: u64, d3: u64) -> GF2_128 {
 // ─── 64×64 → 128-bit carry-less multiply ────────────────────────────────────
 
 #[inline(always)]
+#[allow(unused)]
 fn clmul64(a: u64, b: u64) -> u128 {
   #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
   {
@@ -156,6 +206,7 @@ fn clmul64(a: u64, b: u64) -> u128 {
     }
   }
 
+  #[allow(unreachable_code)]
   clmul64_portable(a, b)
 }
 
@@ -163,6 +214,7 @@ fn clmul64(a: u64, b: u64) -> u128 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "pclmulqdq")]
+#[allow(unused)]
 unsafe fn clmul64_pclmul(a: u64, b: u64) -> u128 {
   use std::arch::x86_64::*;
   let va = _mm_set_epi64x(0, a as i64);
@@ -185,6 +237,7 @@ unsafe fn clmul64_pmull(a: u64, b: u64) -> u128 {
 
 // ── portable fallback ────────────────────────────────────────────────────────
 
+#[allow(unused)]
 fn clmul64_portable(a: u64, b: u64) -> u128 {
   let mut result: u128 = 0;
   let mut b_acc = b as u128;

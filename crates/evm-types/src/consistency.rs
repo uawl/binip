@@ -20,11 +20,7 @@ use std::collections::HashMap;
 use revm::primitives::U256;
 use thiserror::Error;
 
-use crate::{
-  opcode,
-  proof_tree::ProofNode,
-  state::EvmState,
-};
+use crate::{opcode, proof_tree::ProofNode, state::EvmState};
 
 /// Maximum EVM operand-stack depth (EIP spec).
 const MAX_STACK_DEPTH: usize = 1024;
@@ -192,72 +188,56 @@ pub enum ConsistencyError {
     actual: U256,
   },
 
-  #[error(
-    "AND result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("AND result mismatch at pc={pc}: expected {expected}, got {actual}")]
   AndMismatch {
     pc: u32,
     expected: U256,
     actual: U256,
   },
 
-  #[error(
-    "OR result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("OR result mismatch at pc={pc}: expected {expected}, got {actual}")]
   OrMismatch {
     pc: u32,
     expected: U256,
     actual: U256,
   },
 
-  #[error(
-    "XOR result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("XOR result mismatch at pc={pc}: expected {expected}, got {actual}")]
   XorMismatch {
     pc: u32,
     expected: U256,
     actual: U256,
   },
 
-  #[error(
-    "NOT result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("NOT result mismatch at pc={pc}: expected {expected}, got {actual}")]
   NotMismatch {
     pc: u32,
     expected: U256,
     actual: U256,
   },
 
-  #[error(
-    "ISZERO result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("ISZERO result mismatch at pc={pc}: expected {expected}, got {actual}")]
   IsZeroMismatch {
     pc: u32,
     expected: U256,
     actual: U256,
   },
 
-  #[error(
-    "EQ result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("EQ result mismatch at pc={pc}: expected {expected}, got {actual}")]
   EqMismatch {
     pc: u32,
     expected: U256,
     actual: U256,
   },
 
-  #[error(
-    "LT result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("LT result mismatch at pc={pc}: expected {expected}, got {actual}")]
   LtMismatch {
     pc: u32,
     expected: U256,
     actual: U256,
   },
 
-  #[error(
-    "GT result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("GT result mismatch at pc={pc}: expected {expected}, got {actual}")]
   GtMismatch {
     pc: u32,
     expected: U256,
@@ -308,18 +288,14 @@ pub enum ConsistencyError {
     actual: U256,
   },
 
-  #[error(
-    "MLOAD result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("MLOAD result mismatch at pc={pc}: expected {expected}, got {actual}")]
   MloadMismatch {
     pc: u32,
     expected: U256,
     actual: U256,
   },
 
-  #[error(
-    "DUP{n} result mismatch at pc={pc}: expected {expected}, got {actual}"
-  )]
+  #[error("DUP{n} result mismatch at pc={pc}: expected {expected}, got {actual}")]
   DupMismatch {
     pc: u32,
     n: u8,
@@ -666,11 +642,7 @@ fn check_storage_boundary(
 /// Environment-dependent opcodes (ADDRESS, CALLER, etc.) and opcodes
 /// verified by the circuit's advice+check pattern (EXP, SAR, etc.) are
 /// skipped — their correctness is guaranteed by the ZK sub-proof.
-fn check_opcode_semantics(
-  op: u8,
-  pre: &EvmState,
-  post: &EvmState,
-) -> Result<(), ConsistencyError> {
+fn check_opcode_semantics(op: u8, pre: &EvmState, post: &EvmState) -> Result<(), ConsistencyError> {
   let pc = pre.pc;
 
   match op {
@@ -678,41 +650,83 @@ fn check_opcode_semantics(
     opcode::ADD => check_binary(pc, pre, post, |a, b| a.overflowing_add(b).0, "ADD")?,
     opcode::MUL => check_binary(pc, pre, post, |a, b| a.overflowing_mul(b).0, "MUL")?,
     opcode::SUB => check_binary(pc, pre, post, |a, b| a.overflowing_sub(b).0, "SUB")?,
-    opcode::DIV => check_binary(pc, pre, post, |a, b| {
-      if b.is_zero() { U256::ZERO } else { a / b }
-    }, "DIV")?,
-    opcode::MOD => check_binary(pc, pre, post, |a, b| {
-      if b.is_zero() { U256::ZERO } else { a % b }
-    }, "MOD")?,
+    opcode::DIV => check_binary(
+      pc,
+      pre,
+      post,
+      |a, b| {
+        if b.is_zero() { U256::ZERO } else { a / b }
+      },
+      "DIV",
+    )?,
+    opcode::MOD => check_binary(
+      pc,
+      pre,
+      post,
+      |a, b| {
+        if b.is_zero() { U256::ZERO } else { a % b }
+      },
+      "MOD",
+    )?,
 
     // ── Bitwise ──────────────────────────────────────────────────────────
     opcode::AND => check_binary(pc, pre, post, |a, b| a & b, "AND")?,
-    opcode::OR  => check_binary(pc, pre, post, |a, b| a | b, "OR")?,
+    opcode::OR => check_binary(pc, pre, post, |a, b| a | b, "OR")?,
     opcode::XOR => check_binary(pc, pre, post, |a, b| a ^ b, "XOR")?,
     opcode::NOT => {
       if let (Some(&a), Some(&result)) = (pre.stack.first(), post.stack.first()) {
         let expected = !a;
         if result != expected {
-          return Err(ConsistencyError::NotMismatch { pc, expected, actual: result });
+          return Err(ConsistencyError::NotMismatch {
+            pc,
+            expected,
+            actual: result,
+          });
         }
       }
     }
 
     // ── Comparison ───────────────────────────────────────────────────────
-    opcode::LT => check_binary(pc, pre, post, |a, b| {
-      if a < b { U256::from(1u64) } else { U256::ZERO }
-    }, "LT")?,
-    opcode::GT => check_binary(pc, pre, post, |a, b| {
-      if a > b { U256::from(1u64) } else { U256::ZERO }
-    }, "GT")?,
-    opcode::EQ => check_binary(pc, pre, post, |a, b| {
-      if a == b { U256::from(1u64) } else { U256::ZERO }
-    }, "EQ")?,
+    opcode::LT => check_binary(
+      pc,
+      pre,
+      post,
+      |a, b| {
+        if a < b { U256::from(1u64) } else { U256::ZERO }
+      },
+      "LT",
+    )?,
+    opcode::GT => check_binary(
+      pc,
+      pre,
+      post,
+      |a, b| {
+        if a > b { U256::from(1u64) } else { U256::ZERO }
+      },
+      "GT",
+    )?,
+    opcode::EQ => check_binary(
+      pc,
+      pre,
+      post,
+      |a, b| {
+        if a == b { U256::from(1u64) } else { U256::ZERO }
+      },
+      "EQ",
+    )?,
     opcode::ISZERO => {
       if let (Some(&a), Some(&result)) = (pre.stack.first(), post.stack.first()) {
-        let expected = if a.is_zero() { U256::from(1u64) } else { U256::ZERO };
+        let expected = if a.is_zero() {
+          U256::from(1u64)
+        } else {
+          U256::ZERO
+        };
         if result != expected {
-          return Err(ConsistencyError::IsZeroMismatch { pc, expected, actual: result });
+          return Err(ConsistencyError::IsZeroMismatch {
+            pc,
+            expected,
+            actual: result,
+          });
         }
       }
     }
@@ -875,7 +889,11 @@ fn check_opcode_semantics(
           let offset = offset_u256.saturating_to::<usize>();
           let expected = mload_from_memory(&post.memory, offset);
           if result != expected {
-            return Err(ConsistencyError::MloadMismatch { pc, expected, actual: result });
+            return Err(ConsistencyError::MloadMismatch {
+              pc,
+              expected,
+              actual: result,
+            });
           }
         }
       }
@@ -909,18 +927,78 @@ fn check_binary(
       let expected = f(a, b);
       if result != expected {
         return Err(match tag {
-          "ADD" => ConsistencyError::AddMismatch { pc, a, b, expected, actual: result },
-          "SUB" => ConsistencyError::SubMismatch { pc, a, b, expected, actual: result },
-          "MUL" => ConsistencyError::MulMismatch { pc, a, b, expected, actual: result },
-          "DIV" => ConsistencyError::DivMismatch { pc, a, b, expected, actual: result },
-          "MOD" => ConsistencyError::ModMismatch { pc, a, b, expected, actual: result },
-          "AND" => ConsistencyError::AndMismatch { pc, expected, actual: result },
-          "OR"  => ConsistencyError::OrMismatch  { pc, expected, actual: result },
-          "XOR" => ConsistencyError::XorMismatch { pc, expected, actual: result },
-          "LT"  => ConsistencyError::LtMismatch  { pc, expected, actual: result },
-          "GT"  => ConsistencyError::GtMismatch  { pc, expected, actual: result },
-          "EQ"  => ConsistencyError::EqMismatch  { pc, expected, actual: result },
-          _     => ConsistencyError::AddMismatch  { pc, a, b, expected, actual: result },
+          "ADD" => ConsistencyError::AddMismatch {
+            pc,
+            a,
+            b,
+            expected,
+            actual: result,
+          },
+          "SUB" => ConsistencyError::SubMismatch {
+            pc,
+            a,
+            b,
+            expected,
+            actual: result,
+          },
+          "MUL" => ConsistencyError::MulMismatch {
+            pc,
+            a,
+            b,
+            expected,
+            actual: result,
+          },
+          "DIV" => ConsistencyError::DivMismatch {
+            pc,
+            a,
+            b,
+            expected,
+            actual: result,
+          },
+          "MOD" => ConsistencyError::ModMismatch {
+            pc,
+            a,
+            b,
+            expected,
+            actual: result,
+          },
+          "AND" => ConsistencyError::AndMismatch {
+            pc,
+            expected,
+            actual: result,
+          },
+          "OR" => ConsistencyError::OrMismatch {
+            pc,
+            expected,
+            actual: result,
+          },
+          "XOR" => ConsistencyError::XorMismatch {
+            pc,
+            expected,
+            actual: result,
+          },
+          "LT" => ConsistencyError::LtMismatch {
+            pc,
+            expected,
+            actual: result,
+          },
+          "GT" => ConsistencyError::GtMismatch {
+            pc,
+            expected,
+            actual: result,
+          },
+          "EQ" => ConsistencyError::EqMismatch {
+            pc,
+            expected,
+            actual: result,
+          },
+          _ => ConsistencyError::AddMismatch {
+            pc,
+            a,
+            b,
+            expected,
+            actual: result,
+          },
         });
       }
       // Also check passthrough: post_stack[1..] == pre_stack[2..]
@@ -945,8 +1023,8 @@ fn check_stack_passthrough(
   pre_start: usize,
   post_start: usize,
 ) -> Result<(), ConsistencyError> {
-  let count = (pre.stack.len().saturating_sub(pre_start))
-    .min(post.stack.len().saturating_sub(post_start));
+  let count =
+    (pre.stack.len().saturating_sub(pre_start)).min(post.stack.len().saturating_sub(post_start));
   for i in 0..count {
     let pre_val = pre.stack[pre_start + i];
     let post_val = post.stack[post_start + i];
@@ -1064,7 +1142,10 @@ mod tests {
       EvmState::with_stack(big_stack, 1),
     );
     let err = consistency_check(&node).unwrap_err();
-    assert!(matches!(err, ConsistencyError::StackOverflow { depth: 1025 }));
+    assert!(matches!(
+      err,
+      ConsistencyError::StackOverflow { depth: 1025 }
+    ));
   }
 
   #[test]
@@ -1091,7 +1172,10 @@ mod tests {
       st_mem(vec![U256::from(3u64)], 1, vec![0u8; 33]),
     );
     let err = consistency_check(&node).unwrap_err();
-    assert!(matches!(err, ConsistencyError::MemoryAlignment { size: 33 }));
+    assert!(matches!(
+      err,
+      ConsistencyError::MemoryAlignment { size: 33 }
+    ));
   }
 
   // ────────────────── Gas ────────────────────────────────────────────────
@@ -1106,7 +1190,11 @@ mod tests {
     let err = consistency_check(&node).unwrap_err();
     assert!(matches!(
       err,
-      ConsistencyError::GasIncrease { pre: 100, post: 200, .. }
+      ConsistencyError::GasIncrease {
+        pre: 100,
+        post: 200,
+        ..
+      }
     ));
   }
 
@@ -1139,7 +1227,10 @@ mod tests {
     let err = consistency_check(&seq).unwrap_err();
     assert!(matches!(
       err,
-      ConsistencyError::SeqGasMismatch { left: 997, right: 990 }
+      ConsistencyError::SeqGasMismatch {
+        left: 997,
+        right: 990
+      }
     ));
   }
 
@@ -1164,10 +1255,7 @@ mod tests {
     let err = consistency_check(&seq).unwrap_err();
     assert!(matches!(
       err,
-      ConsistencyError::SeqStackValueMismatch {
-        position: 0,
-        ..
-      }
+      ConsistencyError::SeqStackValueMismatch { position: 0, .. }
     ));
   }
 
@@ -1250,7 +1338,8 @@ mod tests {
       opcode::TSTORE,
       {
         let mut s = st_gas(vec![U256::from(1u64), U256::from(42u64)], 0, HIGH_GAS);
-        s.transient_storage.insert(U256::from(10u64), U256::from(100u64));
+        s.transient_storage
+          .insert(U256::from(10u64), U256::from(100u64));
         s
       },
       st_gas_tstor(vec![], 1, HIGH_GAS - 100, &[(1, 42)]), // key 10 lost!
@@ -1388,31 +1477,19 @@ mod tests {
 
   #[test]
   fn not_correct() {
-    let node = leaf_gas(
-      opcode::NOT,
-      vec![U256::ZERO],
-      vec![U256::MAX],
-    );
+    let node = leaf_gas(opcode::NOT, vec![U256::ZERO], vec![U256::MAX]);
     assert!(consistency_check(&node).is_ok());
   }
 
   #[test]
   fn iszero_correct() {
-    let node = leaf_gas(
-      opcode::ISZERO,
-      vec![U256::ZERO],
-      vec![U256::from(1u64)],
-    );
+    let node = leaf_gas(opcode::ISZERO, vec![U256::ZERO], vec![U256::from(1u64)]);
     assert!(consistency_check(&node).is_ok());
   }
 
   #[test]
   fn iszero_nonzero() {
-    let node = leaf_gas(
-      opcode::ISZERO,
-      vec![U256::from(42u64)],
-      vec![U256::ZERO],
-    );
+    let node = leaf_gas(opcode::ISZERO, vec![U256::from(42u64)], vec![U256::ZERO]);
     assert!(consistency_check(&node).is_ok());
   }
 
@@ -1520,7 +1597,8 @@ mod tests {
       opcode::TLOAD,
       {
         let mut s = st_gas(vec![U256::from(1u64)], 0, HIGH_GAS);
-        s.transient_storage.insert(U256::from(1u64), U256::from(42u64));
+        s.transient_storage
+          .insert(U256::from(1u64), U256::from(42u64));
         s
       },
       st_gas_tstor(vec![U256::from(42u64)], 1, HIGH_GAS - 100, &[(1, 42)]),
@@ -1589,11 +1667,7 @@ mod tests {
     let a = U256::from(1u64);
     let b = U256::from(2u64);
     let c = U256::from(3u64);
-    let node = leaf_gas(
-      opcode::POP,
-      vec![a, b, c],
-      vec![b, c],
-    );
+    let node = leaf_gas(opcode::POP, vec![a, b, c], vec![b, c]);
     assert!(consistency_check(&node).is_ok());
   }
 
@@ -1695,9 +1769,15 @@ mod tests {
       st_gas(vec![U256::from(3u64)], 1, 99), // consumed=1 < 3
     );
     let err = consistency_check(&node).unwrap_err();
-    assert!(matches!(err, ConsistencyError::GasCostTooLow {
-      opcode: 0x01, consumed: 1, min_cost: 3, ..
-    }));
+    assert!(matches!(
+      err,
+      ConsistencyError::GasCostTooLow {
+        opcode: 0x01,
+        consumed: 1,
+        min_cost: 3,
+        ..
+      }
+    ));
   }
 
   #[test]
@@ -1709,9 +1789,15 @@ mod tests {
       st_gas(vec![U256::from(3u64)], 1, 95), // consumed=5 ≠ 3
     );
     let err = consistency_check(&node).unwrap_err();
-    assert!(matches!(err, ConsistencyError::GasCostMismatch {
-      opcode: 0x01, consumed: 5, expected: 3, ..
-    }));
+    assert!(matches!(
+      err,
+      ConsistencyError::GasCostMismatch {
+        opcode: 0x01,
+        consumed: 5,
+        expected: 3,
+        ..
+      }
+    ));
   }
 
   #[test]
@@ -1753,8 +1839,14 @@ mod tests {
       st_gas_tstor(vec![], 1, 150, &[(1, 42)]), // consumed=50 < 100
     );
     let err = consistency_check(&node).unwrap_err();
-    assert!(matches!(err, ConsistencyError::GasCostTooLow {
-      opcode: 0x5d, consumed: 50, min_cost: 100, ..
-    }));
+    assert!(matches!(
+      err,
+      ConsistencyError::GasCostTooLow {
+        opcode: 0x5d,
+        consumed: 50,
+        min_cost: 100,
+        ..
+      }
+    ));
   }
 }

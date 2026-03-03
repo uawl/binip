@@ -46,16 +46,18 @@ pub fn encode_binary(a: u8, b: u8, c: u8) -> GF2_128 {
 #[inline]
 pub fn decode_binary(e: GF2_128) -> (u8, u8, u8) {
   let v = e.lo;
-  ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8)
+  (
+    (v & 0xFF) as u8,
+    ((v >> 8) & 0xFF) as u8,
+    ((v >> 16) & 0xFF) as u8,
+  )
 }
 
 /// Pack an addition result `(a, b, sum, carry)`.
 #[inline]
 pub fn encode_add(a: u8, b: u8, sum: u8, carry: u8) -> GF2_128 {
   debug_assert!(carry <= 1);
-  GF2_128::from(
-    a as u64 | (b as u64) << 8 | (sum as u64) << 16 | (carry as u64) << 24,
-  )
+  GF2_128::from(a as u64 | (b as u64) << 8 | (sum as u64) << 16 | (carry as u64) << 24)
 }
 
 /// Unpack an addition field element into `(a, b, sum, carry)`.
@@ -73,9 +75,7 @@ pub fn decode_add(e: GF2_128) -> (u8, u8, u8, u8) {
 /// Pack a multiplication result `(a, b, lo, hi)`.
 #[inline]
 pub fn encode_mul(a: u8, b: u8, lo: u8, hi: u8) -> GF2_128 {
-  GF2_128::from(
-    a as u64 | (b as u64) << 8 | (lo as u64) << 16 | (hi as u64) << 24,
-  )
+  GF2_128::from(a as u64 | (b as u64) << 8 | (lo as u64) << 16 | (hi as u64) << 24)
 }
 
 /// Unpack a multiplication field element into `(a, b, lo, hi)`.
@@ -232,10 +232,30 @@ pub fn prove(
   // Pad witness to next power of two with a valid table entry.
   let n = witness.len().next_power_of_two();
   let pad = table.entries[0];
+  witness.reserve(n.saturating_sub(witness.len()));
   witness.resize(n, pad);
 
   let proof = logup::prove(witness, table, transcript);
   (proof, table.clone())
+}
+
+/// Prove an 8-bit LUT relation with a succinct witness commitment.
+///
+/// Returns `(proof, table, witness_digest)`.
+pub fn prove_committed(
+  op: Op8,
+  witness: &mut Vec<GF2_128>,
+  transcript: &mut transcript::Blake3Transcript,
+) -> (logup::LogUpProof, LookupTable, [u8; 32]) {
+  let table = build_table(op);
+
+  let n = witness.len().next_power_of_two();
+  let pad = table.entries[0];
+  witness.reserve(n.saturating_sub(witness.len()));
+  witness.resize(n, pad);
+
+  let (proof, digest) = logup::prove_committed(witness, &table, transcript);
+  (proof, table.clone(), digest)
 }
 
 /// Verify an 8-bit LUT proof.
@@ -246,6 +266,17 @@ pub fn verify(
   transcript: &mut transcript::Blake3Transcript,
 ) -> Option<logup::LogUpClaims> {
   logup::verify(proof, witness, table, transcript)
+}
+
+/// Verify an 8-bit LUT proof using a succinct witness commitment.
+pub fn verify_committed(
+  proof: &logup::LogUpProof,
+  n_witness: usize,
+  table: &LookupTable,
+  transcript: &mut transcript::Blake3Transcript,
+  witness_digest: &[u8; 32],
+) -> Option<logup::LogUpClaims> {
+  logup::verify_committed(proof, n_witness, table, transcript, witness_digest)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

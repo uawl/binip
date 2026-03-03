@@ -18,13 +18,14 @@ use crate::proof::{RoundPoly, SumcheckProof, alpha};
 
 /// Prove that `Σ_{x ∈ {0,1}^n} poly(x) = poly.sum()`.
 ///
-/// Consumes challenges from `transcript`. The same transcript must be used
-/// by the verifier (initialised in the same state) to reproduce challenges.
-pub fn prove<T: Transcript>(poly: &MlePoly, transcript: &mut T) -> SumcheckProof {
+/// Takes ownership of `poly` to fold in-place without cloning.
+/// The same transcript must be used by the verifier (initialised in the
+/// same state) to reproduce challenges.
+pub fn prove<T: Transcript>(poly: MlePoly, transcript: &mut T) -> SumcheckProof {
   let claimed_sum = poly.sum();
   transcript.absorb_field(claimed_sum);
 
-  let mut table = poly.evals.clone();
+  let mut table = poly.evals;
   let mut round_polys = Vec::with_capacity(poly.n_vars as usize);
   let a = alpha();
 
@@ -51,12 +52,13 @@ pub fn prove<T: Transcript>(poly: &MlePoly, transcript: &mut T) -> SumcheckProof
 
     let r = transcript.squeeze_challenge();
 
-    // Fold: fix current variable to r
+    // Fold in-place: fix current variable to r
     // new[j] = old[j]*(1+r) + old[j+half]*r   (char 2: 1-r = 1+r)
     let one_plus_r = GF2_128::one() + r;
-    table = (0..half)
-      .map(|j| table[j] * one_plus_r + table[j + half] * r)
-      .collect();
+    for j in 0..half {
+      table[j] = table[j] * one_plus_r + table[j + half] * r;
+    }
+    table.truncate(half);
   }
 
   let final_eval = table[0];

@@ -26,7 +26,7 @@ mod tests {
 
   fn roundtrip(poly: &MlePoly) -> bool {
     let mut t_prover = fresh_transcript();
-    let proof = prove(poly, &mut t_prover);
+    let proof = prove(poly.clone(), &mut t_prover);
 
     // Derive oracle eval from the MLE at the same challenges the verifier will use.
     // Since both prover and verifier produce the same challenges, we replay
@@ -88,7 +88,7 @@ mod tests {
   fn test_tampered_claimed_sum_fails() {
     let poly = MlePoly::new(vec![g(3), g(7), g(2), g(9)]);
     let mut t_prover = fresh_transcript();
-    let mut proof = prove(&poly, &mut t_prover);
+    let mut proof = prove(poly.clone(), &mut t_prover);
 
     // Tamper: flip the claimed sum
     proof.claimed_sum = proof.claimed_sum + g(1);
@@ -101,7 +101,7 @@ mod tests {
   fn test_tampered_round_poly_fails() {
     let poly = MlePoly::new((1u64..=8).map(g).collect());
     let mut t_prover = fresh_transcript();
-    let mut proof = prove(&poly, &mut t_prover);
+    let mut proof = prove(poly.clone(), &mut t_prover);
 
     // Tamper: modify g(1) of the first round poly
     proof.round_polys[0].0[1] = proof.round_polys[0].0[1] + g(1);
@@ -124,7 +124,7 @@ mod tests {
     let poly = MlePoly::new(evals);
 
     let mut t_prover = fresh_transcript();
-    let proof = prove(&poly, &mut t_prover);
+    let proof = prove(poly.clone(), &mut t_prover);
 
     // Use a fresh transcript to reproduce challenges
     let mut tc = fresh_transcript();
@@ -140,7 +140,7 @@ mod tests {
     let poly = MlePoly::new(evals);
 
     let mut t_prover = fresh_transcript();
-    let proof = prove(&poly, &mut t_prover);
+    let proof = prove(poly.clone(), &mut t_prover);
 
     // Reproduce challenges
     let mut tc = fresh_transcript();
@@ -157,7 +157,7 @@ mod tests {
     let poly = MlePoly::new(evals.clone());
 
     let mut t_prover = fresh_transcript();
-    let proof = prove(&poly, &mut t_prover);
+    let proof = prove(poly.clone(), &mut t_prover);
 
     let mut t_verifier = fresh_transcript();
     // Pass a wrong oracle value

@@ -5,8 +5,20 @@
 //!
 //! Default: 64 steps.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::hint::black_box;
+
 use e2e::{EvmStep, build_witness, prove_cpu_par, verify};
 use revm::primitives::U256;
+
+/// Enable large (2 MiB) OS pages for all mimalloc allocations.
+fn enable_large_pages() {
+  unsafe {
+    libmimalloc_sys::mi_option_set_enabled(libmimalloc_sys::mi_option_large_os_pages, true);
+  }
+}
 
 /// Create a mixed EVM trace of `n` steps — **O(n) time and memory**.
 ///
@@ -74,10 +86,12 @@ fn mixed_trace(n: usize) -> Vec<EvmStep> {
 }
 
 fn main() {
+  enable_large_pages();
+
   let n: usize = std::env::args()
     .nth(1)
     .and_then(|s| s.parse().ok())
-    .unwrap_or(1 << 20);
+    .unwrap_or(1 << 18);
 
   eprintln!("Building witness for {} steps...", n);
   let steps = mixed_trace(n);
@@ -91,7 +105,7 @@ fn main() {
 
   let t0 = std::time::Instant::now();
 
-  let (proof, params) = prove_cpu_par(&witness).unwrap();
+  let (proof, params) = black_box(prove_cpu_par(black_box(&witness))).unwrap();
 
   let t1 = std::time::Instant::now();
 
@@ -101,7 +115,7 @@ fn main() {
 
   eprintln!("Prover took {:.2?}", t1 - t0);
 
-  if let Err(err) = res {
+  if let Err(_err) = res {
     eprintln!("Verification failed in {:.2?}", t2 - t1);
   } else {
     eprintln!("Verification succeeded in {:.2?}", t2 - t1);

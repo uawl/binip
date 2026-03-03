@@ -152,7 +152,7 @@ mod tests {
     let evals: Vec<GF2_128> = (1u64..=4).map(g).collect();
     let sub = MlePoly::new(evals);
     let root_t = Blake3Transcript::new();
-    let proof = crate::prover::prove_shard(0, &sub, &root_t);
+    let proof = crate::prover::prove_shard(0, sub.clone(), &root_t);
 
     // Compute oracle eval
     let mut t_tmp = root_t.fork("shard", 0);
