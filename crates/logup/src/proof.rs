@@ -2,6 +2,29 @@
 
 use field::GF2_128;
 
+/// PCS evaluation binding for committed logup proofs.
+///
+/// Depending on whether h_w and h_t share the same n_vars, the prover
+/// chooses between a shared [`Batch`] commit (shared Merkle tree + column
+/// queries) and separate [`Individual`] commits.
+#[derive(Debug, Clone)]
+pub enum PcsBinding {
+  /// h_w and h_t committed separately (different n_vars).
+  Individual {
+    h_w_commit: pcs::Commitment,
+    h_t_commit: pcs::Commitment,
+    h_w_opening: (GF2_128, pcs::OpenProof),
+    h_t_opening: (GF2_128, pcs::OpenProof),
+  },
+  /// h_w and h_t batched into a single commitment (same n_vars).
+  /// Entry 0 = h_w, entry 1 = h_t.
+  Batch {
+    n_vars: u32,
+    commit: pcs::BatchCommitment,
+    open_proof: pcs::BatchOpenProof,
+  },
+}
+
 /// A single LogUp relation proof: witness values ⊂ table entries.
 ///
 /// The γ-weighted LogUp protocol proves
@@ -33,18 +56,6 @@ pub struct LogUpProof {
   pub table_sumcheck: sumcheck::SumcheckProof,
 
   // ── PCS evaluation binding (committed path only) ──────────────────────
-  /// PCS commitment to the witness-side fractional MLE h_w.
   /// Present only in the committed proof variant.
-  pub h_w_commit: Option<pcs::Commitment>,
-
-  /// PCS commitment to the table-side fractional MLE h_t.
-  pub h_t_commit: Option<pcs::Commitment>,
-
-  /// PCS opening proof for h_w at the witness sumcheck challenge point.
-  /// `(evaluation, opening_proof)` — evaluation must equal `witness_sumcheck.final_eval`.
-  pub h_w_opening: Option<(GF2_128, pcs::OpenProof)>,
-
-  /// PCS opening proof for h_t at the table sumcheck challenge point.
-  /// `(evaluation, opening_proof)` — evaluation must equal `table_sumcheck.final_eval`.
-  pub h_t_opening: Option<(GF2_128, pcs::OpenProof)>,
+  pub pcs_binding: Option<PcsBinding>,
 }

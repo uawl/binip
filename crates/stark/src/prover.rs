@@ -127,7 +127,7 @@ fn prepare(rows: &[Row], tree: &ProofNode, params: &StarkParams) -> Result<Prepa
   let mut lookup_witness = lookup::collect_witnesses(rows);
   let mut lookup_transcript = transcript.clone();
   let (lookup_proofs, lookup_commits) =
-    lookup::prove_lookups_par(&mut lookup_witness, &mut lookup_transcript);
+    lookup::prove_lookups_committed(&mut lookup_witness, &mut lookup_transcript);
 
   // 2d. ZK blinding
   let blinded_mle = constraint_mle.blind(&mut rng());
@@ -207,7 +207,7 @@ fn prepare_par(
     // PCS open at challenge point (fork from same parent state)
     let mut bnd_pcs_t = transcript.fork("boundary_pcs_open", 0);
     let (bnd_open_eval, bnd_pcs_open) =
-      pcs::open(&bnd_pcs_state, &bnd_challenges, &mut bnd_pcs_t);
+      pcs::open_par(&bnd_pcs_state, &bnd_challenges, &mut bnd_pcs_t);
     Some(BoundaryPcsProof {
       commit: bnd_commit,
       sumcheck: bnd_sumcheck,
@@ -306,6 +306,7 @@ fn assemble(
     pcs_open,
     open_point,
     open_eval,
+    storage_proof: None,
     config: params.config.clone(),
   })
 }
@@ -399,7 +400,7 @@ pub fn prove_cpu_par(
     &params.config,
     &shard_transcript,
   );
-  let (open_eval, pcs_open) = pcs::open(&pcs_state, &open_point, &mut transcript);
+  let (open_eval, pcs_open) = pcs::open_par(&pcs_state, &open_point, &mut transcript);
 
   Ok(Proof {
     type_cert,
@@ -417,6 +418,7 @@ pub fn prove_cpu_par(
     pcs_open,
     open_point,
     open_eval,
+    storage_proof: None,
     config: params.config.clone(),
   })
 }
@@ -470,12 +472,18 @@ fn derive_open_point(
     }
   }
 
-  // ── Compose: high ∥ low, truncate/pad to total_vars ───────────────────
+  // ── Compose: high ∥ low ────────────────────────────────────────────────
   let mut point = Vec::with_capacity(total_vars);
   point.extend_from_slice(&high_challenges);
   point.extend_from_slice(&low_challenges);
-  point.truncate(total_vars);
-  point.resize(total_vars, GF2_128::zero());
+  assert_eq!(
+    point.len(),
+    total_vars,
+    "open point length mismatch: high({}) + low({}) != total_vars({})",
+    high_challenges.len(),
+    low_challenges.len(),
+    total_vars,
+  );
   point
 }
 

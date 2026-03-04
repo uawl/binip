@@ -3,7 +3,7 @@ pub mod prover;
 pub mod verifier;
 
 pub use proof::{RoundPoly, SumcheckProof};
-pub use prover::prove;
+pub use prover::{prove, prove_par};
 pub use verifier::verify;
 
 #[cfg(test)]
@@ -163,5 +163,52 @@ mod tests {
     // Pass a wrong oracle value
     let wrong_oracle = g(999999);
     assert!(verify(&proof, wrong_oracle, &mut t_verifier).is_none());
+  }
+
+  // ─── prove_par tests ────────────────────────────────────────────────────
+
+  fn roundtrip_par(poly: &MlePoly) -> bool {
+    let mut t_prover = fresh_transcript();
+    let proof = prove_par(poly.clone(), &mut t_prover);
+
+    let mut tc_tmp = fresh_transcript();
+    if let Some(challenges) = verify(&proof, proof.final_eval, &mut tc_tmp) {
+      assert_eq!(challenges.len(), poly.n_vars as usize);
+      let oracle = poly.evaluate(&challenges);
+      let mut t_verifier = fresh_transcript();
+      verify(&proof, oracle, &mut t_verifier).is_some()
+    } else {
+      false
+    }
+  }
+
+  #[test]
+  fn prove_par_matches_prove_small() {
+    for n in 1..=8u32 {
+      let evals: Vec<GF2_128> = (1u64..=(1 << n)).map(g).collect();
+      let poly = MlePoly::new(evals);
+      assert!(roundtrip_par(&poly), "prove_par failed for n_vars={n}");
+    }
+  }
+
+  #[test]
+  fn prove_par_matches_prove_large() {
+    // n_vars=14 → 16384 elements, exceeds PAR_THRESHOLD
+    let n = 14;
+    let evals: Vec<GF2_128> = (0..1u64 << n).map(|i| g(i.wrapping_mul(7) ^ 0xDEAD)).collect();
+    let poly = MlePoly::new(evals);
+
+    let mut t1 = fresh_transcript();
+    let proof_seq = prove(poly.clone(), &mut t1);
+
+    let mut t2 = fresh_transcript();
+    let proof_par = prove_par(poly.clone(), &mut t2);
+
+    assert_eq!(proof_seq.claimed_sum, proof_par.claimed_sum);
+    assert_eq!(proof_seq.final_eval, proof_par.final_eval);
+    assert_eq!(proof_seq.round_polys.len(), proof_par.round_polys.len());
+    for (s, p) in proof_seq.round_polys.iter().zip(&proof_par.round_polys) {
+      assert_eq!(s, p, "round polys differ");
+    }
   }
 }

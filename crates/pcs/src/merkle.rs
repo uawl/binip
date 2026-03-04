@@ -1,4 +1,4 @@
-//! Blake3-based binary Merkle tree used by the Tensor PCS.
+//! Blake3-based binary Merkle tree used by the PCS.
 //!
 //! Leaves are padded to the next power-of-two with the all-zero hash.
 //! The tree is stored in a 1-indexed heap layout:
@@ -6,6 +6,8 @@
 //!   nodes[n..2n-1] = leaves (n = next_power_of_two(n_leaves))
 //!   parent(i)     = i / 2
 //!   children(i)   = 2i, 2i+1
+
+use rayon::prelude::*;
 
 /// A 32-byte Blake3 hash.
 pub type Hash = [u8; 32];
@@ -48,6 +50,41 @@ impl MerkleTree {
   /// The Merkle root.
   pub fn root(&self) -> Hash {
     self.nodes[1]
+  }
+
+  /// Build the tree with parallel internal-node computation.
+  ///
+  /// Leaves are placed sequentially (cheap memcopy).  Internal nodes are
+  /// computed bottom-up, one level at a time.  Levels with ≥256 nodes
+  /// are hashed in parallel via rayon.
+  pub fn build_par(leaves: &[Hash]) -> Self {
+    let n = leaves.len().next_power_of_two().max(1);
+    let mut nodes = vec![[0u8; 32]; 2 * n];
+    nodes[n..n + leaves.len()].copy_from_slice(leaves);
+
+    let depth = n.trailing_zeros() as usize;
+    for level in (0..depth).rev() {
+      let start = 1usize << level;
+      let count = 1usize << level;
+      if count >= 256 {
+        // Parallel: compute hashes into a temp vec, then copy back.
+        // The closure borrows `nodes` immutably (reads children at level+1).
+        // After collect(), the borrow is released and we write to level.
+        let hashes: Vec<Hash> = (0..count)
+          .into_par_iter()
+          .map(|j| {
+            let i = start + j;
+            hash_inner(&nodes[2 * i], &nodes[2 * i + 1])
+          })
+          .collect();
+        nodes[start..start + count].copy_from_slice(&hashes);
+      } else {
+        for i in start..start + count {
+          nodes[i] = hash_inner(&nodes[2 * i], &nodes[2 * i + 1]);
+        }
+      }
+    }
+    Self { n, nodes }
   }
 
   /// Generate an inclusion proof for the leaf at `idx` (0-based).

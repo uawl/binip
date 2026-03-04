@@ -142,6 +142,14 @@ fn walk_boundaries(node: &ProofNode, rows: &mut Vec<BoundaryRow>) {
       walk_boundaries(cond, rows);
       walk_boundaries(taken, rows);
       walk_boundaries(not_taken, rows);
+
+      // L-4: Both branch paths must rejoin at the same post-state.
+      // Without this, a malicious prover could have `taken` and
+      // `not_taken` end in different states while the parent Seq
+      // only checks `taken.post` via `rightmost_post`.
+      let taken_post = rightmost_post(taken);
+      let not_taken_post = rightmost_post(not_taken);
+      emit_boundary_rows(taken_post, not_taken_post, rows);
     }
   }
 }

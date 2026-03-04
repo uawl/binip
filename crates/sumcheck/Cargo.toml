@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 field      = { path = "../field" }
 poly       = { path = "../poly" }
+rayon      = "1"
 transcript = { path = "../transcript" }

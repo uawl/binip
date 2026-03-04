@@ -19,6 +19,7 @@ use shard::{RecursiveConfig, ShardProofBatch};
 use sumcheck::SumcheckProof;
 
 use circuit::lookup::{LookupCommitments, LookupProofs};
+use circuit::mpt::StorageProof;
 
 /// Cryptographic binding for the boundary-constraint MLE.
 ///
@@ -99,6 +100,13 @@ pub struct Proof {
   pub open_point: Vec<GF2_128>,
   /// Claimed evaluation of the constraint MLE at `open_point`.
   pub open_eval: GF2_128,
+
+  // ── Phase C: storage state binding ─────────────────────────────────
+  /// Sparse Merkle Tree inclusion proofs for storage slots.
+  ///
+  /// Present when the execution touches persistent storage (SLOAD/SSTORE).
+  /// Binds `RwSummaries.storage` initial/final values to pre/post state roots.
+  pub storage_proof: Option<StorageProof>,
 
   // ── config ────────────────────────────────────────────────────────────
   /// The recursion configuration used during proving.

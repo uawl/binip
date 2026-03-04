@@ -264,8 +264,8 @@ mod tests {
     let witness = build_witness(&steps).unwrap();
 
     assert_eq!(witness.n_steps, 1);
-    // EXP uses advice_u256: 2 AdviceLoad + 2 Mov = 4 ops.
-    assert_eq!(witness.rows.len(), 4);
+    // EXP uses advice_u256: 1 Advice2 + 2 Mov = 3 ops.
+    assert_eq!(witness.rows.len(), 3);
   }
 
   #[test]
@@ -280,8 +280,8 @@ mod tests {
     let witness = build_witness(&steps).unwrap();
 
     assert_eq!(witness.n_steps, 1);
-    // DIV: 2 AdviceLoad(quot) + 2 AdviceLoad(rem) + 1 CheckDiv + 2 Mov = 7
-    assert_eq!(witness.rows.len(), 7);
+    // DIV: 1 Advice4(quot+rem) + 1 CheckDiv + 2 Mov = 4
+    assert_eq!(witness.rows.len(), 4);
   }
 
   #[test]
@@ -394,6 +394,105 @@ mod tests {
   }
 
   #[test]
+  fn prove_and_verify_simple_mul() {
+    use revm::bytecode::opcode::MUL;
+    let a = U256::from(6u64);
+    let b = U256::from(7u64);
+    let result = U256::from(42u64);
+    let steps = vec![step(MUL, 0, &[a, b], &[result])];
+    let witness = build_witness(&steps).unwrap();
+    let (proof, params) = prove_cpu(&witness).unwrap();
+    verify(&proof, &witness.tree, &params).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_simple_exp() {
+    use revm::bytecode::opcode::EXP;
+    // 0^7 = 0
+    let a = U256::from(0u64);
+    let b = U256::from(7u64);
+    let result = U256::from(0u64);
+    let steps = vec![step(EXP, 0, &[a, b], &[result])];
+    let witness = build_witness(&steps).unwrap();
+    let (proof, params) = prove_cpu(&witness).unwrap();
+    verify(&proof, &witness.tree, &params).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_push0_mul() {
+    use revm::bytecode::opcode::{MUL, PUSH0};
+    let a = U256::from(7u64);
+    let b = U256::from(3u64);
+    let push0_cost = evm_types::opcode::gas_cost(PUSH0).unwrap().static_gas;
+    let mul_cost = evm_types::opcode::gas_cost(MUL).unwrap().static_gas;
+    let gas0 = 100_000u64;
+    let gas1 = gas0 - push0_cost;
+    let gas2 = gas1 - mul_cost;
+    let steps = vec![
+      EvmStep {
+        opcode: PUSH0,
+        pc: 0,
+        gas_before: gas0,
+        gas_after: gas1,
+        pre_stack: vec![a, b],
+        post_stack: vec![U256::ZERO, a, b],
+      },
+      EvmStep {
+        opcode: MUL,
+        pc: 1,
+        gas_before: gas1,
+        gas_after: gas2,
+        pre_stack: vec![U256::ZERO, a, b],
+        post_stack: vec![U256::ZERO, b],
+      },
+    ];
+    prove_and_verify(&steps).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_push0_div() {
+    use revm::bytecode::opcode::{DIV, PUSH0};
+    let a = U256::from(7u64);
+    let b = U256::from(3u64);
+    let push0_cost = evm_types::opcode::gas_cost(PUSH0).unwrap().static_gas;
+    let div_cost = evm_types::opcode::gas_cost(DIV).unwrap().static_gas;
+    let gas0 = 100_000u64;
+    let gas1 = gas0 - push0_cost;
+    let gas2 = gas1 - div_cost;
+    let steps = vec![
+      EvmStep {
+        opcode: PUSH0,
+        pc: 0,
+        gas_before: gas0,
+        gas_after: gas1,
+        pre_stack: vec![a, b],
+        post_stack: vec![U256::ZERO, a, b],
+      },
+      EvmStep {
+        opcode: DIV,
+        pc: 1,
+        gas_before: gas1,
+        gas_after: gas2,
+        pre_stack: vec![U256::ZERO, a, b],
+        post_stack: vec![U256::ZERO, b],
+      },
+    ];
+    prove_and_verify(&steps).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_simple_div() {
+    use revm::bytecode::opcode::DIV;
+    let a = U256::from(100u64);
+    let b = U256::from(7u64);
+    let result = U256::from(14u64);
+    let steps = vec![step(DIV, 0, &[a, b], &[result])];
+    let witness = build_witness(&steps).unwrap();
+    let (proof, params) = prove_cpu(&witness).unwrap();
+    verify(&proof, &witness.tree, &params).unwrap();
+  }
+
+  #[test]
   fn prove_and_verify_multi_step() {
     use revm::bytecode::opcode::{ADD, STOP};
     // ADD costs 3, STOP costs 0.
@@ -422,5 +521,68 @@ mod tests {
       "prove_and_verify failed: {:?}",
       result.err()
     );
+  }
+
+  // ── L-1 indirect coverage: comparison ops prove & verify ──────────
+  //
+  // These tests verify that correct comparison results pass the full
+  // prove→verify pipeline.  The circuit's AdviceLoad + RangeCheck
+  // only ensures the result is 0 or 1; actual correctness is verified
+  // by `consistency_check` in the verifier.
+
+  #[test]
+  fn prove_and_verify_lt_true() {
+    use revm::bytecode::opcode::LT;
+    // 3 < 5 = 1
+    let steps = vec![step(LT, 0, &[U256::from(3u64), U256::from(5u64)], &[U256::from(1u64)])];
+    prove_and_verify(&steps).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_lt_false() {
+    use revm::bytecode::opcode::LT;
+    // 5 < 3 = 0
+    let steps = vec![step(LT, 0, &[U256::from(5u64), U256::from(3u64)], &[U256::ZERO])];
+    prove_and_verify(&steps).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_gt_true() {
+    use revm::bytecode::opcode::GT;
+    // 5 > 3 = 1
+    let steps = vec![step(GT, 0, &[U256::from(5u64), U256::from(3u64)], &[U256::from(1u64)])];
+    prove_and_verify(&steps).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_eq_true() {
+    use revm::bytecode::opcode::EQ;
+    // 7 == 7 = 1
+    let steps = vec![step(EQ, 0, &[U256::from(7u64), U256::from(7u64)], &[U256::from(1u64)])];
+    prove_and_verify(&steps).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_eq_false() {
+    use revm::bytecode::opcode::EQ;
+    // 7 == 8 = 0
+    let steps = vec![step(EQ, 0, &[U256::from(7u64), U256::from(8u64)], &[U256::ZERO])];
+    prove_and_verify(&steps).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_iszero_true() {
+    use revm::bytecode::opcode::ISZERO;
+    // ISZERO(0) = 1
+    let steps = vec![step(ISZERO, 0, &[U256::ZERO], &[U256::from(1u64)])];
+    prove_and_verify(&steps).unwrap();
+  }
+
+  #[test]
+  fn prove_and_verify_iszero_false() {
+    use revm::bytecode::opcode::ISZERO;
+    // ISZERO(42) = 0
+    let steps = vec![step(ISZERO, 0, &[U256::from(42u64)], &[U256::ZERO])];
+    prove_and_verify(&steps).unwrap();
   }
 }

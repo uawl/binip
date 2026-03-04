@@ -11,11 +11,9 @@
 //! 5. Feed the aggregate claims into the next level.
 //! 6. Repeat until a single root claim remains.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use field::{FieldElem, GF2_128};
-use poly::MlePoly;
-use rayon::prelude::*;
 use shard::{RecursiveConfig, ShardProofBatch};
 use transcript::{Blake3Transcript, Transcript};
 
@@ -112,20 +110,20 @@ fn prove_level(
 
 /// DAG-parallel variant of [`prove_recursive`].
 ///
-/// Unlike the sequential version (or a level-barrier parallel version),
-/// this schedules each node as soon as **its own children** complete.
-/// A node at level L+1 can start while unrelated subtrees at level L are
-/// still running.
+/// Uses per-node countdown latches so that a parent node starts the
+/// instant **its own `fan_in` children** finish — no level-wide barrier.
 ///
-/// Implementation: A recursive function [`prove_dag_node`] is called from
-/// the root.  At each internal node, `rayon::par_iter` fans out to child
-/// nodes, which recursively fan out further.  Rayon's work-stealing
-/// scheduler automatically balances the load.
+/// Each node writes its result (claim + proof) into a pre-allocated slot
+/// indexed by `(level, node_idx)`, eliminating Mutex contention entirely.
+/// When the last child of a group decrements its parent's `AtomicUsize`
+/// latch to 0, it spawns the parent task on rayon's scoped thread pool.
 pub fn prove_recursive_par(
   shard_batch: &ShardProofBatch,
   config: &RecursiveConfig,
   root_transcript: &Blake3Transcript,
 ) -> RecursiveProof {
+  use std::cell::UnsafeCell;
+
   let depth = config.depth();
   let fan = config.fan_in as usize;
 
@@ -142,7 +140,7 @@ pub fn prove_recursive_par(
     .map(|sp| sp.sumcheck.claimed_sum)
     .collect();
 
-  // Pre-compute number of nodes at each level for bounds checking.
+  // Pre-compute node counts per level.
   let mut nodes_per_level = Vec::with_capacity(depth as usize);
   let mut count = shard_claims.len();
   for _ in 0..depth {
@@ -150,94 +148,175 @@ pub fn prove_recursive_par(
     nodes_per_level.push(count);
   }
 
-  // Thread-safe collectors for level proofs.
-  let collectors: Vec<Mutex<Vec<LevelProof>>> =
-    (0..depth).map(|_| Mutex::new(Vec::new())).collect();
+  // ── Pre-allocate slots for results ───────────────────────────────────
+  // Each slot holds Option<(LevelProof, GF2_128)>.
+  // Written exactly once by the owning node, read after the scope ends.
+  struct Slot(UnsafeCell<Option<(LevelProof, GF2_128)>>);
+  // SAFETY: each slot is written by exactly one rayon task and never read
+  // concurrently — the parent only reads after its latch fires, which
+  // happens-after the child's write.
+  unsafe impl Sync for Slot {}
 
-  // Kick off from the root — it recursively spawns the whole tree.
-  let root_claim = prove_dag_node(
-    depth - 1,
-    0,
-    &shard_claims,
-    fan,
-    &nodes_per_level,
-    root_transcript,
-    &collectors,
-  );
+  let level_slots: Vec<Vec<Slot>> = nodes_per_level
+    .iter()
+    .map(|&n| (0..n).map(|_| Slot(UnsafeCell::new(None))).collect())
+    .collect();
 
-  // Extract and sort proofs by node_idx within each level.
-  let levels: Vec<Vec<LevelProof>> = collectors
-    .into_iter()
-    .map(|m| {
-      let mut proofs = m.into_inner().unwrap();
-      proofs.sort_by_key(|p| p.node_idx);
-      proofs
+  // ── Per-node latches ─────────────────────────────────────────────────
+  // latch[level][node_idx] counts remaining children.
+  // Level 0 nodes have no latch (triggered directly from shard claims).
+  let latches: Vec<Vec<AtomicUsize>> = nodes_per_level
+    .iter()
+    .enumerate()
+    .map(|(level, &n)| {
+      (0..n)
+        .map(|node_idx| {
+          let n_children = if level == 0 {
+            // Children are shard claims — all immediately available.
+            0
+          } else {
+            let child_level_nodes = nodes_per_level[level - 1];
+            let start = node_idx * fan;
+            (start + fan).min(child_level_nodes) - start
+          };
+          AtomicUsize::new(n_children)
+        })
+        .collect()
     })
     .collect();
 
-  RecursiveProof { levels, root_claim }
-}
+  // ── Node proving + latch trigger ─────────────────────────────────────
+  fn prove_node<'scope>(
+    scope: &rayon::Scope<'scope>,
+    level: u32,
+    node_idx: usize,
+    depth: u32,
+    fan: usize,
+    shard_claims: &'scope [GF2_128],
+    nodes_per_level: &'scope [usize],
+    level_slots: &'scope [Vec<Slot>],
+    latches: &'scope [Vec<AtomicUsize>],
+    root_transcript: &'scope Blake3Transcript,
+  ) {
+    let lv = level as usize;
 
-/// Recursively prove a single DAG node.
-///
-/// - **Level 0** nodes take shard claims directly.
-/// - **Level > 0** nodes spawn children via `par_iter`, wait for them,
-///   then prove this node.  This means a parent starts the instant all
-///   its children finish — no level-wide barrier.
-fn prove_dag_node(
-  level: u32,
-  node_idx: usize,
-  shard_claims: &[GF2_128],
-  fan: usize,
-  nodes_per_level: &[usize],
-  root_transcript: &Blake3Transcript,
-  collectors: &[Mutex<Vec<LevelProof>>],
-) -> GF2_128 {
-  let child_claims: Vec<GF2_128> = if level == 0 {
-    // Leaf: slice shard claims.
-    let start = node_idx * fan;
-    let end = (start + fan).min(shard_claims.len());
-    shard_claims[start..end].to_vec()
-  } else {
-    // Internal: prove children in parallel, collect their aggregate sums.
-    let child_level = (level - 1) as usize;
-    let n_children_total = nodes_per_level[child_level];
-    let start = node_idx * fan;
-    let end = (start + fan).min(n_children_total);
-    (start..end)
-      .into_par_iter()
-      .map(|child_idx| {
-        prove_dag_node(
-          level - 1,
-          child_idx,
-          shard_claims,
+    // Gather child claims.
+    let child_claims: Vec<GF2_128> = if level == 0 {
+      let start = node_idx * fan;
+      let end = (start + fan).min(shard_claims.len());
+      shard_claims[start..end].to_vec()
+    } else {
+      let child_lv = lv - 1;
+      let child_level_nodes = nodes_per_level[child_lv];
+      let start = node_idx * fan;
+      let end = (start + fan).min(child_level_nodes);
+      (start..end)
+        .map(|ci| {
+          // SAFETY: child slot was written before this node's latch fired.
+          let slot = unsafe { &*level_slots[child_lv][ci].0.get() };
+          slot.as_ref().unwrap().1
+        })
+        .collect()
+    };
+
+    // Prove.
+    let agg_mle = build_aggregation_mle(&child_claims);
+    let aggregate_sum = agg_mle.sum();
+
+    let mut t = root_transcript.fork("recursive", level * 0x1_0000 + node_idx as u32);
+    t.absorb_bytes(&level.to_le_bytes());
+    t.absorb_bytes(&(node_idx as u32).to_le_bytes());
+
+    let sumcheck = sumcheck::prove(agg_mle, &mut t);
+
+    let proof = LevelProof {
+      level,
+      node_idx: node_idx as u32,
+      child_claims,
+      sumcheck,
+    };
+
+    // Write result to slot.
+    // SAFETY: this slot is written exactly once.
+    unsafe {
+      *level_slots[lv][node_idx].0.get() = Some((proof, aggregate_sum));
+    }
+
+    // Notify parent.
+    if (level + 1) < depth {
+      let parent_lv = lv + 1;
+      let parent_idx = node_idx / fan;
+      let prev = latches[parent_lv][parent_idx].fetch_sub(1, Ordering::AcqRel);
+      if prev == 1 {
+        // Last child — spawn parent on the scoped thread pool.
+        scope.spawn(move |s| {
+          prove_node(
+            s,
+            level + 1,
+            parent_idx,
+            depth,
+            fan,
+            shard_claims,
+            nodes_per_level,
+            level_slots,
+            latches,
+            root_transcript,
+          );
+        });
+      }
+    }
+  }
+
+  // ── Kick off level-0 nodes ───────────────────────────────────────────
+  // Level-0 nodes have all inputs ready (shard claims), so fire them all.
+  let sc_ref: &[GF2_128] = &shard_claims;
+  let npl_ref: &[usize] = &nodes_per_level;
+  let ls_ref: &[Vec<Slot>] = &level_slots;
+  let la_ref: &[Vec<AtomicUsize>] = &latches;
+
+  rayon::scope(|s| {
+    let n_level0 = npl_ref[0];
+    for node_idx in 0..n_level0 {
+      s.spawn(move |inner_s| {
+        prove_node(
+          inner_s,
+          0,
+          node_idx,
+          depth,
           fan,
-          nodes_per_level,
+          sc_ref,
+          npl_ref,
+          ls_ref,
+          la_ref,
           root_transcript,
-          collectors,
-        )
-      })
-      .collect()
-  };
-
-  // Prove this node.
-  let agg_mle = build_aggregation_mle(&child_claims);
-  let aggregate_sum = agg_mle.sum();
-
-  let mut t = root_transcript.fork("recursive", level * 0x1_0000 + node_idx as u32);
-  t.absorb_bytes(&level.to_le_bytes());
-  t.absorb_bytes(&(node_idx as u32).to_le_bytes());
-
-  let sumcheck = sumcheck::prove(agg_mle, &mut t);
-
-  collectors[level as usize].lock().unwrap().push(LevelProof {
-    level,
-    node_idx: node_idx as u32,
-    child_claims,
-    sumcheck,
+        );
+      });
+    }
   });
 
-  aggregate_sum
+  // ── Collect results ──────────────────────────────────────────────────
+  let mut levels: Vec<Vec<LevelProof>> = Vec::with_capacity(depth as usize);
+  for lv_slots in &level_slots {
+    let lv_proofs: Vec<LevelProof> = lv_slots
+      .iter()
+      .map(|slot| {
+        let inner = unsafe { &mut *slot.0.get() };
+        inner.take().expect("all nodes must complete").0
+      })
+      .collect();
+    levels.push(lv_proofs);
+  }
+
+  let root_claim = {
+    let last_level = levels.last().unwrap();
+    assert_eq!(last_level.len(), 1);
+    last_level[0]
+      .child_claims
+      .iter()
+      .fold(GF2_128::zero(), |a, &b| a + b)
+  };
+
+  RecursiveProof { levels, root_claim }
 }
 
 #[cfg(test)]

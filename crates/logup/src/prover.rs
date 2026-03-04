@@ -13,7 +13,7 @@ use field::{FieldElem, GF2_128};
 use poly::MlePoly;
 use transcript::{Blake3Transcript, Transcript};
 
-use crate::proof::LogUpProof;
+use crate::proof::{LogUpProof, PcsBinding};
 use crate::table::{LookupTable, table_fractional_evals, witness_fractional_evals};
 
 /// Prove a single LogUp lookup relation.
@@ -60,11 +60,11 @@ pub fn prove(
 
   // ── 4. Witness-side sumcheck ──────────────────────────────────────────
   transcript.absorb_bytes(b"logup:witness_sumcheck");
-  let witness_proof = sumcheck::prove(h_w, transcript);
+  let witness_proof = sumcheck::prove_par(h_w, transcript);
 
   // ── 5. Table-side sumcheck ────────────────────────────────────────────
   transcript.absorb_bytes(b"logup:table_sumcheck");
-  let table_proof = sumcheck::prove(h_t, transcript);
+  let table_proof = sumcheck::prove_par(h_t, transcript);
 
   LogUpProof {
     beta,
@@ -72,10 +72,7 @@ pub fn prove(
     claimed_sum,
     witness_sumcheck: witness_proof,
     table_sumcheck: table_proof,
-    h_w_commit: None,
-    h_t_commit: None,
-    h_w_opening: None,
-    h_t_opening: None,
+    pcs_binding: None,
   }
 }
 
@@ -94,8 +91,11 @@ pub fn hash_witness(witness: &[GF2_128]) -> [u8; 32] {
 /// Same as [`prove`] but:
 /// 1. Absorbs a 32-byte witness digest instead of raw witness values.
 /// 2. PCS-commits the fractional MLEs h_w and h_t.
-/// 3. After each sumcheck, PCS-opens at the challenge point to bind
-///    `final_eval` to the committed polynomial.
+///    - If h_w and h_t share the same n_vars, uses a single
+///      [`BatchTensorPCS`](pcs::BatchTensorPCS) commit (shared Merkle tree
+///      + shared column queries).
+///    - Otherwise, commits each individually with `pcs::commit_par`.
+/// 3. After both sumchecks, PCS-opens at the challenge points.
 ///
 /// Returns `(proof, witness_digest)`.
 pub fn prove_committed(
@@ -134,45 +134,150 @@ pub fn prove_committed(
   );
   let claimed_sum = witness_sum;
 
-  // ── 4. PCS commit h_w and h_t ─────────────────────────────────────────
+  // ── 4. PCS commit ─────────────────────────────────────────────────────
   let h_w_n_vars = h_w_evals.len().trailing_zeros();
+  let h_t_n_vars = h_t_evals.len().trailing_zeros();
+
+  if h_w_n_vars == h_t_n_vars {
+    // ── Batch path: same n_vars → shared tree + column queries ────────
+    prove_committed_batch(
+      h_w_evals,
+      h_t_evals,
+      h_w_n_vars,
+      beta,
+      gamma,
+      claimed_sum,
+      witness_digest,
+      transcript,
+    )
+  } else {
+    // ── Individual path: different n_vars → separate commits ──────────
+    prove_committed_individual(
+      h_w_evals,
+      h_t_evals,
+      h_w_n_vars,
+      h_t_n_vars,
+      beta,
+      gamma,
+      claimed_sum,
+      witness_digest,
+      transcript,
+    )
+  }
+}
+
+/// Batch PCS path: h_w and h_t share the same n_vars.
+fn prove_committed_batch(
+  h_w_evals: Vec<GF2_128>,
+  h_t_evals: Vec<GF2_128>,
+  n_vars: u32,
+  beta: GF2_128,
+  gamma: GF2_128,
+  claimed_sum: GF2_128,
+  witness_digest: [u8; 32],
+  transcript: &mut Blake3Transcript,
+) -> (LogUpProof, [u8; 32]) {
+  let params = pcs::PcsParams {
+    n_vars,
+    n_queries: 40,
+  };
+  let mut batch_pcs = pcs::BatchTensorPCS::new(params);
+  let h_w_for_sc = h_w_evals.clone();
+  let h_t_for_sc = h_t_evals.clone();
+  batch_pcs.add_poly(h_w_evals); // entry 0
+  batch_pcs.add_poly(h_t_evals); // entry 1
+  let (batch_commit, batch_state) = batch_pcs.commit_par(transcript);
+
+  transcript.absorb_field(claimed_sum);
+
+  // Witness-side sumcheck
+  transcript.absorb_bytes(b"logup:witness_sumcheck");
+  let pre_w = transcript.clone();
+  let witness_proof = sumcheck::prove_par(MlePoly::new(h_w_for_sc), transcript);
+  let w_challenges = sumcheck::verify(&witness_proof, witness_proof.final_eval, &mut pre_w.clone())
+    .expect("own proof must verify");
+
+  // Table-side sumcheck
+  transcript.absorb_bytes(b"logup:table_sumcheck");
+  let pre_t = transcript.clone();
+  let table_proof = sumcheck::prove_par(MlePoly::new(h_t_for_sc), transcript);
+  let t_challenges = sumcheck::verify(&table_proof, table_proof.final_eval, &mut pre_t.clone())
+    .expect("own proof must verify");
+
+  // Batch PCS open (shared column queries)
+  let queries = vec![
+    pcs::BatchOpenQuery {
+      entry: 0,
+      point: w_challenges,
+    },
+    pcs::BatchOpenQuery {
+      entry: 1,
+      point: t_challenges,
+    },
+  ];
+  let (open_claims, batch_open_proof) = pcs::batch_open_par(&batch_state, &queries, transcript);
+  debug_assert_eq!(open_claims[0], witness_proof.final_eval);
+  debug_assert_eq!(open_claims[1], table_proof.final_eval);
+
+  (
+    LogUpProof {
+      beta,
+      gamma,
+      claimed_sum,
+      witness_sumcheck: witness_proof,
+      table_sumcheck: table_proof,
+      pcs_binding: Some(PcsBinding::Batch {
+        n_vars,
+        commit: batch_commit,
+        open_proof: batch_open_proof,
+      }),
+    },
+    witness_digest,
+  )
+}
+
+/// Individual PCS path: h_w and h_t have different n_vars.
+fn prove_committed_individual(
+  h_w_evals: Vec<GF2_128>,
+  h_t_evals: Vec<GF2_128>,
+  h_w_n_vars: u32,
+  h_t_n_vars: u32,
+  beta: GF2_128,
+  gamma: GF2_128,
+  claimed_sum: GF2_128,
+  witness_digest: [u8; 32],
+  transcript: &mut Blake3Transcript,
+) -> (LogUpProof, [u8; 32]) {
   let h_w_params = pcs::PcsParams {
     n_vars: h_w_n_vars,
     n_queries: 40,
   };
-  let (h_w_commit, h_w_state) = pcs::commit(&h_w_evals, &h_w_params, transcript);
+  let (h_w_commit, h_w_state) = pcs::commit_par(&h_w_evals, &h_w_params, transcript);
 
-  let h_t_n_vars = h_t_evals.len().trailing_zeros();
   let h_t_params = pcs::PcsParams {
     n_vars: h_t_n_vars,
     n_queries: 40,
   };
-  let (h_t_commit, h_t_state) = pcs::commit(&h_t_evals, &h_t_params, transcript);
+  let (h_t_commit, h_t_state) = pcs::commit_par(&h_t_evals, &h_t_params, transcript);
 
   transcript.absorb_field(claimed_sum);
 
-  // ── 5. Witness-side sumcheck + PCS open ───────────────────────────────
+  // Witness-side sumcheck + PCS open
   transcript.absorb_bytes(b"logup:witness_sumcheck");
   let pre_w = transcript.clone();
-  let witness_proof = sumcheck::prove(MlePoly::new(h_w_evals), transcript);
-
-  // Re-derive witness challenges by replaying verify on saved state.
+  let witness_proof = sumcheck::prove_par(MlePoly::new(h_w_evals), transcript);
   let w_challenges = sumcheck::verify(&witness_proof, witness_proof.final_eval, &mut pre_w.clone())
     .expect("own proof must verify");
-
-  // PCS open h_w at the sumcheck challenge point.
-  let (h_w_eval, h_w_opening) = pcs::open(&h_w_state, &w_challenges, transcript);
+  let (h_w_eval, h_w_opening) = pcs::open_par(&h_w_state, &w_challenges, transcript);
   debug_assert_eq!(h_w_eval, witness_proof.final_eval);
 
-  // ── 6. Table-side sumcheck + PCS open ─────────────────────────────────
+  // Table-side sumcheck + PCS open
   transcript.absorb_bytes(b"logup:table_sumcheck");
   let pre_t = transcript.clone();
-  let table_proof = sumcheck::prove(MlePoly::new(h_t_evals), transcript);
-
+  let table_proof = sumcheck::prove_par(MlePoly::new(h_t_evals), transcript);
   let t_challenges = sumcheck::verify(&table_proof, table_proof.final_eval, &mut pre_t.clone())
     .expect("own proof must verify");
-
-  let (h_t_eval, h_t_opening) = pcs::open(&h_t_state, &t_challenges, transcript);
+  let (h_t_eval, h_t_opening) = pcs::open_par(&h_t_state, &t_challenges, transcript);
   debug_assert_eq!(h_t_eval, table_proof.final_eval);
 
   (
@@ -182,10 +287,12 @@ pub fn prove_committed(
       claimed_sum,
       witness_sumcheck: witness_proof,
       table_sumcheck: table_proof,
-      h_w_commit: Some(h_w_commit),
-      h_t_commit: Some(h_t_commit),
-      h_w_opening: Some((h_w_eval, h_w_opening)),
-      h_t_opening: Some((h_t_eval, h_t_opening)),
+      pcs_binding: Some(PcsBinding::Individual {
+        h_w_commit,
+        h_t_commit,
+        h_w_opening: (h_w_eval, h_w_opening),
+        h_t_opening: (h_t_eval, h_t_opening),
+      }),
     },
     witness_digest,
   )

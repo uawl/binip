@@ -30,7 +30,7 @@ pub mod prover;
 pub mod table;
 pub mod verifier;
 
-pub use proof::LogUpProof;
+pub use proof::{LogUpProof, PcsBinding};
 pub use prover::{hash_witness, prove, prove_committed};
 pub use table::LookupTable;
 pub use verifier::{LogUpClaims, verify, verify_committed};

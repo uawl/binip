@@ -2873,6 +2873,7 @@ version = "0.1.0"
 dependencies = [
  "field",
  "poly",
+ "rayon",
  "transcript",
 ]
 
@@ -3131,6 +3132,7 @@ name = "vm"
 version = "0.1.0"
 dependencies = [
  "evm-types",
+ "field",
  "revm",
  "thiserror",
 ]

@@ -119,20 +119,31 @@ pub fn build_witness(steps: &[EvmStep]) -> Result<Witness, WitnessError> {
 ///
 /// The advice pattern depends on the opcode's `advice_count`:
 /// - 0: no advice needed (ADD, SUB, AND, XOR, etc.)
-/// - 1: boolean result (LT, GT, SLT, SGT, ISZERO, EQ, BYTE)
+/// - 1: boolean result (LT, GT, SLT, SGT, BYTE)
+/// - 2 (special): ISZERO, EQ → [boolean, GF(2^128) inverse of accumulator]
 /// - 2 (LIMBS): full U256 result (EXP, SDIV, SHL, SHR, SAR, MUL, env queries, etc.)
 /// - 4 (LIMBS*2): quotient + remainder (DIV, MOD, ADDMOD, MULMOD)
 fn compute_advice(step: &EvmStep, compiled: &Compiled) -> Vec<u128> {
+  use revm::bytecode::opcode::{EQ, ISZERO};
+
   let count = compiled.advice_count;
   if count == 0 {
     return Vec::new();
+  }
+
+  // ISZERO and EQ: [boolean, GF(2^128) inverse of accumulator].
+  if step.opcode == ISZERO {
+    return compute_zero_check_advice(&step.pre_stack, true);
+  }
+  if step.opcode == EQ {
+    return compute_zero_check_advice(&step.pre_stack, false);
   }
 
   // The result U256: for most opcodes it's post_stack[0].
   let result = step.post_stack.first().copied().unwrap_or(U256::ZERO);
 
   match count {
-    // Boolean result (1 limb): LT, GT, SLT, SGT, ISZERO, EQ, BYTE
+    // Boolean result (1 limb): LT, GT, SLT, SGT, BYTE
     1 => {
       let limb0 = result.as_limbs()[0] as u128;
       vec![limb0]
@@ -156,6 +167,38 @@ fn u256_to_limbs(val: &U256) -> Vec<u128> {
     (le[0] as u128) | ((le[1] as u128) << 64),
     (le[2] as u128) | ((le[3] as u128) << 64),
   ]
+}
+
+/// Compute advice for ISZERO / EQ zero-check: `[boolean, GF(2^128) inverse]`.
+///
+/// - `is_iszero = true`:  accumulator = OR of all limbs of `pre_stack[0]`.
+/// - `is_iszero = false` (EQ): accumulator = OR of XOR of limb pairs.
+fn compute_zero_check_advice(pre_stack: &[U256], is_iszero: bool) -> Vec<u128> {
+  use field::{FieldElem, GF2_128};
+
+  let a = pre_stack.first().copied().unwrap_or(U256::ZERO);
+  let limbs_a = u256_to_limbs(&a);
+
+  let acc = if is_iszero {
+    // ISZERO: accumulator = limb0 | limb1
+    limbs_a[0] | limbs_a[1]
+  } else {
+    // EQ: accumulator = (a_limb0 ^ b_limb0) | (a_limb1 ^ b_limb1)
+    let b = pre_stack.get(1).copied().unwrap_or(U256::ZERO);
+    let limbs_b = u256_to_limbs(&b);
+    (limbs_a[0] ^ limbs_b[0]) | (limbs_a[1] ^ limbs_b[1])
+  };
+
+  let boolean = if acc == 0 { 1u128 } else { 0u128 };
+  let inv = if acc == 0 {
+    0u128 // arbitrary; constraint satisfied vacuously when acc = 0
+  } else {
+    let gf_acc = GF2_128::new(acc as u64, (acc >> 64) as u64);
+    let gf_inv = gf_acc.inv();
+    (gf_inv.lo as u128) | ((gf_inv.hi as u128) << 64)
+  };
+
+  vec![boolean, inv]
 }
 
 /// Compute quotient + remainder advice for DIV/MOD/ADDMOD/MULMOD.

@@ -9,6 +9,8 @@
 //!   eq_k(r_k, 0) = 1 + r_k
 //!   eq_k(r_k, 1) = r_k
 
+#![allow(dead_code)]
+
 use field::{FieldElem, GF2_128};
 
 /// Compute eq(r, ·) at all 2^n binary inputs.

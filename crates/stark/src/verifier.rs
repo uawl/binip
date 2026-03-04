@@ -11,6 +11,7 @@
 //! 7. **Root claim consistency** — recursive root_claim == shard total_sum.
 
 use circuit::lookup;
+use circuit::mpt;
 use circuit::state_constraint::extract_boundaries;
 use evm_types::ProofNode;
 use field::{FieldElem, GF2_128};
@@ -63,6 +64,9 @@ pub enum VerifyError {
   #[error("lookup verification failed")]
   LookupVerifyFailed,
 
+  #[error("Phase C storage proof verification failed: {0}")]
+  StorageProofFailed(#[from] mpt::StorageProofError),
+
   #[error("boundary PCS proof missing (Seq junctions exist)")]
   MissingBoundaryPcs,
 
@@ -77,6 +81,12 @@ pub enum VerifyError {
 
   #[error("boundary PCS opening verification failed")]
   BoundaryPcsOpenFailed,
+
+  #[error("constraint sum {constraint:?} != shard total sum {shard_total:?}")]
+  ConstraintSumShardMismatch {
+    constraint: GF2_128,
+    shard_total: GF2_128,
+  },
 }
 
 /// Verify a top-level STARK proof.
@@ -113,6 +123,14 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
   // ── 2. Constraint sum must be zero ────────────────────────────────────
   if !proof.constraint_sum.is_zero() {
     return Err(VerifyError::ConstraintSumNonZero);
+  }
+
+  // ── 2a. Constraint sum must equal shard total sum (H-3 binding) ───────
+  if proof.constraint_sum != proof.shard_batch.total_sum {
+    return Err(VerifyError::ConstraintSumShardMismatch {
+      constraint: proof.constraint_sum,
+      shard_total: proof.shard_batch.total_sum,
+    });
   }
 
   // ── 2b. Boundary constraint sum must be zero ──────────────────────────
@@ -177,12 +195,33 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
   if !proof.reconstruction_sum.is_zero() {
     return Err(VerifyError::ReconstructionSumNonZero);
   }
-  if !lookup::verify_lookups_par(
+  if lookup::verify_lookups_par(
     &proof.lookup_proofs,
     &proof.lookup_commits,
     &mut transcript.clone(),
-  ) {
+  )
+  .is_none()
+  {
     return Err(VerifyError::LookupVerifyFailed);
+  }
+
+  // ── 3c. Phase C: Storage state root binding ───────────────────────────
+  // verify_lookups_par returned RwSummaries; re-derive them to feed Phase C.
+  // We re-call with a cloned transcript to get the actual summaries.
+  {
+    let rw_summaries = lookup::verify_lookups_par(
+      &proof.lookup_proofs,
+      &proof.lookup_commits,
+      &mut transcript.clone(),
+    )
+    .ok_or(VerifyError::LookupVerifyFailed)?;
+
+    let mut phase_c_transcript = transcript.fork("phase_c", 0);
+    mpt::verify_phase_c(
+      proof.storage_proof.as_ref(),
+      &rw_summaries,
+      &mut phase_c_transcript,
+    )?;
   }
 
   // Absorb PCS commitment (mirrors prover step 3)

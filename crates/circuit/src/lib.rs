@@ -17,6 +17,7 @@ pub mod constraint;
 pub mod decomp;
 pub mod encoder;
 pub mod lookup;
+pub mod mpt;
 pub mod state_constraint;
 pub mod trace;
 

@@ -161,6 +161,29 @@ pub enum MicroOp {
   /// EVM opcode structural type-check annotation.
   TypeCheck { opcode: u8, pre: Reg, post: Reg },
 
+  // ── Wide advice ────────────────────────────────────────────────────────────
+  /// Pop 2 values from the advice tape into `dst0` and `dst1`.
+  /// Replaces two consecutive `AdviceLoad` ops with a single row.
+  Advice2 { dst0: Reg, dst1: Reg },
+
+  /// Pop 4 values from the advice tape into `dst0`..`dst3`.
+  /// Replaces four consecutive `AdviceLoad` ops with a single row.
+  Advice4 { dst0: Reg, dst1: Reg, dst2: Reg, dst3: Reg },
+  // ── Zero-check (GF(2^128) algebraic) ──────────────────────────────────
+  /// Constraint 1 of the zero-check pair:
+  ///   `acc * inv + result + 1 = 0` in GF(2^128).
+  ///
+  /// Combined with [`CheckZeroMul`], enforces:
+  /// - `acc = 0  ⟹  result = 1`
+  /// - `acc ≠ 0  ⟹  result = 0` and `inv = acc⁻¹` in GF(2^128).
+  CheckZeroInv { acc: Reg, inv: Reg, result: Reg },
+
+  /// Constraint 2 of the zero-check pair:
+  ///   `acc * result = 0` in GF(2^128).
+  ///
+  /// Since GF(2^128) has no zero divisors, this forces
+  /// `acc = 0` or `result = 0`.
+  CheckZeroMul { acc: Reg, result: Reg },
   // ── Control ───────────────────────────────────────────────────────────────
   /// Halt execution.
   Done,
@@ -199,6 +222,10 @@ impl MicroOp {
       Self::SStore { .. } => 26,
       Self::TLoad { .. } => 27,
       Self::TStore { .. } => 28,
+      Self::Advice2 { .. } => 29,
+      Self::Advice4 { .. } => 30,
+      Self::CheckZeroInv { .. } => 31,
+      Self::CheckZeroMul { .. } => 32,
     }
   }
 }

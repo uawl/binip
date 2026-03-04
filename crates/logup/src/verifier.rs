@@ -15,7 +15,7 @@
 use field::GF2_128;
 use transcript::{Blake3Transcript, Transcript};
 
-use crate::proof::LogUpProof;
+use crate::proof::{LogUpProof, PcsBinding};
 use crate::table::LookupTable;
 
 /// Challenge points returned on successful verification (for PCS opening).
@@ -91,9 +91,8 @@ pub fn verify(
 ///
 /// Same as [`verify`] but:
 /// 1. Absorbs a 32-byte witness digest instead of raw witness values.
-/// 2. Re-absorbs h_w/h_t PCS commitment roots (mirrors prover's `pcs::commit`).
-/// 3. After each sumcheck, PCS-verifies that `final_eval` matches the
-///    committed polynomial at the challenge point.
+/// 2. Dispatches to batch or individual PCS verification depending on
+///    the [`PcsBinding`] variant in the proof.
 pub fn verify_committed(
   proof: &LogUpProof,
   n_witness: usize,
@@ -117,81 +116,131 @@ pub fn verify_committed(
     return None;
   }
 
-  // ── 2. Re-absorb PCS commitment roots (mirrors pcs::commit) ──────────
-  let h_w_commit = proof.h_w_commit.as_ref()?;
-  let h_t_commit = proof.h_t_commit.as_ref()?;
+  let binding = proof.pcs_binding.as_ref()?;
 
-  transcript.absorb_bytes(&h_w_commit.root);
-  transcript.absorb_bytes(&h_t_commit.root);
+  match binding {
+    PcsBinding::Batch { n_vars, commit, .. } => {
+      // ── Batch path ──────────────────────────────────────────────────
+      transcript.absorb_bytes(&commit.root);
 
-  // ── 3. Check claimed sums ─────────────────────────────────────────────
-  if proof.witness_sumcheck.claimed_sum != proof.claimed_sum {
-    return None;
+      if proof.witness_sumcheck.claimed_sum != proof.claimed_sum {
+        return None;
+      }
+      if proof.table_sumcheck.claimed_sum != proof.claimed_sum {
+        return None;
+      }
+      transcript.absorb_field(proof.claimed_sum);
+
+      transcript.absorb_bytes(b"logup:witness_sumcheck");
+      let w_challenges = sumcheck::verify(
+        &proof.witness_sumcheck,
+        proof.witness_sumcheck.final_eval,
+        transcript,
+      )?;
+
+      transcript.absorb_bytes(b"logup:table_sumcheck");
+      let t_challenges = sumcheck::verify(
+        &proof.table_sumcheck,
+        proof.table_sumcheck.final_eval,
+        transcript,
+      )?;
+
+      let open_proof = match binding {
+        PcsBinding::Batch { open_proof, .. } => open_proof,
+        _ => unreachable!(),
+      };
+      let params = pcs::PcsParams {
+        n_vars: *n_vars,
+        n_queries: 40,
+      };
+      let queries = vec![
+        pcs::BatchOpenQuery {
+          entry: 0,
+          point: w_challenges.clone(),
+        },
+        pcs::BatchOpenQuery {
+          entry: 1,
+          point: t_challenges.clone(),
+        },
+      ];
+      let claims = vec![
+        proof.witness_sumcheck.final_eval,
+        proof.table_sumcheck.final_eval,
+      ];
+      if !pcs::batch_verify(commit, &queries, &claims, open_proof, &params, transcript) {
+        return None;
+      }
+
+      Some(LogUpClaims {
+        witness_challenges: w_challenges,
+        table_challenges: t_challenges,
+      })
+    }
+
+    PcsBinding::Individual {
+      h_w_commit,
+      h_t_commit,
+      h_w_opening,
+      h_t_opening,
+    } => {
+      // ── Individual path ─────────────────────────────────────────────
+      transcript.absorb_bytes(&h_w_commit.root);
+      transcript.absorb_bytes(&h_t_commit.root);
+
+      if proof.witness_sumcheck.claimed_sum != proof.claimed_sum {
+        return None;
+      }
+      if proof.table_sumcheck.claimed_sum != proof.claimed_sum {
+        return None;
+      }
+      transcript.absorb_field(proof.claimed_sum);
+
+      // Witness-side sumcheck
+      transcript.absorb_bytes(b"logup:witness_sumcheck");
+      let w_challenges = sumcheck::verify(
+        &proof.witness_sumcheck,
+        proof.witness_sumcheck.final_eval,
+        transcript,
+      )?;
+
+      // PCS verify h_w
+      let (h_w_eval, ref h_w_open) = *h_w_opening;
+      if h_w_eval != proof.witness_sumcheck.final_eval {
+        return None;
+      }
+      let h_w_params = pcs::PcsParams {
+        n_vars: h_w_commit.n_vars,
+        n_queries: 40,
+      };
+      if !pcs::verify(h_w_commit, &w_challenges, h_w_eval, h_w_open, &h_w_params, transcript) {
+        return None;
+      }
+
+      // Table-side sumcheck
+      transcript.absorb_bytes(b"logup:table_sumcheck");
+      let t_challenges = sumcheck::verify(
+        &proof.table_sumcheck,
+        proof.table_sumcheck.final_eval,
+        transcript,
+      )?;
+
+      // PCS verify h_t
+      let (h_t_eval, ref h_t_open) = *h_t_opening;
+      if h_t_eval != proof.table_sumcheck.final_eval {
+        return None;
+      }
+      let h_t_params = pcs::PcsParams {
+        n_vars: h_t_commit.n_vars,
+        n_queries: 40,
+      };
+      if !pcs::verify(h_t_commit, &t_challenges, h_t_eval, h_t_open, &h_t_params, transcript) {
+        return None;
+      }
+
+      Some(LogUpClaims {
+        witness_challenges: w_challenges,
+        table_challenges: t_challenges,
+      })
+    }
   }
-  if proof.table_sumcheck.claimed_sum != proof.claimed_sum {
-    return None;
-  }
-
-  transcript.absorb_field(proof.claimed_sum);
-
-  // ── 4. Witness-side sumcheck ──────────────────────────────────────────
-  transcript.absorb_bytes(b"logup:witness_sumcheck");
-  let w_challenges = sumcheck::verify(
-    &proof.witness_sumcheck,
-    proof.witness_sumcheck.final_eval,
-    transcript,
-  )?;
-
-  // ── 5. PCS verify h_w at witness challenge point ──────────────────────
-  let &(h_w_eval, ref h_w_opening) = proof.h_w_opening.as_ref()?;
-  if h_w_eval != proof.witness_sumcheck.final_eval {
-    return None;
-  }
-  let h_w_params = pcs::PcsParams {
-    n_vars: h_w_commit.n_vars,
-    n_queries: 40,
-  };
-  if !pcs::verify(
-    h_w_commit,
-    &w_challenges,
-    h_w_eval,
-    h_w_opening,
-    &h_w_params,
-    transcript,
-  ) {
-    return None;
-  }
-
-  // ── 6. Table-side sumcheck ────────────────────────────────────────────
-  transcript.absorb_bytes(b"logup:table_sumcheck");
-  let t_challenges = sumcheck::verify(
-    &proof.table_sumcheck,
-    proof.table_sumcheck.final_eval,
-    transcript,
-  )?;
-
-  // ── 7. PCS verify h_t at table challenge point ────────────────────────
-  let &(h_t_eval, ref h_t_opening) = proof.h_t_opening.as_ref()?;
-  if h_t_eval != proof.table_sumcheck.final_eval {
-    return None;
-  }
-  let h_t_params = pcs::PcsParams {
-    n_vars: h_t_commit.n_vars,
-    n_queries: 40,
-  };
-  if !pcs::verify(
-    h_t_commit,
-    &t_challenges,
-    h_t_eval,
-    h_t_opening,
-    &h_t_params,
-    transcript,
-  ) {
-    return None;
-  }
-
-  Some(LogUpClaims {
-    witness_challenges: w_challenges,
-    table_challenges: t_challenges,
-  })
 }

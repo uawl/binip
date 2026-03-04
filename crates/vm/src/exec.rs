@@ -9,6 +9,8 @@ use thiserror::Error;
 
 use crate::{advice::AdviceTape, isa::MicroOp, reg::RegisterFile, row::Row};
 
+use field::FieldElem;
+
 // ─────────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -360,6 +362,121 @@ impl Vm {
         }
       }
 
+      // ── Advice2 ───────────────────────────────────────────────────────────
+      MicroOp::Advice2 { dst0, dst1 } => {
+        let v0 = self
+          .advice
+          .next()
+          .ok_or(VmError::AdviceExhausted(self.pc))?;
+        let v1 = self
+          .advice
+          .next()
+          .ok_or(VmError::AdviceExhausted(self.pc))?;
+        self.regs.write(*dst0, v0);
+        self.regs.write(*dst1, v1);
+        Row {
+          pc,
+          op: op.tag() as u128,
+          in0: v0,
+          in1: v1,
+          in2: 0,
+          out: 0,
+          flags: 0,
+          advice: 0,
+        }
+      }
+
+      // ── Advice4 ───────────────────────────────────────────────────────────
+      MicroOp::Advice4 {
+        dst0,
+        dst1,
+        dst2,
+        dst3,
+      } => {
+        let v0 = self
+          .advice
+          .next()
+          .ok_or(VmError::AdviceExhausted(self.pc))?;
+        let v1 = self
+          .advice
+          .next()
+          .ok_or(VmError::AdviceExhausted(self.pc))?;
+        let v2 = self
+          .advice
+          .next()
+          .ok_or(VmError::AdviceExhausted(self.pc))?;
+        let v3 = self
+          .advice
+          .next()
+          .ok_or(VmError::AdviceExhausted(self.pc))?;
+        self.regs.write(*dst0, v0);
+        self.regs.write(*dst1, v1);
+        self.regs.write(*dst2, v2);
+        self.regs.write(*dst3, v3);
+        Row {
+          pc,
+          op: op.tag() as u128,
+          in0: v0,
+          in1: v1,
+          in2: v2,
+          out: v3,
+          flags: 0,
+          advice: 0,
+        }
+      }
+
+      // ── CheckZeroInv ──────────────────────────────────────────────────────
+      // acc * inv + result + 1 = 0  in GF(2^128)
+      MicroOp::CheckZeroInv { acc, inv, result } => {
+        let va = self.regs.read(*acc);
+        let vi = self.regs.read(*inv);
+        let vr = self.regs.read(*result);
+        let ga = u128_to_gf(va);
+        let gi = u128_to_gf(vi);
+        let gr = u128_to_gf(vr);
+        if !(ga * gi + gr + field::GF2_128::one()).is_zero() {
+          return Err(VmError::AdviceCheckFailed(
+            self.pc,
+            "acc*inv + result + 1 ≠ 0 in GF(2^128)",
+          ));
+        }
+        Row {
+          pc,
+          op: op.tag() as u128,
+          in0: va,
+          in1: vi,
+          in2: 0,
+          out: vr,
+          flags: 0,
+          advice: 0,
+        }
+      }
+
+      // ── CheckZeroMul ──────────────────────────────────────────────────────
+      // acc * result = 0  in GF(2^128)
+      MicroOp::CheckZeroMul { acc, result } => {
+        let va = self.regs.read(*acc);
+        let vr = self.regs.read(*result);
+        let ga = u128_to_gf(va);
+        let gr = u128_to_gf(vr);
+        if !(ga * gr).is_zero() {
+          return Err(VmError::AdviceCheckFailed(
+            self.pc,
+            "acc*result ≠ 0 in GF(2^128)",
+          ));
+        }
+        Row {
+          pc,
+          op: op.tag() as u128,
+          in0: va,
+          in1: vr,
+          in2: 0,
+          out: 0,
+          flags: 0,
+          advice: 0,
+        }
+      }
+
       // ── CheckDiv ──────────────────────────────────────────────────────────
       MicroOp::CheckDiv {
         quot,
@@ -383,15 +500,16 @@ impl Vm {
         if r >= d {
           return Err(VmError::AdviceCheckFailed(self.pc, "remainder ≥ divisor"));
         }
+        // Columns: in0=quot, in1=rem, in2=dividend, advice=divisor
         Row {
           pc,
           op: op.tag() as u128,
-          in0: p,
-          in1: d,
-          in2: q,
-          out: r,
+          in0: q,
+          in1: r,
+          in2: p,
+          out: 0,
           flags: 0,
-          advice: 0,
+          advice: d,
         }
       }
 
@@ -405,15 +523,16 @@ impl Vm {
         if ql != expected_lo || qh != expected_hi {
           return Err(VmError::AdviceCheckFailed(self.pc, "a*b ≠ q_hi:q_lo"));
         }
+        // Columns: in0=q_lo, in1=q_hi, in2=a, advice=b
         Row {
           pc,
           op: op.tag() as u128,
-          in0: va,
-          in1: vb,
-          in2: ql,
-          out: qh,
+          in0: ql,
+          in1: qh,
+          in2: va,
+          out: 0,
           flags: 0,
-          advice: 0,
+          advice: vb,
         }
       }
 
@@ -453,7 +572,7 @@ impl Vm {
           in0: vr,
           in1: b as u128,
           in2: 0,
-          out: 0,
+          out: vr,
           flags: 0,
           advice: 0,
         }
@@ -758,4 +877,10 @@ fn widening_mul_u128(a: u128, b: u128) -> (u128, u128) {
   let hi = hh + (mid_sum >> 64) + (if carry1 { 1u128 << 64 } else { 0 }) + carry2;
 
   (lo, hi)
+}
+
+/// Convert a raw `u128` to a [`field::GF2_128`] element.
+#[inline]
+fn u128_to_gf(v: u128) -> field::GF2_128 {
+  field::GF2_128::new(v as u64, (v >> 64) as u64)
 }

@@ -42,6 +42,88 @@ use crate::decomp;
 
 pub use logup::{LogUpClaims, LogUpProof};
 
+// ── R/W Log types ────────────────────────────────────────────────────────────
+
+/// A single memory read/write operation recorded from the execution trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RwEntry {
+  /// Address or key of the access (low 128 bits).
+  pub addr: u128,
+  /// Value read or written (low 128 bits).
+  pub value: u128,
+  /// Global position in the execution trace (monotonically increasing).
+  pub counter: u32,
+  /// `true` for writes, `false` for reads.
+  pub is_write: bool,
+}
+
+/// Memory type classification for R/W consistency rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemType {
+  /// VM internal register memory — zero-initialized.
+  VmMem,
+  /// EVM byte-addressable memory — zero-initialized.
+  EvmMem,
+  /// Persistent contract storage — initial values from world state (external).
+  Storage,
+  /// EIP-1153 transient storage — zero-initialized per transaction.
+  Transient,
+}
+
+/// Per-address R/W summary extracted after sorting the log.
+///
+/// The recursive proof layer (Phase B) uses these summaries to chain
+/// adjacent shards; Phase C binds `initial_value` / `final_value` to
+/// Merkle roots for persistent storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RwSummary {
+  pub addr: u128,
+  pub initial_value: u128,
+  pub final_value: u128,
+}
+
+/// R/W logs partitioned by memory type.
+#[derive(Debug, Clone, Default)]
+pub struct RwLog {
+  /// VM internal memory (Load/Store, tags 16/17).
+  pub mem: Vec<RwEntry>,
+  /// EVM memory (MLoad/MStore/MStore8, tags 22/23/24).
+  pub emem: Vec<RwEntry>,
+  /// Persistent storage (SLoad/SStore, tags 25/26).
+  pub storage: Vec<RwEntry>,
+  /// Transient storage (TLoad/TStore, tags 27/28).
+  pub transient: Vec<RwEntry>,
+}
+
+/// LogUp proof for a single R/W log permutation argument.
+#[derive(Debug, Clone)]
+pub struct RwProof {
+  /// LogUp proof: execution-order entries ⊆ sorted entries.
+  pub logup: LogUpProof,
+  /// The sorted table (committed to transcript via LogUp).
+  pub sorted_table: LookupTable,
+  /// Raw sorted entries — the verifier re-checks ordering, read-after-write
+  /// consistency, and RLC encoding against `sorted_table`.
+  pub sorted_entries: Vec<RwEntry>,
+  /// Number of entries before padding.
+  pub n_entries: usize,
+  /// RLC challenge used to encode entries as field elements.
+  pub alpha: GF2_128,
+  /// Blake3 digest of the padded execution-order witness.
+  pub exec_digest: [u8; 32],
+}
+
+/// Per-address summaries extracted from the R/W log.
+#[derive(Debug, Clone, Default)]
+pub struct RwSummaries {
+  pub mem: Vec<RwSummary>,
+  pub emem: Vec<RwSummary>,
+  pub storage: Vec<RwSummary>,
+  pub transient: Vec<RwSummary>,
+}
+
+// ── Core lookup types ────────────────────────────────────────────────────────
+
 /// Lookup witnesses partitioned by LUT table type.
 #[derive(Debug, Clone)]
 pub struct LookupWitness {
@@ -53,6 +135,8 @@ pub struct LookupWitness {
   pub add_op: Vec<GF2_128>,
   /// Mul table: `lut::encode_mul(a, b, lo, hi)`.
   pub mul_op: Vec<GF2_128>,
+  /// R/W logs for memory consistency (Phase A).
+  pub rw: RwLog,
 }
 
 /// LogUp proofs, one per active LUT table.
@@ -62,6 +146,16 @@ pub struct LookupProofs {
   pub and_op: Option<(LogUpProof, LookupTable)>,
   pub add_op: Option<(LogUpProof, LookupTable)>,
   pub mul_op: Option<(LogUpProof, LookupTable)>,
+  /// R/W consistency proofs per memory type.
+  pub rw_mem: Option<RwProof>,
+  pub rw_emem: Option<RwProof>,
+  pub rw_storage: Option<RwProof>,
+  pub rw_transient: Option<RwProof>,
+  /// Per-address R/W summaries (Phase B output).
+  ///
+  /// Extracted during proving; the verifier re-derives from sorted entries
+  /// and checks they match.
+  pub rw_summaries: RwSummaries,
 }
 
 /// Succinct witness commitments for the lookup tables.
@@ -75,6 +169,11 @@ pub struct LookupCommitments {
   pub and_op: Option<([u8; 32], usize)>,
   pub add_op: Option<([u8; 32], usize)>,
   pub mul_op: Option<([u8; 32], usize)>,
+  /// R/W log commitments (exec-order witness digest + count).
+  pub rw_mem: Option<([u8; 32], usize)>,
+  pub rw_emem: Option<([u8; 32], usize)>,
+  pub rw_storage: Option<([u8; 32], usize)>,
+  pub rw_transient: Option<([u8; 32], usize)>,
 }
 
 #[inline]
@@ -91,9 +190,11 @@ pub fn collect_witnesses(rows: &[Row]) -> LookupWitness {
     and_op: Vec::new(),
     add_op: Vec::new(),
     mul_op: Vec::new(),
+    rw: RwLog::default(),
   };
-  for row in rows {
+  for (i, row) in rows.iter().enumerate() {
     emit_decomp_ranges(&mut w, row);
+    emit_rw_entry(&mut w.rw, row, i as u32);
     match row.op as u32 {
       0 => emit_add128(&mut w, row),
       1 => {
@@ -130,20 +231,38 @@ pub fn collect_witnesses_par(rows: &[Row]) -> LookupWitness {
   let n_threads = rayon::current_num_threads().max(1);
   let chunk_size = (rows.len() + n_threads - 1) / n_threads;
 
+  // Compute global counter offsets for each chunk so that RW entry
+  // counters are globally monotone across the merged result.
+  let chunk_starts: Vec<usize> = {
+    let mut starts = Vec::with_capacity(
+      (rows.len() + chunk_size.max(1) - 1) / chunk_size.max(1),
+    );
+    let mut offset = 0usize;
+    for c in rows.chunks(chunk_size.max(1)) {
+      starts.push(offset);
+      offset += c.len();
+    }
+    starts
+  };
+
   let chunks: Vec<LookupWitness> = rows
     .par_chunks(chunk_size.max(1))
-    .map(|chunk| {
+    .enumerate()
+    .map(|(ci, chunk)| {
       // Pre-allocate based on average entries per row:
       // ~50 range + ~16 and + ~32 add + ~256 mul (conservative upper bound)
       let n = chunk.len();
+      let base_counter = chunk_starts[ci] as u32;
       let mut w = LookupWitness {
         range: Vec::with_capacity(n * 50),
         and_op: Vec::with_capacity(n * 4),
         add_op: Vec::with_capacity(n * 8),
         mul_op: Vec::with_capacity(n * 8),
+        rw: RwLog::default(),
       };
-      for row in chunk {
+      for (j, row) in chunk.iter().enumerate() {
         emit_decomp_ranges(&mut w, row);
+        emit_rw_entry(&mut w.rw, row, base_counter + j as u32);
         match row.op as u32 {
           0 => emit_add128(&mut w, row),
           1 => {
@@ -177,18 +296,32 @@ pub fn collect_witnesses_par(rows: &[Row]) -> LookupWitness {
   let total_and: usize = chunks.iter().map(|w| w.and_op.len()).sum();
   let total_add: usize = chunks.iter().map(|w| w.add_op.len()).sum();
   let total_mul: usize = chunks.iter().map(|w| w.mul_op.len()).sum();
+  let total_mem: usize = chunks.iter().map(|w| w.rw.mem.len()).sum();
+  let total_emem: usize = chunks.iter().map(|w| w.rw.emem.len()).sum();
+  let total_storage: usize = chunks.iter().map(|w| w.rw.storage.len()).sum();
+  let total_transient: usize = chunks.iter().map(|w| w.rw.transient.len()).sum();
 
   let mut merged = LookupWitness {
     range: Vec::with_capacity(total_range),
     and_op: Vec::with_capacity(total_and),
     add_op: Vec::with_capacity(total_add),
     mul_op: Vec::with_capacity(total_mul),
+    rw: RwLog {
+      mem: Vec::with_capacity(total_mem),
+      emem: Vec::with_capacity(total_emem),
+      storage: Vec::with_capacity(total_storage),
+      transient: Vec::with_capacity(total_transient),
+    },
   };
   for w in chunks {
     merged.range.extend(w.range);
     merged.and_op.extend(w.and_op);
     merged.add_op.extend(w.add_op);
     merged.mul_op.extend(w.mul_op);
+    merged.rw.mem.extend(w.rw.mem);
+    merged.rw.emem.extend(w.rw.emem);
+    merged.rw.storage.extend(w.rw.storage);
+    merged.rw.transient.extend(w.rw.transient);
   }
   merged
 }
@@ -510,6 +643,229 @@ fn emit_check_inv(w: &mut LookupWitness, row: &Row) {
   emit_mul_products(w, &a, &b);
 }
 
+// ── R/W log emission ─────────────────────────────────────────────────────────
+
+/// Emit an R/W log entry for memory operations (tags 16–28).
+fn emit_rw_entry(rw: &mut RwLog, row: &Row, counter: u32) {
+  match row.op as u32 {
+    // VM Load: addr=in0, value=out (read)
+    16 => rw.mem.push(RwEntry {
+      addr: row.in0,
+      value: row.out,
+      counter,
+      is_write: false,
+    }),
+    // VM Store: addr=in0, value=in1 (write)
+    17 => rw.mem.push(RwEntry {
+      addr: row.in0,
+      value: row.in1,
+      counter,
+      is_write: true,
+    }),
+    // MLoad: offset=in0, value=out (read)
+    22 => rw.emem.push(RwEntry {
+      addr: row.in0,
+      value: row.out,
+      counter,
+      is_write: false,
+    }),
+    // MStore: offset=in0, value=in1 (write)
+    23 => rw.emem.push(RwEntry {
+      addr: row.in0,
+      value: row.in1,
+      counter,
+      is_write: true,
+    }),
+    // MStore8: offset=in0, value=in1 (write, single byte)
+    24 => rw.emem.push(RwEntry {
+      addr: row.in0,
+      value: row.in1,
+      counter,
+      is_write: true,
+    }),
+    // SLoad: key=in0, value=out (read)
+    25 => rw.storage.push(RwEntry {
+      addr: row.in0,
+      value: row.out,
+      counter,
+      is_write: false,
+    }),
+    // SStore: key=in0, value=in1 (write)
+    26 => rw.storage.push(RwEntry {
+      addr: row.in0,
+      value: row.in1,
+      counter,
+      is_write: true,
+    }),
+    // TLoad: key=in0, value=out (read)
+    27 => rw.transient.push(RwEntry {
+      addr: row.in0,
+      value: row.out,
+      counter,
+      is_write: false,
+    }),
+    // TStore: key=in0, value=in1 (write)
+    28 => rw.transient.push(RwEntry {
+      addr: row.in0,
+      value: row.in1,
+      counter,
+      is_write: true,
+    }),
+    _ => {}
+  }
+}
+
+// ── R/W log encoding (RLC) ───────────────────────────────────────────────────
+
+/// Encode an R/W entry as a single field element via random linear combination.
+///
+/// ```text
+/// entry = addr + α · value + α² · (counter | is_write << 32)
+/// ```
+///
+/// The RLC uses challenge `α` squeezed from the transcript, ensuring that
+/// distinct logical entries produce distinct encodings with overwhelming
+/// probability.
+#[inline]
+fn encode_rw(entry: &RwEntry, alpha: GF2_128, alpha2: GF2_128) -> GF2_128 {
+  let a = GF2_128::new(entry.addr as u64, (entry.addr >> 64) as u64);
+  let v = GF2_128::new(entry.value as u64, (entry.value >> 64) as u64);
+  let meta = GF2_128::from(entry.counter as u64 | ((entry.is_write as u64) << 32));
+  a + alpha * v + alpha2 * meta
+}
+
+/// Encode a slice of R/W entries into field elements.
+fn encode_rw_entries(entries: &[RwEntry], alpha: GF2_128) -> Vec<GF2_128> {
+  let alpha2 = alpha * alpha;
+  entries.iter().map(|e| encode_rw(e, alpha, alpha2)).collect()
+}
+
+// ── R/W sorted-trace verification ────────────────────────────────────────────
+
+/// R/W log verification error.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RwError {
+  #[error("read from zero-initialized address {addr:#x} returned non-zero value {value:#x}")]
+  InitialReadNonZero { addr: u128, value: u128 },
+  #[error("read at counter {counter} addr {addr:#x}: expected {expected:#x}, got {got:#x}")]
+  ReadMismatch {
+    addr: u128,
+    counter: u32,
+    expected: u128,
+    got: u128,
+  },
+  #[error("sorted log not sorted at index {index}: ({addr_a:#x}, {counter_a}) >= ({addr_b:#x}, {counter_b})")]
+  NotSorted {
+    index: usize,
+    addr_a: u128,
+    counter_a: u32,
+    addr_b: u128,
+    counter_b: u32,
+  },
+  #[error("RLC encoding mismatch at index {index}")]
+  EncodingMismatch { index: usize },
+  #[error("bridge mismatch at addr {addr:#x}: left final {left_final:#x} != right initial {right_initial:#x}")]
+  BridgeMismatch {
+    addr: u128,
+    left_final: u128,
+    right_initial: u128,
+  },
+}
+
+/// Verify that already-sorted R/W entries satisfy ordering and read-after-write
+/// consistency, and extract per-address summaries.
+///
+/// Does NOT sort — entries must already be sorted by `(addr, counter)`.
+/// Use [`sort_and_verify_rw`] when the prover needs to sort in-place.
+pub fn verify_rw_consistency(
+  entries: &[RwEntry],
+  mem_type: MemType,
+) -> Result<Vec<RwSummary>, RwError> {
+  if entries.is_empty() {
+    return Ok(vec![]);
+  }
+
+  // Verify sorted order.
+  for i in 0..entries.len() - 1 {
+    let a = &entries[i];
+    let b = &entries[i + 1];
+    if (a.addr, a.counter) >= (b.addr, b.counter) {
+      return Err(RwError::NotSorted {
+        index: i,
+        addr_a: a.addr,
+        counter_a: a.counter,
+        addr_b: b.addr,
+        counter_b: b.counter,
+      });
+    }
+  }
+
+  let zero_init = matches!(mem_type, MemType::VmMem | MemType::EvmMem | MemType::Transient);
+  let mut summaries = Vec::new();
+  let mut i = 0;
+
+  while i < entries.len() {
+    let addr = entries[i].addr;
+
+    // Determine initial value for this address.
+    let initial_value = if entries[i].is_write {
+      // First access is a write — initial state is zero for zero-init types,
+      // unknown for storage (will be bound externally in Phase C).
+      if zero_init { 0u128 } else { 0u128 }
+    } else {
+      // First access is a read — the value IS the initial state.
+      let val = entries[i].value;
+      if zero_init && val != 0 {
+        return Err(RwError::InitialReadNonZero { addr, value: val });
+      }
+      val
+    };
+
+    // Walk all entries for this address, verifying read consistency.
+    let mut current_value = initial_value;
+    while i < entries.len() && entries[i].addr == addr {
+      if entries[i].is_write {
+        current_value = entries[i].value;
+      } else {
+        // Read must return the most recently written value.
+        if entries[i].value != current_value {
+          return Err(RwError::ReadMismatch {
+            addr,
+            counter: entries[i].counter,
+            expected: current_value,
+            got: entries[i].value,
+          });
+        }
+      }
+      i += 1;
+    }
+
+    summaries.push(RwSummary {
+      addr,
+      initial_value,
+      final_value: current_value,
+    });
+  }
+
+  Ok(summaries)
+}
+
+/// Sort R/W entries by `(addr, counter)`, verify read-after-write consistency,
+/// and extract per-address summaries.
+///
+/// For `mem_type` ∈ {VmMem, EvmMem, Transient}: the initial value of every
+/// address is 0.  For `Storage`: the initial value of the first read is
+/// accepted as-is (it will be bound to a Merkle root in Phase C).
+///
+/// Returns sorted entries (in-place) and per-address `(initial, final)` summaries.
+pub fn sort_and_verify_rw(
+  entries: &mut [RwEntry],
+  mem_type: MemType,
+) -> Result<Vec<RwSummary>, RwError> {
+  entries.sort_unstable_by_key(|e| (e.addr, e.counter));
+  verify_rw_consistency(entries, mem_type)
+}
+
 // ── Deterministic checks ─────────────────────────────────────────────────────
 
 /// Verify conditions that don't need lookups:
@@ -571,7 +927,229 @@ fn widening_mul(a: u128, b: u128) -> (u128, u128) {
   (lo, hi)
 }
 
+// ── R/W LogUp permutation argument ──────────────────────────────────────────
+
+/// Prove a single R/W log: sorted-trace permutation via LogUp.
+///
+/// 1. Squeeze RLC challenge α from the transcript.
+/// 2. Sort entries by (addr, counter), verify read-after-write consistency.
+/// 3. Encode both execution-order and sorted entries with α.
+/// 4. Build a [`LookupTable`] from sorted encoded entries.
+/// 5. Run LogUp: exec_encoded ⊆ sorted_table.
+///
+/// Returns (proof, summaries) or None if the log is empty.
+fn prove_rw_single(
+  entries: &mut Vec<RwEntry>,
+  mem_type: MemType,
+  label: &[u8],
+  transcript: &mut Blake3Transcript,
+) -> Option<(RwProof, Vec<RwSummary>)> {
+  if entries.is_empty() {
+    return None;
+  }
+
+  transcript.absorb_bytes(label);
+  let n_entries = entries.len();
+
+  // 1. RLC challenge
+  transcript.absorb_bytes(&(n_entries as u64).to_le_bytes());
+  let alpha: GF2_128 = transcript.squeeze_challenge();
+
+  // 2. Encode execution-order entries
+  let exec_encoded = encode_rw_entries(entries, alpha);
+
+  // 3. Sort and verify read-after-write consistency
+  let summaries = sort_and_verify_rw(entries, mem_type)
+    .expect("R/W consistency check must pass for honest prover");
+
+  // 4. Snapshot sorted entries (verifier will re-check ordering + consistency)
+  let sorted_entries = entries.to_vec();
+
+  // 5. Encode sorted entries
+  let sorted_encoded = encode_rw_entries(entries, alpha);
+
+  // 6. Build table from sorted entries, run LogUp
+  let table = LookupTable::new(sorted_encoded);
+  let mut witness = exec_encoded;
+  let n = witness.len().next_power_of_two();
+  witness.resize(n, table.entries[0]);
+
+  let (logup_proof, exec_digest) = logup::prove_committed(&witness, &table, transcript);
+
+  // 7. Commit summaries to transcript (Phase B binding)
+  absorb_summaries(&summaries, transcript);
+
+  Some((
+    RwProof {
+      logup: logup_proof,
+      sorted_table: table,
+      sorted_entries,
+      n_entries,
+      alpha,
+      exec_digest,
+    },
+    summaries,
+  ))
+}
+
+/// Verify a single R/W LogUp proof and re-derive per-address summaries.
+///
+/// The verifier:
+/// 1. Re-derives α from the transcript.
+/// 2. Verifies the LogUp permutation argument (exec ⊆ sorted).
+/// 3. **Phase B**: Re-checks that `sorted_entries` are truly sorted by
+///    `(addr, counter)`, satisfy read-after-write consistency, and re-encode
+///    to the values in `sorted_table`.
+/// 4. Absorbs re-derived summaries into the transcript (matching prover).
+/// 5. Returns the verified summaries.
+fn verify_rw_single(
+  proof: &RwProof,
+  label: &[u8],
+  mem_type: MemType,
+  transcript: &mut Blake3Transcript,
+) -> Option<Vec<RwSummary>> {
+  transcript.absorb_bytes(label);
+
+  // 1. Re-derive α
+  transcript.absorb_bytes(&(proof.n_entries as u64).to_le_bytes());
+  let alpha: GF2_128 = transcript.squeeze_challenge();
+
+  if alpha != proof.alpha {
+    return None;
+  }
+
+  // 2. Verify LogUp (committed variant uses digest stored in proof)
+  let n_padded = proof.n_entries.next_power_of_two();
+  logup::verify_committed(
+    &proof.logup,
+    n_padded,
+    &proof.sorted_table,
+    transcript,
+    &proof.exec_digest,
+  )?;
+
+  // ── Phase B: verify sorted entries ────────────────────────────────────
+  //
+  // The LogUp argument proves exec-order ⊂ sorted table (as encoded field
+  // elements). We now verify the *raw* sorted entries are:
+  //   a) correctly encoded — each raw entry, encoded with α, matches the
+  //      corresponding sorted_table entry;
+  //   b) properly ordered by (addr, counter);
+  //   c) read-after-write consistent; and
+  //   d) zero-init compliant for applicable memory types.
+
+  // 3a. Length check
+  if proof.sorted_entries.len() != proof.n_entries {
+    return None;
+  }
+
+  // 3b. Re-encode sorted entries and verify against sorted_table
+  let alpha2 = alpha * alpha;
+  for (i, entry) in proof.sorted_entries.iter().enumerate() {
+    let encoded = encode_rw(entry, alpha, alpha2);
+    if encoded != proof.sorted_table.entries[i] {
+      return None;
+    }
+  }
+  // Verify that padding entries (n_entries .. sorted_table.len) are all
+  // equal to the first table entry (LookupTable pads with entries[0]).
+  if proof.n_entries < proof.sorted_table.entries.len() {
+    let pad_val = proof.sorted_table.entries[0];
+    for entry in &proof.sorted_table.entries[proof.n_entries..] {
+      if *entry != pad_val {
+        return None;
+      }
+    }
+  }
+
+  // 3c. Verify ordering + read-after-write consistency → extract summaries
+  let summaries = verify_rw_consistency(&proof.sorted_entries, mem_type).ok()?;
+
+  // 4. Absorb summaries into transcript (matches prover)
+  absorb_summaries(&summaries, transcript);
+
+  Some(summaries)
+}
+
+// ── Phase B helpers ──────────────────────────────────────────────────────────
+
+/// Deterministically absorb R/W summaries into the transcript.
+fn absorb_summaries(summaries: &[RwSummary], transcript: &mut Blake3Transcript) {
+  transcript.absorb_bytes(&(summaries.len() as u64).to_le_bytes());
+  for s in summaries {
+    transcript.absorb_bytes(&s.addr.to_le_bytes());
+    transcript.absorb_bytes(&s.initial_value.to_le_bytes());
+    transcript.absorb_bytes(&s.final_value.to_le_bytes());
+  }
+}
+
+/// Compose R/W summaries from two adjacent trace segments.
+///
+/// For addresses in both segments, verifies the bridge constraint:
+/// `left.final_value == right.initial_value`, then merges:
+/// `(left.initial, right.final)`.
+///
+/// Both inputs must be sorted by `addr` (as produced by [`verify_rw_consistency`]).
+pub fn compose_summaries(
+  left: &[RwSummary],
+  right: &[RwSummary],
+) -> Result<Vec<RwSummary>, RwError> {
+  let mut result = Vec::with_capacity(left.len().max(right.len()));
+  let (mut l, mut r) = (0, 0);
+
+  while l < left.len() && r < right.len() {
+    use std::cmp::Ordering;
+    match left[l].addr.cmp(&right[r].addr) {
+      Ordering::Less => {
+        result.push(left[l].clone());
+        l += 1;
+      }
+      Ordering::Greater => {
+        result.push(right[r].clone());
+        r += 1;
+      }
+      Ordering::Equal => {
+        if left[l].final_value != right[r].initial_value {
+          return Err(RwError::BridgeMismatch {
+            addr: left[l].addr,
+            left_final: left[l].final_value,
+            right_initial: right[r].initial_value,
+          });
+        }
+        result.push(RwSummary {
+          addr: left[l].addr,
+          initial_value: left[l].initial_value,
+          final_value: right[r].final_value,
+        });
+        l += 1;
+        r += 1;
+      }
+    }
+  }
+  result.extend_from_slice(&left[l..]);
+  result.extend_from_slice(&right[r..]);
+  Ok(result)
+}
+
+/// Compose all four memory-type summaries from two adjacent segments.
+pub fn compose_rw_summaries(
+  left: &RwSummaries,
+  right: &RwSummaries,
+) -> Result<RwSummaries, RwError> {
+  Ok(RwSummaries {
+    mem: compose_summaries(&left.mem, &right.mem)?,
+    emem: compose_summaries(&left.emem, &right.emem)?,
+    storage: compose_summaries(&left.storage, &right.storage)?,
+    transient: compose_summaries(&left.transient, &right.transient)?,
+  })
+}
+
 // ── Prove / Verify ───────────────────────────────────────────────────────────
+
+/// Extract the witness digest from an RwProof.
+fn rw_exec_digest(proof: &RwProof) -> [u8; 32] {
+  proof.exec_digest
+}
 
 /// Prove all lookup arguments.
 ///
@@ -611,12 +1189,120 @@ pub fn prove_lookups(w: &mut LookupWitness, transcript: &mut Blake3Transcript) -
     None
   };
 
+  // R/W log proofs (sequentially after ALU lookups)
+  let mut t_rw = transcript.clone();
+  t_rw.absorb_bytes(b"rw:logs");
+  let rw_mem = prove_rw_single(&mut w.rw.mem, MemType::VmMem, b"rw:mem", &mut t_rw);
+  let rw_emem = prove_rw_single(&mut w.rw.emem, MemType::EvmMem, b"rw:emem", &mut t_rw);
+  let rw_storage = prove_rw_single(&mut w.rw.storage, MemType::Storage, b"rw:storage", &mut t_rw);
+  let rw_transient = prove_rw_single(
+    &mut w.rw.transient,
+    MemType::Transient,
+    b"rw:transient",
+    &mut t_rw,
+  );
+
+  let rw_summaries = RwSummaries {
+    mem: rw_mem.as_ref().map_or(vec![], |(_, s)| s.clone()),
+    emem: rw_emem.as_ref().map_or(vec![], |(_, s)| s.clone()),
+    storage: rw_storage.as_ref().map_or(vec![], |(_, s)| s.clone()),
+    transient: rw_transient.as_ref().map_or(vec![], |(_, s)| s.clone()),
+  };
+
   LookupProofs {
     range,
     and_op,
     add_op,
     mul_op,
+    rw_mem: rw_mem.map(|(p, _)| p),
+    rw_emem: rw_emem.map(|(p, _)| p),
+    rw_storage: rw_storage.map(|(p, _)| p),
+    rw_transient: rw_transient.map(|(p, _)| p),
+    rw_summaries,
   }
+}
+
+/// Sequential variant of [`prove_lookups`] that also returns commitments.
+///
+/// Uses forked transcripts (same as [`prove_lookups_par`]) for identical
+/// output, but executes each table proof sequentially.
+pub fn prove_lookups_committed(
+  w: &mut LookupWitness,
+  transcript: &mut Blake3Transcript,
+) -> (LookupProofs, LookupCommitments) {
+  transcript.absorb_bytes(b"circuit:lookups");
+
+  let mut t_range = transcript.fork("lut:range", 0);
+  let mut t_and = transcript.fork("lut:and", 1);
+  let mut t_add = transcript.fork("lut:add", 2);
+  let mut t_mul = transcript.fork("lut:mul", 3);
+
+  let range_res = if w.range.is_empty() {
+    None
+  } else {
+    let (p, t, d) = lut::prove_committed(lut::Op8::Range, &mut w.range, &mut t_range);
+    Some((p, t, d, w.range.len()))
+  };
+  let and_res = if w.and_op.is_empty() {
+    None
+  } else {
+    let (p, t, d) = lut::prove_committed(lut::Op8::And, &mut w.and_op, &mut t_and);
+    Some((p, t, d, w.and_op.len()))
+  };
+  let add_res = if w.add_op.is_empty() {
+    None
+  } else {
+    let (p, t, d) = lut::prove_committed(lut::Op8::Add, &mut w.add_op, &mut t_add);
+    Some((p, t, d, w.add_op.len()))
+  };
+  let mul_res = if w.mul_op.is_empty() {
+    None
+  } else {
+    let (p, t, d) = lut::prove_committed(lut::Op8::Mul, &mut w.mul_op, &mut t_mul);
+    Some((p, t, d, w.mul_op.len()))
+  };
+
+  // R/W log proofs
+  let mut t_rw = transcript.fork("rw:logs", 4);
+  let rw_mem = prove_rw_single(&mut w.rw.mem, MemType::VmMem, b"rw:mem", &mut t_rw);
+  let rw_emem = prove_rw_single(&mut w.rw.emem, MemType::EvmMem, b"rw:emem", &mut t_rw);
+  let rw_storage = prove_rw_single(&mut w.rw.storage, MemType::Storage, b"rw:storage", &mut t_rw);
+  let rw_transient = prove_rw_single(
+    &mut w.rw.transient,
+    MemType::Transient,
+    b"rw:transient",
+    &mut t_rw,
+  );
+
+  let proofs = LookupProofs {
+    range: range_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
+    and_op: and_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
+    add_op: add_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
+    mul_op: mul_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
+    rw_mem: rw_mem.as_ref().map(|(p, _)| p.clone()),
+    rw_emem: rw_emem.as_ref().map(|(p, _)| p.clone()),
+    rw_storage: rw_storage.as_ref().map(|(p, _)| p.clone()),
+    rw_transient: rw_transient.as_ref().map(|(p, _)| p.clone()),
+    rw_summaries: RwSummaries {
+      mem: rw_mem.as_ref().map_or(vec![], |(_, s)| s.clone()),
+      emem: rw_emem.as_ref().map_or(vec![], |(_, s)| s.clone()),
+      storage: rw_storage.as_ref().map_or(vec![], |(_, s)| s.clone()),
+      transient: rw_transient.as_ref().map_or(vec![], |(_, s)| s.clone()),
+    },
+  };
+
+  let commits = LookupCommitments {
+    range: range_res.map(|(_, _, d, n)| (d, n)),
+    and_op: and_res.map(|(_, _, d, n)| (d, n)),
+    add_op: add_res.map(|(_, _, d, n)| (d, n)),
+    mul_op: mul_res.map(|(_, _, d, n)| (d, n)),
+    rw_mem: rw_mem.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+    rw_emem: rw_emem.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+    rw_storage: rw_storage.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+    rw_transient: rw_transient.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+  };
+
+  (proofs, commits)
 }
 
 /// Parallel variant of [`prove_lookups`] — each table gets a forked
@@ -679,6 +1365,19 @@ pub fn prove_lookups_par(
     },
   );
 
+  // R/W log proofs (sequential — sorting is not parallelizable here because
+  // prove_rw_single mutates entries in-place).
+  let mut t_rw = transcript.fork("rw:logs", 4);
+  let rw_mem = prove_rw_single(&mut w.rw.mem, MemType::VmMem, b"rw:mem", &mut t_rw);
+  let rw_emem = prove_rw_single(&mut w.rw.emem, MemType::EvmMem, b"rw:emem", &mut t_rw);
+  let rw_storage = prove_rw_single(&mut w.rw.storage, MemType::Storage, b"rw:storage", &mut t_rw);
+  let rw_transient = prove_rw_single(
+    &mut w.rw.transient,
+    MemType::Transient,
+    b"rw:transient",
+    &mut t_rw,
+  );
+
   let proofs = LookupProofs {
     range: range_res
       .as_ref()
@@ -686,6 +1385,16 @@ pub fn prove_lookups_par(
     and_op: and_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
     add_op: add_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
     mul_op: mul_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
+    rw_mem: rw_mem.as_ref().map(|(p, _)| p.clone()),
+    rw_emem: rw_emem.as_ref().map(|(p, _)| p.clone()),
+    rw_storage: rw_storage.as_ref().map(|(p, _)| p.clone()),
+    rw_transient: rw_transient.as_ref().map(|(p, _)| p.clone()),
+    rw_summaries: RwSummaries {
+      mem: rw_mem.as_ref().map_or(vec![], |(_, s)| s.clone()),
+      emem: rw_emem.as_ref().map_or(vec![], |(_, s)| s.clone()),
+      storage: rw_storage.as_ref().map_or(vec![], |(_, s)| s.clone()),
+      transient: rw_transient.as_ref().map_or(vec![], |(_, s)| s.clone()),
+    },
   };
 
   let commits = LookupCommitments {
@@ -693,6 +1402,10 @@ pub fn prove_lookups_par(
     and_op: and_res.map(|(_, _, d, n)| (d, n)),
     add_op: add_res.map(|(_, _, d, n)| (d, n)),
     mul_op: mul_res.map(|(_, _, d, n)| (d, n)),
+    rw_mem: rw_mem.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+    rw_emem: rw_emem.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+    rw_storage: rw_storage.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+    rw_transient: rw_transient.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
   };
 
   (proofs, commits)
@@ -701,11 +1414,12 @@ pub fn prove_lookups_par(
 /// Verify all lookup proofs.
 ///
 /// Witnesses in `w` are padded to match the prover's padding.
+/// Returns verified [`RwSummaries`] on success.
 pub fn verify_lookups(
   proofs: &LookupProofs,
   w: &mut LookupWitness,
   transcript: &mut Blake3Transcript,
-) -> bool {
+) -> Option<RwSummaries> {
   transcript.absorb_bytes(b"circuit:lookups");
 
   if let Some((proof, table)) = &proofs.range {
@@ -713,10 +1427,10 @@ pub fn verify_lookups(
     let n = w.range.len().next_power_of_two();
     w.range.resize(n, table.entries[0]);
     if lut::verify(proof, &w.range, table, transcript).is_none() {
-      return false;
+      return None;
     }
   } else if !w.range.is_empty() {
-    return false;
+    return None;
   }
 
   if let Some((proof, table)) = &proofs.and_op {
@@ -724,10 +1438,10 @@ pub fn verify_lookups(
     let n = w.and_op.len().next_power_of_two();
     w.and_op.resize(n, table.entries[0]);
     if lut::verify(proof, &w.and_op, table, transcript).is_none() {
-      return false;
+      return None;
     }
   } else if !w.and_op.is_empty() {
-    return false;
+    return None;
   }
 
   if let Some((proof, table)) = &proofs.add_op {
@@ -735,10 +1449,10 @@ pub fn verify_lookups(
     let n = w.add_op.len().next_power_of_two();
     w.add_op.resize(n, table.entries[0]);
     if lut::verify(proof, &w.add_op, table, transcript).is_none() {
-      return false;
+      return None;
     }
   } else if !w.add_op.is_empty() {
-    return false;
+    return None;
   }
 
   if let Some((proof, table)) = &proofs.mul_op {
@@ -746,25 +1460,49 @@ pub fn verify_lookups(
     let n = w.mul_op.len().next_power_of_two();
     w.mul_op.resize(n, table.entries[0]);
     if lut::verify(proof, &w.mul_op, table, transcript).is_none() {
-      return false;
+      return None;
     }
   } else if !w.mul_op.is_empty() {
-    return false;
+    return None;
   }
 
-  true
+  // R/W consistency proofs + Phase B summary extraction
+  let mut t_rw = transcript.clone();
+  t_rw.absorb_bytes(b"rw:logs");
+  let mem = if let Some(proof) = &proofs.rw_mem {
+    verify_rw_single(proof, b"rw:mem", MemType::VmMem, &mut t_rw)?
+  } else {
+    vec![]
+  };
+  let emem = if let Some(proof) = &proofs.rw_emem {
+    verify_rw_single(proof, b"rw:emem", MemType::EvmMem, &mut t_rw)?
+  } else {
+    vec![]
+  };
+  let storage = if let Some(proof) = &proofs.rw_storage {
+    verify_rw_single(proof, b"rw:storage", MemType::Storage, &mut t_rw)?
+  } else {
+    vec![]
+  };
+  let transient = if let Some(proof) = &proofs.rw_transient {
+    verify_rw_single(proof, b"rw:transient", MemType::Transient, &mut t_rw)?
+  } else {
+    vec![]
+  };
+
+  Some(RwSummaries { mem, emem, storage, transient })
 }
 
 /// Parallel variant of [`verify_lookups`] — uses forked transcripts
 /// matching [`prove_lookups_par`].
 ///
 /// Accepts [`LookupCommitments`] (succinct digests) instead of raw
-/// witness data.
+/// witness data.  Returns verified [`RwSummaries`] on success.
 pub fn verify_lookups_par(
   proofs: &LookupProofs,
   commits: &LookupCommitments,
   transcript: &mut Blake3Transcript,
-) -> bool {
+) -> Option<RwSummaries> {
   transcript.absorb_bytes(b"circuit:lookups");
 
   let mut t_range = transcript.fork("lut:range", 0);
@@ -774,16 +1512,29 @@ pub fn verify_lookups_par(
 
   // Check presence consistency first (proof ↔ commit non-emptiness).
   if proofs.range.is_none() != commits.range.is_none() {
-    return false;
+    return None;
   }
   if proofs.and_op.is_none() != commits.and_op.is_none() {
-    return false;
+    return None;
   }
   if proofs.add_op.is_none() != commits.add_op.is_none() {
-    return false;
+    return None;
   }
   if proofs.mul_op.is_none() != commits.mul_op.is_none() {
-    return false;
+    return None;
+  }
+  // R/W presence consistency
+  if proofs.rw_mem.is_none() != commits.rw_mem.is_none() {
+    return None;
+  }
+  if proofs.rw_emem.is_none() != commits.rw_emem.is_none() {
+    return None;
+  }
+  if proofs.rw_storage.is_none() != commits.rw_storage.is_none() {
+    return None;
+  }
+  if proofs.rw_transient.is_none() != commits.rw_transient.is_none() {
+    return None;
   }
 
   let ((r1, r2), (r3, r4)) = rayon::join(
@@ -821,7 +1572,35 @@ pub fn verify_lookups_par(
     },
   );
 
-  r1 && r2 && r3 && r4
+  if !(r1 && r2 && r3 && r4) {
+    return None;
+  }
+
+  // R/W log verification (sequential — mirrors prover's sequential rw fork).
+  // Phase B: collect verified summaries.
+  let mut t_rw = transcript.fork("rw:logs", 4);
+  let mem = if let Some(proof) = &proofs.rw_mem {
+    verify_rw_single(proof, b"rw:mem", MemType::VmMem, &mut t_rw)?
+  } else {
+    vec![]
+  };
+  let emem = if let Some(proof) = &proofs.rw_emem {
+    verify_rw_single(proof, b"rw:emem", MemType::EvmMem, &mut t_rw)?
+  } else {
+    vec![]
+  };
+  let storage = if let Some(proof) = &proofs.rw_storage {
+    verify_rw_single(proof, b"rw:storage", MemType::Storage, &mut t_rw)?
+  } else {
+    vec![]
+  };
+  let transient = if let Some(proof) = &proofs.rw_transient {
+    verify_rw_single(proof, b"rw:transient", MemType::Transient, &mut t_rw)?
+  } else {
+    vec![]
+  };
+
+  Some(RwSummaries { mem, emem, storage, transient })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -851,7 +1630,7 @@ mod tests {
 
     let mut w_verifier = collect_witnesses(rows);
     let mut tv = Blake3Transcript::new();
-    let ok = verify_lookups(&proofs, &mut w_verifier, &mut tv);
+    let ok = verify_lookups(&proofs, &mut w_verifier, &mut tv).is_some();
     ok && verify_deterministic_checks(rows)
   }
 
@@ -1048,7 +1827,7 @@ mod tests {
     let (proofs, commits) = prove_lookups_par(&mut w_prover, &mut tp);
 
     let mut tv = Blake3Transcript::new();
-    verify_lookups_par(&proofs, &commits, &mut tv) && verify_deterministic_checks(rows)
+    verify_lookups_par(&proofs, &commits, &mut tv).is_some() && verify_deterministic_checks(rows)
   }
 
   #[test]
@@ -1076,5 +1855,373 @@ mod tests {
     assert_eq!(seq.and_op, par.and_op);
     assert_eq!(seq.add_op, par.add_op);
     assert_eq!(seq.mul_op, par.mul_op);
+  }
+
+  // ── R/W log: emit_rw_entry routing ─────────────────────────────────
+
+  #[test]
+  fn emit_rw_entry_routes_vm_load_store() {
+    // Load (16): addr=in0, value=out → mem, is_write=false
+    // Store (17): addr=in0, value=in1 → mem, is_write=true
+    let rows = vec![
+      make_row(16, 42, 0, 0, 99, 0),  // VM Load
+      make_row(17, 42, 77, 0, 0, 0),   // VM Store
+    ];
+    let w = collect_witnesses(&rows);
+    assert_eq!(w.rw.mem.len(), 2);
+    assert!(!w.rw.mem[0].is_write);
+    assert_eq!(w.rw.mem[0].addr, 42);
+    assert_eq!(w.rw.mem[0].value, 99);
+    assert!(w.rw.mem[1].is_write);
+    assert_eq!(w.rw.mem[1].value, 77);
+    assert!(w.rw.emem.is_empty());
+    assert!(w.rw.storage.is_empty());
+    assert!(w.rw.transient.is_empty());
+  }
+
+  #[test]
+  fn emit_rw_entry_routes_evm_memory() {
+    let rows = vec![
+      make_row(22, 0x20, 0, 0, 0xAB, 0),  // MLoad
+      make_row(23, 0x40, 0xCD, 0, 0, 0),   // MStore
+      make_row(24, 0x60, 0xEF, 0, 0, 0),   // MStore8
+    ];
+    let w = collect_witnesses(&rows);
+    assert_eq!(w.rw.emem.len(), 3);
+    assert!(!w.rw.emem[0].is_write); // MLoad → read
+    assert!(w.rw.emem[1].is_write);  // MStore → write
+    assert!(w.rw.emem[2].is_write);  // MStore8 → write
+    assert!(w.rw.mem.is_empty());
+  }
+
+  #[test]
+  fn emit_rw_entry_routes_storage_and_transient() {
+    let rows = vec![
+      make_row(25, 1, 0, 0, 100, 0), // SLoad
+      make_row(26, 1, 200, 0, 0, 0),  // SStore
+      make_row(27, 2, 0, 0, 300, 0),  // TLoad
+      make_row(28, 2, 400, 0, 0, 0),  // TStore
+    ];
+    let w = collect_witnesses(&rows);
+    assert_eq!(w.rw.storage.len(), 2);
+    assert_eq!(w.rw.transient.len(), 2);
+    assert!(!w.rw.storage[0].is_write);
+    assert!(w.rw.storage[1].is_write);
+    assert!(!w.rw.transient[0].is_write);
+    assert!(w.rw.transient[1].is_write);
+  }
+
+  #[test]
+  fn emit_rw_entry_counters_sequential() {
+    let rows = vec![
+      make_row(16, 1, 0, 0, 10, 0),
+      make_row(17, 1, 20, 0, 0, 0),
+      make_row(16, 1, 0, 0, 20, 0),
+    ];
+    let w = collect_witnesses(&rows);
+    assert_eq!(w.rw.mem[0].counter, 0);
+    assert_eq!(w.rw.mem[1].counter, 1);
+    assert_eq!(w.rw.mem[2].counter, 2);
+  }
+
+  // ── R/W log: sort_and_verify_rw ────────────────────────────────────
+
+  #[test]
+  fn sort_verify_write_then_read() {
+    let mut entries = vec![
+      RwEntry { addr: 10, value: 42, counter: 0, is_write: true },
+      RwEntry { addr: 10, value: 42, counter: 1, is_write: false },
+    ];
+    let summaries = sort_and_verify_rw(&mut entries, MemType::VmMem).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].addr, 10);
+    assert_eq!(summaries[0].initial_value, 0); // zero-init, first is write
+    assert_eq!(summaries[0].final_value, 42);
+  }
+
+  #[test]
+  fn sort_verify_multiple_addresses() {
+    let mut entries = vec![
+      RwEntry { addr: 20, value: 1, counter: 0, is_write: true },
+      RwEntry { addr: 10, value: 2, counter: 1, is_write: true },
+      RwEntry { addr: 20, value: 1, counter: 2, is_write: false },
+      RwEntry { addr: 10, value: 2, counter: 3, is_write: false },
+    ];
+    let summaries = sort_and_verify_rw(&mut entries, MemType::VmMem).unwrap();
+    assert_eq!(summaries.len(), 2);
+    // Sorted by addr: 10 first, then 20.
+    assert_eq!(summaries[0].addr, 10);
+    assert_eq!(summaries[1].addr, 20);
+  }
+
+  #[test]
+  fn sort_verify_read_mismatch_error() {
+    let mut entries = vec![
+      RwEntry { addr: 10, value: 42, counter: 0, is_write: true },
+      RwEntry { addr: 10, value: 99, counter: 1, is_write: false }, // wrong!
+    ];
+    let result = sort_and_verify_rw(&mut entries, MemType::VmMem);
+    assert!(matches!(result, Err(RwError::ReadMismatch { .. })));
+  }
+
+  #[test]
+  fn sort_verify_zero_init_initial_read_must_be_zero() {
+    // For VmMem: first access is read with value=0 → OK.
+    let mut entries_ok = vec![
+      RwEntry { addr: 10, value: 0, counter: 0, is_write: false },
+    ];
+    assert!(sort_and_verify_rw(&mut entries_ok, MemType::VmMem).is_ok());
+
+    // For VmMem: first access is read with value≠0 → error.
+    let mut entries_bad = vec![
+      RwEntry { addr: 10, value: 5, counter: 0, is_write: false },
+    ];
+    assert!(matches!(
+      sort_and_verify_rw(&mut entries_bad, MemType::VmMem),
+      Err(RwError::InitialReadNonZero { .. })
+    ));
+  }
+
+  #[test]
+  fn sort_verify_storage_initial_read_any_value() {
+    // For Storage: first access is read with non-zero → OK (external binding).
+    let mut entries = vec![
+      RwEntry { addr: 10, value: 999, counter: 0, is_write: false },
+    ];
+    assert!(sort_and_verify_rw(&mut entries, MemType::Storage).is_ok());
+  }
+
+  #[test]
+  fn sort_verify_empty_entries() {
+    let mut entries: Vec<RwEntry> = vec![];
+    let summaries = sort_and_verify_rw(&mut entries, MemType::VmMem).unwrap();
+    assert!(summaries.is_empty());
+  }
+
+  #[test]
+  fn sort_verify_write_overwrite_read() {
+    let mut entries = vec![
+      RwEntry { addr: 10, value: 1, counter: 0, is_write: true },
+      RwEntry { addr: 10, value: 2, counter: 1, is_write: true },
+      RwEntry { addr: 10, value: 2, counter: 2, is_write: false },
+    ];
+    let summaries = sort_and_verify_rw(&mut entries, MemType::VmMem).unwrap();
+    assert_eq!(summaries[0].final_value, 2);
+  }
+
+  // ── R/W log: encode_rw ─────────────────────────────────────────────
+
+  #[test]
+  fn encode_rw_distinct_entries() {
+    let alpha = GF2_128::new(0x1234, 0x5678);
+    let alpha2 = alpha * alpha;
+    let a = RwEntry { addr: 1, value: 2, counter: 0, is_write: false };
+    let b = RwEntry { addr: 1, value: 2, counter: 1, is_write: false };
+    let c = RwEntry { addr: 1, value: 3, counter: 0, is_write: false };
+    // Same addr+value but different counter → different encoding.
+    assert_ne!(encode_rw(&a, alpha, alpha2), encode_rw(&b, alpha, alpha2));
+    // Same addr+counter but different value → different encoding.
+    assert_ne!(encode_rw(&a, alpha, alpha2), encode_rw(&c, alpha, alpha2));
+  }
+
+  // ── R/W log: prove/verify round trip ───────────────────────────────
+
+  #[test]
+  fn rw_prove_verify_vm_mem() {
+    // Store to addr 5, then load from addr 5 — valid trace.
+    let rows = vec![
+      make_row(17, 5, 42, 0, 0, 0),  // Store addr=5, val=42
+      make_row(16, 5, 0, 0, 42, 0),  // Load addr=5 → 42
+    ];
+    assert!(run_lookup(&rows));
+  }
+
+  #[test]
+  fn rw_prove_verify_evm_memory() {
+    let rows = vec![
+      make_row(23, 0x20, 0xFF, 0, 0, 0), // MStore offset=0x20, val=0xFF
+      make_row(22, 0x20, 0, 0, 0xFF, 0),  // MLoad offset=0x20 → 0xFF
+    ];
+    assert!(run_lookup(&rows));
+  }
+
+  #[test]
+  fn rw_prove_verify_storage_roundtrip() {
+    // SLoad key=1 val=100 (first read, initial state), then SStore key=1 val=200.
+    let rows = vec![
+      make_row(25, 1, 0, 0, 100, 0),  // SLoad key=1 → 100
+      make_row(26, 1, 200, 0, 0, 0),  // SStore key=1 := 200
+      make_row(25, 1, 0, 0, 200, 0),  // SLoad key=1 → 200
+    ];
+    assert!(run_lookup(&rows));
+  }
+
+  #[test]
+  fn rw_prove_verify_transient() {
+    let rows = vec![
+      make_row(28, 3, 50, 0, 0, 0),  // TStore key=3 := 50
+      make_row(27, 3, 0, 0, 50, 0),  // TLoad key=3 → 50
+    ];
+    assert!(run_lookup(&rows));
+  }
+
+  #[test]
+  fn rw_prove_verify_par() {
+    // Parallel path with mixed rw ops.
+    let rows = vec![
+      make_row(17, 1, 10, 0, 0, 0),  // VM Store
+      make_row(16, 1, 0, 0, 10, 0),  // VM Load
+      make_row(23, 0, 20, 0, 0, 0),  // MStore
+      make_row(22, 0, 0, 0, 20, 0),  // MLoad
+    ];
+    assert!(run_lookup_par(&rows));
+  }
+
+  #[test]
+  #[should_panic(expected = "R/W consistency check must pass")]
+  fn rw_read_mismatch_panics_at_prove() {
+    // Store 42 to addr 5, but load returns 99 — inconsistent.
+    let rows = vec![
+      make_row(17, 5, 42, 0, 0, 0),  // Store addr=5, val=42
+      make_row(16, 5, 0, 0, 99, 0),  // Load addr=5 → 99 (WRONG)
+    ];
+    run_lookup(&rows);
+  }
+
+  #[test]
+  fn rw_empty_log_prove_verify() {
+    // No memory ops — should still pass.
+    let rows = vec![
+      make_row(0, 100, 200, 0, 300, 0), // Add128
+    ];
+    assert!(run_lookup(&rows));
+  }
+
+  #[test]
+  fn rw_par_witnesses_match_sequential() {
+    let rows = vec![
+      make_row(17, 1, 10, 0, 0, 0),
+      make_row(16, 1, 0, 0, 10, 0),
+      make_row(23, 0, 20, 0, 0, 0),
+      make_row(22, 0, 0, 0, 20, 0),
+      make_row(26, 5, 30, 0, 0, 0),
+      make_row(25, 5, 0, 0, 30, 0),
+    ];
+    let seq = collect_witnesses(&rows);
+    let par = collect_witnesses_par(&rows);
+    // R/W entries should have same data (possibly different counters for par).
+    assert_eq!(seq.rw.mem.len(), par.rw.mem.len());
+    assert_eq!(seq.rw.emem.len(), par.rw.emem.len());
+    assert_eq!(seq.rw.storage.len(), par.rw.storage.len());
+    assert_eq!(seq.rw.transient.len(), par.rw.transient.len());
+  }
+
+  // ── L-1 indirect coverage: compose_summaries bridge enforcement ────
+  //
+  // The R/W consistency argument enforces value continuity at Seq
+  // boundaries via compose_summaries.  When two adjacent shards share
+  // an address, left.final_value must equal right.initial_value.
+  // These tests verify the bridge constraint catches mismatches.
+
+  #[test]
+  fn compose_bridge_match_merges_correctly() {
+    let left = vec![RwSummary { addr: 10, initial_value: 0, final_value: 42 }];
+    let right = vec![RwSummary { addr: 10, initial_value: 42, final_value: 99 }];
+    let merged = compose_summaries(&left, &right).unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].addr, 10);
+    assert_eq!(merged[0].initial_value, 0);
+    assert_eq!(merged[0].final_value, 99);
+  }
+
+  #[test]
+  fn compose_bridge_mismatch_detected() {
+    // left writes final_value=42, right expects initial_value=99 → mismatch.
+    let left = vec![RwSummary { addr: 10, initial_value: 0, final_value: 42 }];
+    let right = vec![RwSummary { addr: 10, initial_value: 99, final_value: 200 }];
+    let result = compose_summaries(&left, &right);
+    assert!(
+      matches!(result, Err(RwError::BridgeMismatch { addr: 10, left_final: 42, right_initial: 99 })),
+      "compose_summaries must reject Seq boundary value mismatch: {result:?}"
+    );
+  }
+
+  #[test]
+  fn compose_bridge_disjoint_addresses_preserved() {
+    // Non-overlapping addresses: both are preserved without bridge check.
+    let left = vec![RwSummary { addr: 5, initial_value: 1, final_value: 2 }];
+    let right = vec![RwSummary { addr: 20, initial_value: 3, final_value: 4 }];
+    let merged = compose_summaries(&left, &right).unwrap();
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].addr, 5);
+    assert_eq!(merged[1].addr, 20);
+  }
+
+  #[test]
+  fn compose_bridge_multi_addr_partial_overlap() {
+    // Two shared addrs + one unique per side.
+    let left = vec![
+      RwSummary { addr: 1, initial_value: 0, final_value: 10 },
+      RwSummary { addr: 3, initial_value: 0, final_value: 30 },
+      RwSummary { addr: 5, initial_value: 0, final_value: 50 },
+    ];
+    let right = vec![
+      RwSummary { addr: 2, initial_value: 0, final_value: 20 },
+      RwSummary { addr: 3, initial_value: 30, final_value: 33 },
+      RwSummary { addr: 5, initial_value: 50, final_value: 55 },
+    ];
+    let merged = compose_summaries(&left, &right).unwrap();
+    assert_eq!(merged.len(), 4); // addrs 1, 2, 3, 5
+    // addr 3: initial=0, final=33 (bridged through 30)
+    let a3 = merged.iter().find(|s| s.addr == 3).unwrap();
+    assert_eq!(a3.initial_value, 0);
+    assert_eq!(a3.final_value, 33);
+  }
+
+  #[test]
+  fn compose_rw_summaries_bridge_mismatch_any_type() {
+    // Bridge mismatch in storage type → compose_rw_summaries fails.
+    let left = RwSummaries {
+      mem: vec![],
+      emem: vec![],
+      storage: vec![RwSummary { addr: 1, initial_value: 0, final_value: 100 }],
+      transient: vec![],
+    };
+    let right = RwSummaries {
+      mem: vec![],
+      emem: vec![],
+      storage: vec![RwSummary { addr: 1, initial_value: 999, final_value: 200 }],
+      transient: vec![],
+    };
+    assert!(compose_rw_summaries(&left, &right).is_err());
+  }
+
+  // ── L-1 indirect coverage: storage key preservation ────────────────
+
+  #[test]
+  fn rw_storage_write_then_read_preserves_key() {
+    // Write to addr 10, then read from addr 10 — key survives.
+    let mut entries = vec![
+      RwEntry { addr: 10, value: 42, counter: 0, is_write: true },
+      RwEntry { addr: 10, value: 42, counter: 1, is_write: false },
+    ];
+    let summaries = sort_and_verify_rw(&mut entries, MemType::VmMem).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].final_value, 42);
+  }
+
+  #[test]
+  fn rw_multiple_keys_all_preserved() {
+    // Multiple keys: all survive across the sorted log.
+    let mut entries = vec![
+      RwEntry { addr: 1, value: 10, counter: 0, is_write: true },
+      RwEntry { addr: 2, value: 20, counter: 1, is_write: true },
+      RwEntry { addr: 3, value: 30, counter: 2, is_write: true },
+      RwEntry { addr: 1, value: 10, counter: 3, is_write: false },
+      RwEntry { addr: 2, value: 20, counter: 4, is_write: false },
+      RwEntry { addr: 3, value: 30, counter: 5, is_write: false },
+    ];
+    let summaries = sort_and_verify_rw(&mut entries, MemType::VmMem).unwrap();
+    assert_eq!(summaries.len(), 3);
   }
 }

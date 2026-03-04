@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+field     = { path = "../field" }
 evm-types = { path = "../evm-types" }
 revm      = { workspace = true }
 thiserror = { workspace = true }

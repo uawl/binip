@@ -174,10 +174,11 @@ fn compile_noop() -> Compiled {
 /// verified at the circuit/proof-tree layer: EXP, SDIV, SMOD, SHL, SHR,
 /// SAR, SIGNEXTEND, all environment/block queries, CALL results, etc.
 fn compile_advice_u256() -> Compiled {
-  let mut ops = Vec::with_capacity(LIMBS * 2);
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: scratch(i) });
-  }
+  let mut ops = Vec::with_capacity(3);
+  ops.push(MicroOp::Advice2 {
+    dst0: scratch(0),
+    dst1: scratch(1),
+  });
   for i in 0..LIMBS {
     ops.push(MicroOp::Mov {
       dst: limb(0, i),
@@ -467,11 +468,12 @@ fn compile_sub() -> Compiled {
 /// Uses the advice pattern: prover supplies the 256-bit product, then
 /// CheckMul verifies each limb-pair multiplication.
 fn compile_mul() -> Compiled {
-  let mut ops = Vec::with_capacity(LIMBS * 2);
-  // Load the 8 result limbs from the advice tape into scratch[0..8].
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: scratch(i) });
-  }
+  let mut ops = Vec::with_capacity(4);
+  // Load the 2 result limbs from the advice tape into scratch[0..2].
+  ops.push(MicroOp::Advice2 {
+    dst0: scratch(0),
+    dst1: scratch(1),
+  });
   // Verify: for each limb pair, check the partial product consistency.
   // Full schoolbook verification: Σ_i Σ_j a[i]*b[j] where i+j = k (for result limb k).
   // At the 32-bit micro-op level, we verify the overall claim with CheckMul
@@ -504,19 +506,15 @@ fn compile_mul() -> Compiled {
 /// Advice pattern: load quot (LIMBS limbs) and rem (LIMBS limbs) from tape,
 /// then CheckDiv.
 fn compile_div() -> Compiled {
-  let mut ops = Vec::with_capacity(LIMBS * 2 + LIMBS + LIMBS);
-  // Load quotient into scratch[0..8]
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: scratch(i) });
-  }
-  // Load remainder into scratch[8..16] — but we only have scratch up to 63.
-  // We'll reuse slot 2 range (regs 16..23) as temp for remainder.
+  let mut ops = Vec::with_capacity(4);
+  // Load quotient (2 limbs) and remainder (2 limbs) in one row.
   let rem_base: Reg = slot(2);
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad {
-      dst: rem_base + i as Reg,
-    });
-  }
+  ops.push(MicroOp::Advice4 {
+    dst0: scratch(0),
+    dst1: scratch(1),
+    dst2: rem_base,
+    dst3: rem_base + 1,
+  });
   // Verify each limb: dividend[i] == divisor[i] * quot[i] + rem[i].
   // For the full 256-bit check the circuit layer does the multi-limb constraint.
   // At micro-op level, verify limb 0 as a sanity check.
@@ -543,18 +541,15 @@ fn compile_div() -> Compiled {
 ///
 /// Same advice pair as DIV but result = remainder.
 fn compile_mod() -> Compiled {
-  let mut ops = Vec::with_capacity(LIMBS * 2 + LIMBS + LIMBS);
-  // Load quotient into scratch
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: scratch(i) });
-  }
-  // Load remainder into slot 2 range
+  let mut ops = Vec::with_capacity(4);
+  // Load quotient (2 limbs) and remainder (2 limbs) in one row.
   let rem_base: Reg = slot(2);
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad {
-      dst: rem_base + i as Reg,
-    });
-  }
+  ops.push(MicroOp::Advice4 {
+    dst0: scratch(0),
+    dst1: scratch(1),
+    dst2: rem_base,
+    dst3: rem_base + 1,
+  });
   // Verify limb 0
   ops.push(MicroOp::CheckDiv {
     quot: scratch(0),
@@ -580,7 +575,7 @@ fn compile_mod() -> Compiled {
 /// Step 1: compute sum = slot0 + slot1 (may overflow to 257 bits).
 /// Step 2: advice provides quot and rem, CheckDiv verifies.
 fn compile_addmod() -> Compiled {
-  let mut ops = Vec::with_capacity(LIMBS * 4);
+  let mut ops = Vec::with_capacity(6);
   // Step 1: add slot0 + slot1 → slot0 (using the ADD chain)
   for i in 0..LIMBS {
     let cin: FlagReg = i as FlagReg;
@@ -594,17 +589,14 @@ fn compile_addmod() -> Compiled {
     });
   }
   // Step 2: advice-based modular reduction: slot0 % slot2
-  // Load quot into scratch[0..LIMBS]
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: scratch(i) });
-  }
-  // Load rem into scratch[LIMBS..]
+  // Load quot (2 limbs) and rem (2 limbs) in one row.
   let rem_base = scratch(LIMBS);
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad {
-      dst: rem_base + i as Reg,
-    });
-  }
+  ops.push(MicroOp::Advice4 {
+    dst0: scratch(0),
+    dst1: scratch(1),
+    dst2: rem_base,
+    dst3: rem_base + 1,
+  });
   // Verify limb 0: sum[0] == N[0]*q[0] + r[0]
   ops.push(MicroOp::CheckDiv {
     quot: scratch(0),
@@ -630,18 +622,15 @@ fn compile_addmod() -> Compiled {
 /// Advice: q = (a*b)/N, r = (a*b)%N.
 /// Verify: CheckMul(a, b) → t, CheckMul(q, N) → s, then t == s + r (XOR).
 fn compile_mulmod() -> Compiled {
-  let mut ops = Vec::with_capacity(LIMBS * 4);
-  // Load q (LIMBS limbs) and r (LIMBS limbs) from advice.
-  // q → scratch[0..LIMBS], r → slot(3) (reuse slot 3 as temp)
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad { dst: scratch(i) }); // q
-  }
+  let mut ops = Vec::with_capacity(6);
+  // Load q (2 limbs) and r (2 limbs) in one row.
   let rem_base = slot(3);
-  for i in 0..LIMBS {
-    ops.push(MicroOp::AdviceLoad {
-      dst: rem_base + i as Reg,
-    }); // r
-  }
+  ops.push(MicroOp::Advice4 {
+    dst0: scratch(0),
+    dst1: scratch(1),
+    dst2: rem_base,
+    dst3: rem_base + 1,
+  });
   // Verify limb 0 of a*b
   ops.push(MicroOp::CheckMul {
     q_lo: scratch(LIMBS), // temp
@@ -761,8 +750,10 @@ fn compile_bitwise_not() -> Compiled {
 /// ISZERO: slot0 = (slot0 == 0) ? 1 : 0.
 ///
 /// OR all 8 limbs together (XOR chain), then use advice to provide 0 or 1.
+/// CheckZeroInv + CheckZeroMul verify the boolean matches the accumulator
+/// via GF(2^128) field algebra.
 fn compile_iszero() -> Compiled {
-  let mut ops = Vec::with_capacity(LIMBS + 4);
+  let mut ops = Vec::with_capacity(LIMBS + 8);
   // Accumulate OR of all limbs into scratch[0] via bitwise-OR.
   ops.push(MicroOp::Mov {
     dst: scratch(0),
@@ -787,11 +778,22 @@ fn compile_iszero() -> Compiled {
     });
   }
   // Now scratch[0] = OR of all limbs.  If zero → result is 1, else 0.
-  // Load advice (0 or 1) and range-check.
+  // Load advice: [boolean, GF(2^128) inverse of accumulator].
   ops.push(MicroOp::AdviceLoad { dst: scratch(2) });
   ops.push(MicroOp::RangeCheck {
     r: scratch(2),
     bits: 1,
+  });
+  ops.push(MicroOp::AdviceLoad { dst: scratch(3) });
+  // Verify: acc * inv + result + 1 = 0, acc * result = 0.
+  ops.push(MicroOp::CheckZeroInv {
+    acc: scratch(0),
+    inv: scratch(3),
+    result: scratch(2),
+  });
+  ops.push(MicroOp::CheckZeroMul {
+    acc: scratch(0),
+    result: scratch(2),
   });
   // Set slot0 = [advice, 0, 0, ..., 0]
   ops.push(MicroOp::Mov {
@@ -806,13 +808,16 @@ fn compile_iszero() -> Compiled {
   }
   Compiled {
     ops,
-    advice_count: 1,
+    advice_count: 2,
   }
 }
 
 /// EQ: slot0 = (slot0 == slot1) ? 1 : 0.
+///
+/// CheckZeroInv + CheckZeroMul verify the boolean matches the XOR accumulator
+/// via GF(2^128) field algebra.
 fn compile_eq() -> Compiled {
-  let mut ops = Vec::with_capacity(LIMBS * 2 + 4);
+  let mut ops = Vec::with_capacity(LIMBS * 2 + 8);
   // XOR each limb pair; if equal, all XORs are zero.
   ops.push(MicroOp::Xor128 {
     dst: scratch(0),
@@ -842,11 +847,22 @@ fn compile_eq() -> Compiled {
       b: scratch(2),
     });
   }
-  // scratch[0] == 0 iff equal.  Advice provides the boolean result.
+  // scratch[0] == 0 iff equal.  Advice provides the boolean result + inverse.
   ops.push(MicroOp::AdviceLoad { dst: scratch(2) });
   ops.push(MicroOp::RangeCheck {
     r: scratch(2),
     bits: 1,
+  });
+  ops.push(MicroOp::AdviceLoad { dst: scratch(3) });
+  // Verify: acc * inv + result + 1 = 0, acc * result = 0.
+  ops.push(MicroOp::CheckZeroInv {
+    acc: scratch(0),
+    inv: scratch(3),
+    result: scratch(2),
+  });
+  ops.push(MicroOp::CheckZeroMul {
+    acc: scratch(0),
+    result: scratch(2),
   });
   ops.push(MicroOp::Mov {
     dst: limb(0, 0),
@@ -860,7 +876,7 @@ fn compile_eq() -> Compiled {
   }
   Compiled {
     ops,
-    advice_count: 1,
+    advice_count: 2,
   }
 }
 
@@ -1432,7 +1448,7 @@ mod tests {
     for op in env_ops {
       let c = compile(op).unwrap();
       assert_eq!(c.advice_count, LIMBS, "opcode 0x{op:02x}");
-      assert_eq!(c.ops.len(), LIMBS * 2, "opcode 0x{op:02x}"); // load + mov
+      assert_eq!(c.ops.len(), LIMBS + 1, "opcode 0x{op:02x}"); // Advice2 + mov×2
     }
   }
 

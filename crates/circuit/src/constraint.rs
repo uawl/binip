@@ -26,8 +26,8 @@ pub enum ConstraintError {
   UnknownTag(u32),
 }
 
-/// Total number of opcode tags this module handles (0..=28).
-pub const NUM_TAGS: u32 = 29;
+/// Total number of opcode tags this module handles (0..=32).
+pub const NUM_TAGS: u32 = 33;
 
 /// Evaluate the constraint polynomial for opcode `tag` on a row whose
 /// columns are given as 8 [`GF2_128`] values (same order as [`encoder::COL_*`]).
@@ -204,6 +204,29 @@ pub fn eval_constraint(tag: u32, cols: &[GF2_128; 8]) -> Result<GF2_128, Constra
     // ── EVM Transient Storage (tag 28): TStore ───────────────────────────
     // Write-only transient storage, no local constraint.
     28 => Ok(GF2_128::zero()),
+    // ── Wide advice (tag 29): Advice2 ─────────────────────────────
+    // 2 values loaded from advice tape. No algebraic constraint;
+    // values are verified by downstream Check* operations.
+    29 => Ok(GF2_128::zero()),
+
+    // ── Wide advice (tag 30): Advice4 ─────────────────────────────
+    // 4 values loaded from advice tape. No algebraic constraint;
+    // values are verified by downstream Check* operations.
+    30 => Ok(GF2_128::zero()),
+
+    // ── Zero-check (tag 31): CheckZeroInv ────────────────────────
+    // acc * inv + result + 1 = 0  in GF(2^128).
+    // Pure field-algebraic constraint (no LUT needed).
+    31 => {
+      let one = GF2_128::from(1u64);
+      Ok(in0 * in1 + out + one)
+    }
+
+    // ── Zero-check (tag 32): CheckZeroMul ────────────────────────
+    // acc * result = 0  in GF(2^128).
+    // GF(2^128) is a field: no zero divisors, so this forces
+    // acc = 0 or result = 0.
+    32 => Ok(in0 * in1),
 
     _ => Err(ConstraintError::UnknownTag(tag)),
   }
@@ -237,59 +260,6 @@ pub fn selector(tag: u32, beta: GF2_128) -> GF2_128 {
 /// C(row, β) = sel(op, β) · constraint(op, cols)
 /// ```
 ///
-/// The full circuit constraint polynomial is then:
-///
-/// ```text
-/// Σ_{i ∈ rows}  eq(r, i) · C(row_i, β) = 0
-/// ```
-///
-/// which is checked via sumcheck.
-pub fn batched_constraint(cols: &[GF2_128; 8], beta: GF2_128) -> Result<GF2_128, ConstraintError> {
-  // Extract the tag from the op column (low bits as u32).
-  let tag = {
-    // GF2_128::from(x) embeds x in the low 64 bits.
-    // We stored op as a u32, so the tag is recoverable.
-    // For evaluation purposes the caller passes the tag separately via cols[1].
-    // Here we just read the tag from the u32 that was embedded.
-    let op_val = cols[1];
-    // We need to try each tag and find which one matches.
-    // Instead, the caller can pass the tag externally.
-    // For now, iterate over possible tags and use the selector.
-    //
-    // Actually: the batched constraint is evaluated as:
-    //   Σ_t  sel(t, β) · constraint(t, cols) · δ(op, t)
-    // where δ(op, t)=1 iff op==t.
-    //
-    // But in the MLE formulation, the selector polynomial handles the
-    // per-row selection automatically.  We evaluate all constraints and
-    // let the selector zero out the wrong ones.
-    //
-    // Simplified: Σ_t constraint(t, cols) · ∏_{j≠t}(op − j)
-    let _ = op_val;
-    0 // placeholder — see below
-  };
-  let _ = tag;
-
-  // The batched constraint sums over all tags:
-  //   Σ_t  constraint(t, cols) · ∏_{j≠t} (cols[1] - j)
-  let op_val = cols[1];
-  let mut sum = GF2_128::zero();
-  for t in 0..NUM_TAGS {
-    let c = eval_constraint(t, cols)?;
-    // Selector for tag t evaluated at β = op_val:
-    //   ∏_{j≠t} (op_val − j)  where − = + in char 2
-    let mut sel = GF2_128::one();
-    for j in 0..NUM_TAGS {
-      if j != t {
-        sel = sel * (op_val + GF2_128::from(j as u64));
-      }
-    }
-    sum = sum + c * sel;
-  }
-  let _ = beta;
-  Ok(sum)
-}
-
 /// Evaluate the batched constraint using a known tag (avoids selector iteration).
 ///
 /// This is more efficient when the tag is known (e.g. during trace encoding).
@@ -459,5 +429,76 @@ mod tests {
     // when β = t because none of the (β−j) factors are zero (j ≠ t).
     let beta = f(5);
     assert!(!selector(5, beta).is_zero());
+  }
+
+  // ── L-1 coverage gap: AdviceLoad (tag 11) accepts arbitrary values ──
+  //
+  // Comparison opcodes (LT, GT, EQ, ISZERO) use AdviceLoad to inject
+  // the boolean result.  The circuit constraint for tag 11 is:
+  //   `out + advice = 0`  (i.e., out == advice)
+  // Combined with a 1-bit RangeCheck (tag 15), this only ensures the
+  // result is 0 or 1 — NOT that it is the correct comparison result.
+  //
+  // These tests document that a malicious prover can inject wrong
+  // comparison results that still satisfy all circuit constraints.
+  // Correctness currently depends on `consistency_check`.
+
+  #[test]
+  fn advice_load_accepts_any_value() {
+    // Tag 11: out + advice = 0.  Any (out, advice) pair with out == advice passes.
+    let mut cols_true = zero_cols();
+    cols_true[5] = f(1); // out = 1
+    cols_true[7] = f(1); // advice = 1
+    assert_eq!(eval_constraint(11, &cols_true).unwrap(), GF2_128::zero());
+
+    let mut cols_false = zero_cols();
+    cols_false[5] = f(0); // out = 0
+    cols_false[7] = f(0); // advice = 0
+    assert_eq!(eval_constraint(11, &cols_false).unwrap(), GF2_128::zero());
+
+    // Both pass — circuit cannot distinguish correct from incorrect advice.
+  }
+
+  #[test]
+  fn range_check_1bit_accepts_both_values() {
+    // Tag 15: out + in0 = 0.  For 1-bit range check, both 0 and 1 pass.
+    let mut cols_zero = zero_cols();
+    cols_zero[2] = f(0); // in0 = 0
+    cols_zero[5] = f(0); // out = 0
+    assert_eq!(eval_constraint(15, &cols_zero).unwrap(), GF2_128::zero());
+
+    let mut cols_one = zero_cols();
+    cols_one[2] = f(1); // in0 = 1
+    cols_one[5] = f(1); // out = 1
+    assert_eq!(eval_constraint(15, &cols_one).unwrap(), GF2_128::zero());
+  }
+
+  #[test]
+  fn comparison_gap_wrong_iszero_passes_constraints() {
+    // ISZERO(5) should return 0, but a malicious prover claims 1.
+    // AdviceLoad row: out=1, advice=1 → tag 11 passes.
+    // RangeCheck row: in0=1, out=1 → tag 15 passes.
+    // Mov row: in0=1, out=1 → tag 10 passes.
+    // The circuit accepts the wrong result.
+    for wrong_result in [0u64, 1u64] {
+      let v = f(wrong_result);
+      // AdviceLoad
+      let mut adv = zero_cols();
+      adv[5] = v;
+      adv[7] = v;
+      assert_eq!(eval_constraint(11, &adv).unwrap(), GF2_128::zero());
+      // RangeCheck (1-bit)
+      let mut rc = zero_cols();
+      rc[2] = v;
+      rc[5] = v;
+      assert_eq!(eval_constraint(15, &rc).unwrap(), GF2_128::zero());
+      // Mov
+      let mut mv = zero_cols();
+      mv[2] = v;
+      mv[5] = v;
+      assert_eq!(eval_constraint(10, &mv).unwrap(), GF2_128::zero());
+    }
+    // Both wrong_result=0 and wrong_result=1 pass all constraints.
+    // Only one is correct for a given input, but the circuit cannot tell.
   }
 }
