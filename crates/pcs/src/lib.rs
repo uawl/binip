@@ -600,29 +600,45 @@ pub struct BatchOpenQuery {
   pub point: Vec<GF2_128>,
 }
 
-/// Data revealed for one batch query at one fold round.
+/// Shared round-0 query data at one sampled position.
+///
+/// At round 0 the batch Merkle tree commits all entries' pairs together
+/// as "super-pair" leaves.  The verifier needs every entry's pair to
+/// reconstruct the leaf hash.
 #[derive(Clone, Debug)]
-pub struct BatchRoundQuery {
-  /// All entries' left-right pairs at this position.
-  /// Length = n_entries. Each element is `(left, right)`.
+pub struct BatchRound0Query {
+  /// All entries' pairs at this position.  Length = n_entries.
   pub pairs: Vec<(GF2_128, GF2_128)>,
-  /// Merkle proof for the super-leaf hash.
+  /// Merkle proof in the batch commitment tree.
   pub merkle_proof: MerkleProof,
 }
 
-/// A batch query path through all fold rounds.
+/// Per-query evaluation proof.
+///
+/// Each query folds its entry's evaluations with the query's own evaluation
+/// point (like single-point PCS), producing per-query intermediate Merkle
+/// trees for rounds 1 through n-1.
 #[derive(Clone, Debug)]
-pub struct BatchQueryPath {
-  pub rounds: Vec<BatchRoundQuery>,
+pub struct BatchEvalProof {
+  /// Intermediate Merkle roots for this query's fold chain.
+  /// `round_roots[j]` is the root for the entry's table after `j+1` folds.
+  /// Length = n_vars − 1.
+  pub round_roots: Vec<Hash>,
+  /// Per-position inner-round data.
+  /// `inner_paths[pos][j]` gives the pair + Merkle proof for round `j+1`
+  /// at sampled position `pos`.
+  /// Outer length = number of sampled positions.
+  /// Inner length = n_vars − 1.
+  pub inner_paths: Vec<Vec<RoundQuery>>,
 }
 
 /// Batch opening proof.
 #[derive(Clone, Debug)]
 pub struct BatchOpenProof {
-  /// Merkle roots of intermediate fold rounds (length = n_vars - 1).
-  pub round_roots: Vec<Hash>,
-  /// One query path per queried position (shared across all entries).
-  pub query_paths: Vec<BatchQueryPath>,
+  /// Shared round-0 data (one per sampled position).
+  pub round0: Vec<BatchRound0Query>,
+  /// Per-query evaluation proofs.
+  pub eval_proofs: Vec<BatchEvalProof>,
 }
 
 // ─── batch helpers ───────────────────────────────────────────────────────────
@@ -725,6 +741,10 @@ impl BatchBaseFold {
 
 /// Open multiple (entry, point) queries against the same batch commitment.
 ///
+/// Each query folds the entry's evaluations with its own evaluation point
+/// (like single-point BaseFold), producing per-query intermediate Merkle
+/// trees.  Round 0 uses the shared batch commitment tree.
+///
 /// Returns `(claims, proof)`.
 pub fn batch_open<T: Transcript>(
   state: &BatchPcsState,
@@ -734,7 +754,7 @@ pub fn batch_open<T: Transcript>(
   let n = state.params.n_vars as usize;
   let n_entries = state.entry_evals.len();
 
-  // Compute claims via direct MLE evaluation.
+  // 1. Compute claims and absorb.
   let mut claims = Vec::with_capacity(queries.len());
   for q in queries {
     assert!(q.entry < n_entries);
@@ -744,95 +764,112 @@ pub fn batch_open<T: Transcript>(
     transcript.absorb_field(claim);
   }
 
-  // Build all intermediate tables (per-entry).
-  // tables[round][entry] = folded table at that round for that entry.
-  //
-  // We need per-query fold challenges, but standard BaseFold uses the
-  // committed MLE's evaluation point — not interactive challenges.
-  // For batch with multiple points, we use a single shared folding
-  // sequence derived from the transcript.
-  //
-  // Squeeze one shared fold challenge per round.
-  let fold_challenges: Vec<GF2_128> = (0..n)
-    .map(|_| transcript.squeeze_challenge())
-    .collect();
+  // 2. Per-query fold chains using each query's evaluation point.
+  //    tables_per_q[qi][round] = folded table after `round` folds.
+  //    trees_per_q[qi][j]     = Merkle tree for tables_per_q[qi][j+1].
+  //    roots_per_q[qi][j]     = root of trees_per_q[qi][j].
+  let mut tables_per_q: Vec<Vec<Vec<GF2_128>>> = Vec::with_capacity(queries.len());
+  let mut trees_per_q: Vec<Vec<merkle::MerkleTree>> = Vec::with_capacity(queries.len());
 
-  let mut tables: Vec<Vec<Vec<GF2_128>>> = Vec::with_capacity(n + 1);
-  tables.push(state.entry_evals.clone());
+  for (qi, q) in queries.iter().enumerate() {
+    let entry_evals = &state.entry_evals[q.entry];
+    let point = &q.point;
 
-  let mut round_roots: Vec<Hash> = Vec::with_capacity(n.saturating_sub(1));
-  let mut round_trees: Vec<merkle::MerkleTree> = Vec::with_capacity(n.saturating_sub(1));
+    let mut tables: Vec<Vec<GF2_128>> = Vec::with_capacity(n + 1);
+    tables.push(entry_evals.clone());
 
-  for i in 0..n {
-    let prev = &tables[i];
-    let folded: Vec<Vec<GF2_128>> = prev
-      .iter()
-      .map(|t| fold_table(t, fold_challenges[i]))
-      .collect();
+    let mut round_trees = Vec::with_capacity(n.saturating_sub(1));
 
-    if i < n - 1 {
-      let tree_i = build_batch_tree(&folded);
-      let root_i = tree_i.root();
-      round_roots.push(root_i);
-      transcript.absorb_bytes(&root_i);
-      round_trees.push(tree_i);
+    for i in 0..n {
+      let folded = fold_table(&tables[i], point[n - 1 - i]);
+      if i < n - 1 {
+        let tree_i = build_pair_tree(&folded);
+        let root_i = tree_i.root();
+        transcript.absorb_bytes(&root_i);
+        round_trees.push(tree_i);
+      }
+      tables.push(folded);
     }
-    tables.push(folded);
+
+    debug_assert_eq!(tables[n][0], claims[qi]);
+
+    tables_per_q.push(tables);
+    trees_per_q.push(round_trees);
   }
 
-  // Squeeze query positions.
+  // 3. Squeeze shared query positions (deduplicated).
   let n_pairs = 1usize << (n - 1);
-  let query_indices: Vec<usize> = (0..state.params.n_queries)
-    .map(|_| (transcript.squeeze_challenge().lo as usize) % n_pairs)
-    .collect();
+  let effective_queries = state.params.n_queries.min(n_pairs);
+  let mut seen = std::collections::HashSet::with_capacity(effective_queries);
+  let mut positions = Vec::with_capacity(effective_queries);
+  while positions.len() < effective_queries {
+    let q = (transcript.squeeze_challenge().lo as usize) % n_pairs;
+    if seen.insert(q) {
+      positions.push(q);
+    }
+  }
 
-  // Build query paths.
-  let query_paths: Vec<BatchQueryPath> = query_indices
+  // 4. Build round-0 proofs (shared batch tree).
+  let round0: Vec<BatchRound0Query> = positions
     .iter()
     .map(|&q0| {
-      let mut pair_idx = q0;
-      let mut rounds = Vec::with_capacity(n);
-
-      for i in 0..n {
-        let pairs: Vec<(GF2_128, GF2_128)> = (0..n_entries)
-          .map(|e| {
-            let t = &tables[i][e];
-            (t[2 * pair_idx], t[2 * pair_idx + 1])
-          })
-          .collect();
-
-        let tree_ref = if i == 0 {
-          &state.tree
-        } else {
-          &round_trees[i - 1]
-        };
-        let merkle_proof = tree_ref.prove(pair_idx);
-
-        rounds.push(BatchRoundQuery {
-          pairs,
-          merkle_proof,
-        });
-        pair_idx /= 2;
+      let pairs: Vec<(GF2_128, GF2_128)> = (0..n_entries)
+        .map(|e| {
+          let t = &state.entry_evals[e];
+          (t[2 * q0], t[2 * q0 + 1])
+        })
+        .collect();
+      let merkle_proof = state.tree.prove(q0);
+      BatchRound0Query {
+        pairs,
+        merkle_proof,
       }
-      BatchQueryPath { rounds }
     })
     .collect();
 
-  (
-    claims,
-    BatchOpenProof {
-      round_roots,
-      query_paths,
-    },
-  )
+  // 5. Build per-query eval proofs (rounds 1..n-1).
+  let eval_proofs: Vec<BatchEvalProof> = (0..queries.len())
+    .map(|qi| {
+      let round_roots: Vec<Hash> = trees_per_q[qi].iter().map(|t| t.root()).collect();
+
+      let inner_paths: Vec<Vec<RoundQuery>> = positions
+        .iter()
+        .map(|&q0| {
+          let mut pair_idx = q0 / 2; // After round 0.
+          let mut rounds = Vec::with_capacity(n.saturating_sub(1));
+          for j in 1..n {
+            let table = &tables_per_q[qi][j];
+            let left = table[2 * pair_idx];
+            let right = table[2 * pair_idx + 1];
+            let merkle_proof = trees_per_q[qi][j - 1].prove(pair_idx);
+            rounds.push(RoundQuery {
+              left,
+              right,
+              merkle_proof,
+            });
+            pair_idx /= 2;
+          }
+          rounds
+        })
+        .collect();
+
+      BatchEvalProof {
+        round_roots,
+        inner_paths,
+      }
+    })
+    .collect();
+
+  (claims, BatchOpenProof { round0, eval_proofs })
 }
 
 /// Parallel variant of [`batch_open`].
 ///
-/// Same three-phase structure as [`open_par`]:
-/// 1. Fold rounds — sequential across rounds, parallel across entries + within fold.
-/// 2. Batch Merkle tree builds — all (n-1) trees built concurrently.
-/// 3. Query path construction — parallel across queries.
+/// Phases:
+/// 1. Per-query fold chains — parallel across queries, each fold is sequential.
+/// 2. Per-query Merkle tree builds — parallel across queries × rounds.
+/// 3. Absorb roots sequentially, squeeze positions.
+/// 4. Build query paths — parallel across positions.
 pub fn batch_open_par<T: Transcript>(
   state: &BatchPcsState,
   queries: &[BatchOpenQuery],
@@ -841,7 +878,7 @@ pub fn batch_open_par<T: Transcript>(
   let n = state.params.n_vars as usize;
   let n_entries = state.entry_evals.len();
 
-  // Claims via direct MLE evaluation.
+  // 1. Compute claims.
   let mut claims = Vec::with_capacity(queries.len());
   for q in queries {
     assert!(q.entry < n_entries);
@@ -851,120 +888,125 @@ pub fn batch_open_par<T: Transcript>(
     transcript.absorb_field(claim);
   }
 
-  let fold_challenges: Vec<GF2_128> = (0..n)
-    .map(|_| transcript.squeeze_challenge())
-    .collect();
-
-  // ── Phase 1: fold all entries at each round ───────────────────────────
-  // Each round depends on the previous, but entries fold in parallel.
-  let mut fold_results: Vec<Vec<Vec<GF2_128>>> = Vec::with_capacity(n);
-  {
-    let first: Vec<Vec<GF2_128>> = state
-      .entry_evals
-      .par_iter()
-      .map(|t| {
-        if t.len() >= 2048 {
-          fold_table_par(t, fold_challenges[0])
-        } else {
-          fold_table(t, fold_challenges[0])
-        }
-      })
-      .collect();
-    fold_results.push(first);
-    for i in 1..n {
-      let prev = &fold_results[i - 1];
-      let folded: Vec<Vec<GF2_128>> = prev
-        .par_iter()
-        .map(|t| {
-          if t.len() >= 2048 {
-            fold_table_par(t, fold_challenges[i])
-          } else {
-            fold_table(t, fold_challenges[i])
-          }
-        })
-        .collect();
-      fold_results.push(folded);
-    }
-  }
-
-  // ── Phase 2: build intermediate batch Merkle trees in parallel ────────
-  let round_trees: Vec<merkle::MerkleTree> = if n > 1 {
-    (0..n - 1)
-      .into_par_iter()
-      .map(|j| {
-        let entries = &fold_results[j];
-        if entries[0].len() >= 2048 {
-          build_batch_tree_par(entries)
-        } else {
-          build_batch_tree(entries)
-        }
-      })
-      .collect()
-  } else {
-    Vec::new()
-  };
-
-  // ── Phase 3: absorb roots + squeeze queries ───────────────────────────
-  let round_roots: Vec<Hash> = round_trees.iter().map(|t| t.root()).collect();
-  for &root in &round_roots {
-    transcript.absorb_bytes(&root);
-  }
-
-  let n_pairs = 1usize << (n - 1);
-  let query_indices: Vec<usize> = (0..state.params.n_queries)
-    .map(|_| (transcript.squeeze_challenge().lo as usize) % n_pairs)
-    .collect();
-
-  // ── Phase 4: build query paths in parallel ────────────────────────────
-  let query_paths: Vec<BatchQueryPath> = query_indices
+  // ── Phase 1: per-query fold chains (parallel across queries) ──────────
+  let tables_per_q: Vec<Vec<Vec<GF2_128>>> = queries
     .par_iter()
-    .map(|&q0| {
-      let mut pair_idx = q0;
-      let mut rounds = Vec::with_capacity(n);
-
+    .map(|q| {
+      let entry_evals = &state.entry_evals[q.entry];
+      let point = &q.point;
+      let mut tables: Vec<Vec<GF2_128>> = Vec::with_capacity(n + 1);
+      tables.push(entry_evals.clone());
       for i in 0..n {
-        let entry_tables: &[Vec<GF2_128>] = if i == 0 {
-          &state.entry_evals
+        let folded = if tables[i].len() >= 2048 {
+          fold_table_par(&tables[i], point[n - 1 - i])
         } else {
-          &fold_results[i - 1]
+          fold_table(&tables[i], point[n - 1 - i])
         };
-
-        let pairs: Vec<(GF2_128, GF2_128)> = (0..n_entries)
-          .map(|e| {
-            let t = &entry_tables[e];
-            (t[2 * pair_idx], t[2 * pair_idx + 1])
-          })
-          .collect();
-
-        let tree_ref = if i == 0 {
-          &state.tree
-        } else {
-          &round_trees[i - 1]
-        };
-        let merkle_proof = tree_ref.prove(pair_idx);
-
-        rounds.push(BatchRoundQuery {
-          pairs,
-          merkle_proof,
-        });
-        pair_idx /= 2;
+        tables.push(folded);
       }
-      BatchQueryPath { rounds }
+      tables
     })
     .collect();
 
-  (
-    claims,
-    BatchOpenProof {
-      round_roots,
-      query_paths,
-    },
-  )
+  // ── Phase 2: build per-query intermediate Merkle trees ────────────────
+  // trees_per_q[qi][j] = Merkle tree for tables_per_q[qi][j+1].
+  let trees_per_q: Vec<Vec<merkle::MerkleTree>> = tables_per_q
+    .par_iter()
+    .map(|tables| {
+      if n > 1 {
+        (1..n)
+          .map(|j| {
+            let t = &tables[j];
+            if t.len() >= 2048 {
+              build_pair_tree_par(t)
+            } else {
+              build_pair_tree(t)
+            }
+          })
+          .collect()
+      } else {
+        Vec::new()
+      }
+    })
+    .collect();
+
+  // ── Phase 3: absorb roots in transcript order, squeeze positions ──────
+  for qi in 0..queries.len() {
+    for tree in &trees_per_q[qi] {
+      transcript.absorb_bytes(&tree.root());
+    }
+  }
+
+  let n_pairs = 1usize << (n - 1);
+  let effective_queries = state.params.n_queries.min(n_pairs);
+  let mut seen = std::collections::HashSet::with_capacity(effective_queries);
+  let mut positions = Vec::with_capacity(effective_queries);
+  while positions.len() < effective_queries {
+    let q = (transcript.squeeze_challenge().lo as usize) % n_pairs;
+    if seen.insert(q) {
+      positions.push(q);
+    }
+  }
+
+  // ── Phase 4: build proof paths (parallel across positions) ────────────
+  let round0: Vec<BatchRound0Query> = positions
+    .par_iter()
+    .map(|&q0| {
+      let pairs: Vec<(GF2_128, GF2_128)> = (0..n_entries)
+        .map(|e| {
+          let t = &state.entry_evals[e];
+          (t[2 * q0], t[2 * q0 + 1])
+        })
+        .collect();
+      let merkle_proof = state.tree.prove(q0);
+      BatchRound0Query {
+        pairs,
+        merkle_proof,
+      }
+    })
+    .collect();
+
+  let eval_proofs: Vec<BatchEvalProof> = (0..queries.len())
+    .map(|qi| {
+      let round_roots: Vec<Hash> = trees_per_q[qi].iter().map(|t| t.root()).collect();
+      let inner_paths: Vec<Vec<RoundQuery>> = positions
+        .par_iter()
+        .map(|&q0| {
+          let mut pair_idx = q0 / 2;
+          let mut rounds = Vec::with_capacity(n.saturating_sub(1));
+          for j in 1..n {
+            let table = &tables_per_q[qi][j];
+            let left = table[2 * pair_idx];
+            let right = table[2 * pair_idx + 1];
+            let merkle_proof = trees_per_q[qi][j - 1].prove(pair_idx);
+            rounds.push(RoundQuery {
+              left,
+              right,
+              merkle_proof,
+            });
+            pair_idx /= 2;
+          }
+          rounds
+        })
+        .collect();
+      BatchEvalProof {
+        round_roots,
+        inner_paths,
+      }
+    })
+    .collect();
+
+  (claims, BatchOpenProof { round0, eval_proofs })
 }
 
 // ─── batch verify ────────────────────────────────────────────────────────────
 
 /// Verify a batch opening proof.
+///
+/// Each query is verified with its own fold chain using the query's
+/// evaluation point, exactly like single-point BaseFold.  Round 0 uses
+/// the shared batch commitment tree; rounds 1+ use per-query intermediate
+/// trees whose roots are absorbed into the transcript.
 pub fn batch_verify<T: Transcript>(
   commitment: &BatchCommitment,
   queries: &[BatchOpenQuery],
@@ -979,10 +1021,7 @@ pub fn batch_verify<T: Transcript>(
   if queries.len() != claims.len() {
     return false;
   }
-  if proof.round_roots.len() != n.saturating_sub(1) {
-    return false;
-  }
-  if proof.query_paths.len() != params.n_queries {
+  if proof.eval_proofs.len() != queries.len() {
     return false;
   }
 
@@ -991,164 +1030,141 @@ pub fn batch_verify<T: Transcript>(
     transcript.absorb_field(c);
   }
 
-  // Squeeze shared fold challenges.
-  let fold_challenges: Vec<GF2_128> = (0..n)
-    .map(|_| transcript.squeeze_challenge())
-    .collect();
-
-  // Absorb round roots.
-  for root in &proof.round_roots {
-    transcript.absorb_bytes(root);
+  // Absorb per-query round roots (must match prover order).
+  for ep in &proof.eval_proofs {
+    if ep.round_roots.len() != n.saturating_sub(1) {
+      return false;
+    }
+    for root in &ep.round_roots {
+      transcript.absorb_bytes(root);
+    }
   }
 
-  // Re-squeeze query positions.
-  let n_pairs = 1usize << (n - 1);
-  let query_indices: Vec<usize> = (0..params.n_queries)
-    .map(|_| (transcript.squeeze_challenge().lo as usize) % n_pairs)
-    .collect();
+  // Re-squeeze shared query positions (deduplicated).
+  let n_pairs_round0 = 1usize << (n - 1);
+  let effective_queries = params.n_queries.min(n_pairs_round0);
+  let mut seen = std::collections::HashSet::with_capacity(effective_queries);
+  let mut positions = Vec::with_capacity(effective_queries);
+  while positions.len() < effective_queries {
+    let q = (transcript.squeeze_challenge().lo as usize) % n_pairs_round0;
+    if seen.insert(q) {
+      positions.push(q);
+    }
+  }
 
-  // Verify each query path.
-  for (qi, &q0) in query_indices.iter().enumerate() {
-    let path = &proof.query_paths[qi];
-    if path.rounds.len() != n {
+  if proof.round0.len() != positions.len() {
+    return false;
+  }
+
+  // Verify each query at each sampled position.
+  for (pos_idx, &q0) in positions.iter().enumerate() {
+    let r0data = &proof.round0[pos_idx];
+
+    // Validate round-0 data length.
+    if r0data.pairs.len() != n_entries {
       return false;
     }
 
-    let mut pair_idx = q0;
+    // Verify batch Merkle proof at round 0.
+    let leaf = {
+      let mut h = blake3::Hasher::new();
+      h.update(b"binip:pcs:batch:");
+      for &(l, r) in &r0data.pairs {
+        h.update(&l.lo.to_le_bytes());
+        h.update(&l.hi.to_le_bytes());
+        h.update(&r.lo.to_le_bytes());
+        h.update(&r.hi.to_le_bytes());
+      }
+      *h.finalize().as_bytes()
+    };
+    let tree_n0 = n_pairs_round0.next_power_of_two().max(1);
+    if !r0data.merkle_proof.verify(leaf, commitment.root, tree_n0) {
+      return false;
+    }
 
-    for i in 0..n {
-      let brq = &path.rounds[i];
-      if brq.pairs.len() != n_entries {
+    // For every query, verify the fold chain starting from round 0.
+    for (qi, q) in queries.iter().enumerate() {
+      if q.point.len() != n || q.entry >= n_entries {
+        return false;
+      }
+      let ep = &proof.eval_proofs[qi];
+      if ep.inner_paths.len() != positions.len() {
+        return false;
+      }
+      let inner_path = &ep.inner_paths[pos_idx];
+      if inner_path.len() != n.saturating_sub(1) {
         return false;
       }
 
-      // Verify Merkle proof for the super-pair.
-      let root = if i == 0 {
-        commitment.root
-      } else {
-        proof.round_roots[i - 1]
-      };
+      let point = &q.point;
+      let entry = q.entry;
+      let mut pair_idx = q0;
 
-      let leaf = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"binip:pcs:batch:");
-        for &(l, r) in &brq.pairs {
-          h.update(&l.lo.to_le_bytes());
-          h.update(&l.hi.to_le_bytes());
-          h.update(&r.lo.to_le_bytes());
-          h.update(&r.hi.to_le_bytes());
+      // Round 0: extract entry's pair from the batch super-leaf.
+      let (left0, right0) = r0data.pairs[entry];
+      let ri0 = point[n - 1];
+      let folded0 = left0 * (GF2_128::one() + ri0) + right0 * ri0;
+
+      if n == 1 {
+        // Single variable: fold result is the evaluation.
+        if folded0 != claims[qi] {
+          return false;
         }
-        *h.finalize().as_bytes()
-      };
-
-      let n_pairs_round = 1usize << (n - 1 - i);
-      let tree_n = n_pairs_round.next_power_of_two().max(1);
-      if !brq.merkle_proof.verify(leaf, root, tree_n) {
-        return false;
+        continue;
       }
 
-      // Fold consistency: check that each entry's fold result appears
-      // in the correct position of the next round.
-      let one_plus_r = GF2_128::one() + fold_challenges[i];
-      for e in 0..n_entries {
-        let (left, right) = brq.pairs[e];
-        let folded = left * one_plus_r + right * fold_challenges[i];
+      // Check fold consistency with round 1.
+      let next_rq = &inner_path[0];
+      let expected = if pair_idx % 2 == 0 {
+        next_rq.left
+      } else {
+        next_rq.right
+      };
+      if folded0 != expected {
+        return false;
+      }
+      pair_idx /= 2;
 
-        if i < n - 1 {
-          let next_brq = &path.rounds[i + 1];
+      // Rounds 1..n-1: per-query intermediate trees.
+      for j in 1..n {
+        let rq = &inner_path[j - 1];
+
+        // Verify Merkle proof against this query's round root.
+        let root_j = ep.round_roots[j - 1];
+        let leaf_j = hash_pair(rq.left, rq.right);
+        let n_pairs_j = 1usize << (n - 1 - j);
+        let tree_n_j = n_pairs_j.next_power_of_two().max(1);
+        if !rq.merkle_proof.verify(leaf_j, root_j, tree_n_j) {
+          return false;
+        }
+
+        // Fold.
+        let ri = point[n - 1 - j];
+        let folded = rq.left * (GF2_128::one() + ri) + rq.right * ri;
+
+        if j < n - 1 {
+          // Fold consistency with next round.
+          let next_rq = &inner_path[j];
           let expected = if pair_idx % 2 == 0 {
-            next_brq.pairs[e].0
+            next_rq.left
           } else {
-            next_brq.pairs[e].1
+            next_rq.right
           };
           if folded != expected {
             return false;
           }
+        } else {
+          // Last round: fold result must equal the claim.
+          if folded != claims[qi] {
+            return false;
+          }
         }
-        // (Last round fold consistency is checked below per-query.)
+
+        pair_idx /= 2;
       }
-
-      pair_idx /= 2;
     }
   }
 
-  // Verify final evaluations match claims.
-  // Each query asks for entry `q.entry` at point `q.point`.
-  // The batch uses shared fold challenges, so the prover provides the
-  // direct MLE evaluation claim. We verify the claim by checking that
-  // the claim equals the evaluation of the committed polynomial at the
-  // query point. The fold-chain verification above ensures the
-  // Merkle-committed data is consistent with shared fold challenges;
-  // the claim is verified via the eq-based inner-product below.
-  for (_qi, q) in queries.iter().enumerate() {
-    if q.point.len() != n || q.entry >= n_entries {
-      return false;
-    }
-    // Verify claim against the fold chain.
-    // From the first round's pair for this query, compute the fold chain
-    // using the *query's* evaluation point to derive the expected eval.
-    // However, the fold chain uses shared fold_challenges, not the query
-    // point. So we need a different check.
-    //
-    // Standard approach: the fold chain proves that the committed poly
-    // has certain evaluations. The claim `P(point)` is then checked via
-    // an inner product: `claim = Σ_x eq(point, x) · P(x)`.
-    //
-    // With the fold chain, we know the committed poly passes the
-    // proximity test. The claim is absorbed into the transcript and
-    // contributes to challenge derivation. A cheating prover who changes
-    // the claim will cause transcript divergence → query indices change.
-    //
-    // For full binding, we verify that the fold chain with shared
-    // challenges produces a value consistent with the per-query basis
-    // decomposition.
-    //
-    // Concretely: after folding by shared challenges c_0..c_{n-1}, the
-    // result for entry e is: Σ_x eq(c, x) · P_e(x).
-    //
-    // The prover claims P_e(point_e) = claims[qi]. The verifier needs to
-    // check this. We use the relationship:
-    //   fold_result_e = Σ_x eq(c, x) · P_e(x)
-    // The prover also claims P_e(point) = claims[qi].
-    // Both are linear functionals of the same committed polynomial.
-    // If the Merkle tree is binding and the fold chain is verified,
-    // the fold_result is honestly computed.
-    //
-    // To connect fold_result to the point-evaluation claim, we use the basis
-    // change: we check that the inner product of eq(point, ·) with the
-    // committed evaluations equals the claim. But we don't have the
-    // evaluations — only the fold chain.
-    //
-    // Alternative: verify the fold chain for each query individually
-    // using its own point. Let's do that.
-  }
-
-  // The fold chain above uses shared fold_challenges. For each query
-  // with its own point, the prover claims the evaluation at that point.
-  // We additionally need to verify that the first-round revealed pairs
-  // fold correctly with the query's point to produce the claim.
-  //
-  // For each query index, the fold chain reveals all `2^n` relevant
-  // evaluations (via the n revealed pairs). From these, we can directly
-  // compute the MLE evaluation at any point.
-  //
-  // Actually, only `n` pairs are revealed (one per round), so we have
-  // `2n` elements, not `2^n`. That's not enough to reconstruct the full
-  // polynomial.
-  //
-  // The correct approach for batch BaseFold with multiple eval points:
-  // 1. The fold chain with shared challenges proves the polynomial is
-  //    "close to" the committed one (proximity test).
-  // 2. For evaluation binding, we run a separate per-query sumcheck
-  //    or inner-product argument.
-  //
-  // For simplicity and correctness, let's use a simpler batch scheme:
-  // each query does its own fold chain with its own evaluation point.
-  // This is less amortized but fully correct.
-  //
-  // HOWEVER: looking at how batch is actually used in logup, there are
-  // only 2 entries with 2 different points. The cost difference is
-  // negligible. Let's implement the simple correct version.
   true
 }
 
@@ -1519,11 +1535,10 @@ mod tests {
     }];
     let (claims, mut proof) = batch_open(&state, &queries, &mut tp);
 
-    if let Some(path) = proof.query_paths.first_mut() {
-      if let Some(rq) = path.rounds.first_mut() {
-        if let Some(pair) = rq.pairs.first_mut() {
-          pair.0 = pair.0 + GF2_128::one();
-        }
+    // Tamper with the first round-0 query's first entry pair.
+    if let Some(r0q) = proof.round0.first_mut() {
+      if let Some(pair) = r0q.pairs.first_mut() {
+        pair.0 = pair.0 + GF2_128::one();
       }
     }
 

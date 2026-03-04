@@ -244,6 +244,20 @@ pub enum ConsistencyError {
     actual: U256,
   },
 
+  #[error("SLT result mismatch at pc={pc}: expected {expected}, got {actual}")]
+  SltMismatch {
+    pc: u32,
+    expected: U256,
+    actual: U256,
+  },
+
+  #[error("SGT result mismatch at pc={pc}: expected {expected}, got {actual}")]
+  SgtMismatch {
+    pc: u32,
+    expected: U256,
+    actual: U256,
+  },
+
   #[error(
     "SLOAD result mismatch at pc={pc}: storage[{key}] should be {expected}, \
      got {actual}"
@@ -705,6 +719,39 @@ fn check_opcode_semantics(op: u8, pre: &EvmState, post: &EvmState) -> Result<(),
       },
       "GT",
     )?,
+    opcode::SLT => check_binary(
+      pc,
+      pre,
+      post,
+      |a, b| {
+        // EVM signed comparison: two's complement via sign bit (bit 255)
+        let sign_a = a.bit(255);
+        let sign_b = b.bit(255);
+        let result = match (sign_a, sign_b) {
+          (true, false) => true,   // negative < positive
+          (false, true) => false,  // positive > negative
+          _ => a < b,              // same sign: unsigned order matches
+        };
+        if result { U256::from(1u64) } else { U256::ZERO }
+      },
+      "SLT",
+    )?,
+    opcode::SGT => check_binary(
+      pc,
+      pre,
+      post,
+      |a, b| {
+        let sign_a = a.bit(255);
+        let sign_b = b.bit(255);
+        let result = match (sign_a, sign_b) {
+          (false, true) => true,   // positive > negative
+          (true, false) => false,  // negative < positive
+          _ => a > b,              // same sign: unsigned order matches
+        };
+        if result { U256::from(1u64) } else { U256::ZERO }
+      },
+      "SGT",
+    )?,
     opcode::EQ => check_binary(
       pc,
       pre,
@@ -988,6 +1035,16 @@ fn check_binary(
             actual: result,
           },
           "EQ" => ConsistencyError::EqMismatch {
+            pc,
+            expected,
+            actual: result,
+          },
+          "SLT" => ConsistencyError::SltMismatch {
+            pc,
+            expected,
+            actual: result,
+          },
+          "SGT" => ConsistencyError::SgtMismatch {
             pc,
             expected,
             actual: result,

@@ -147,7 +147,7 @@ fn bench_trace(label: &str, steps: &[EvmStep]) {
   let (proof, params) = black_box(prove_cpu(black_box(&witness))).unwrap();
   let t2 = std::time::Instant::now();
 
-  let res = verify(&proof, &witness.tree, &params);
+  let res = verify(&proof, &params);
   let t3 = std::time::Instant::now();
 
   eprintln!("[{}] parallel {:.2?}  seq {:.2?}", label, t1 - t0, t2 - t1);

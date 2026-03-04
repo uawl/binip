@@ -16,7 +16,7 @@
 //! let steps = execute(&bytecode, &input)?;
 //! let witness = build_witness(&steps)?;
 //! let proof = prove_cpu(&witness)?;
-//! verify(&proof, &witness.tree)?;
+//! verify(&proof, &params)?;
 //! ```
 
 mod inspector;
@@ -25,7 +25,6 @@ mod witness;
 pub use inspector::{EvmStep, TracingInspector};
 pub use witness::{Witness, WitnessError, build_witness};
 
-use evm_types::ProofNode;
 use shard::RecursiveConfig;
 use stark::{Proof, StarkParams};
 
@@ -112,9 +111,9 @@ pub fn prove_cpu_par_with(
   Ok((proof, params))
 }
 
-/// Verify a ZK-STARK proof against a Proof Tree.
-pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(), E2eError> {
-  stark::verify(proof, tree, params)?;
+/// Verify a ZK-STARK proof (succinct — no proof tree needed).
+pub fn verify(proof: &Proof, params: &StarkParams) -> Result<(), E2eError> {
+  stark::verify(proof, params)?;
   Ok(())
 }
 
@@ -122,7 +121,7 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
 pub fn prove_and_verify(steps: &[EvmStep]) -> Result<Proof, E2eError> {
   let witness = build_witness(steps)?;
   let (proof, params) = prove_cpu(&witness)?;
-  verify(&proof, &witness.tree, &params)?;
+  verify(&proof, &params)?;
   Ok(proof)
 }
 
@@ -133,13 +132,14 @@ pub fn prove_and_verify_with(
 ) -> Result<Proof, E2eError> {
   let witness = build_witness(steps)?;
   let (proof, params) = prove_cpu_with(&witness, cfg)?;
-  verify(&proof, &witness.tree, &params)?;
+  verify(&proof, &params)?;
   Ok(proof)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use evm_types::ProofNode;
   use revm::primitives::U256;
 
   /// Helper: create a synthetic EvmStep with correct static gas consumption.
@@ -176,8 +176,8 @@ mod tests {
     let witness = build_witness(&steps).unwrap();
 
     assert_eq!(witness.n_steps, 1);
-    // ADD compiles to 2 Add128 micro-ops (one per limb).
-    assert_eq!(witness.rows.len(), 2);
+    // ADD compiles to Const(carry=0) + 2 Add128 micro-ops (one per limb).
+    assert_eq!(witness.rows.len(), 3);
     // Tree should be a single Leaf.
     assert!(matches!(witness.tree, ProofNode::Leaf { .. }));
   }
@@ -264,8 +264,9 @@ mod tests {
     let witness = build_witness(&steps).unwrap();
 
     assert_eq!(witness.n_steps, 1);
-    // EXP uses advice_u256: 1 Advice2 + 2 Mov = 3 ops.
-    assert_eq!(witness.rows.len(), 3);
+    // EXP binary exponentiation: 2 Mov (copy base) +
+    //   3 squarings × 5 ops + 1 multiply × 5 ops = 2 + 20 = 22 ops.
+    assert_eq!(witness.rows.len(), 22);
   }
 
   #[test]
@@ -390,7 +391,7 @@ mod tests {
     )];
     let witness = build_witness(&steps).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
-    verify(&proof, &witness.tree, &params).unwrap();
+    verify(&proof, &params).unwrap();
   }
 
   #[test]
@@ -402,7 +403,7 @@ mod tests {
     let steps = vec![step(MUL, 0, &[a, b], &[result])];
     let witness = build_witness(&steps).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
-    verify(&proof, &witness.tree, &params).unwrap();
+    verify(&proof, &params).unwrap();
   }
 
   #[test]
@@ -415,7 +416,7 @@ mod tests {
     let steps = vec![step(EXP, 0, &[a, b], &[result])];
     let witness = build_witness(&steps).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
-    verify(&proof, &witness.tree, &params).unwrap();
+    verify(&proof, &params).unwrap();
   }
 
   #[test]
@@ -489,7 +490,7 @@ mod tests {
     let steps = vec![step(DIV, 0, &[a, b], &[result])];
     let witness = build_witness(&steps).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
-    verify(&proof, &witness.tree, &params).unwrap();
+    verify(&proof, &params).unwrap();
   }
 
   #[test]

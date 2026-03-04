@@ -10,9 +10,6 @@
 /// Register index — selects one of the 16 × u128 registers.
 pub type Reg = u8;
 
-/// Flag-register index — selects one of the 8 carry/boolean flags.
-pub type FlagReg = u8;
-
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Single instruction in the Meta-VM ISA.
@@ -22,14 +19,14 @@ pub type FlagReg = u8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MicroOp {
   // ── 128-bit ALU ───────────────────────────────────────────────────────────
-  /// 128-bit full adder: `dst = (a + b + flags[cin]) mod 2^128`.
-  /// Carry-out written to `flags[cout]`.
+  /// 128-bit full adder: `dst = (a + b + regs[cin]) mod 2^128`.
+  /// Carry-out (0 or 1, zero-extended) written to `regs[cout]`.
   Add128 {
     dst: Reg,
     a: Reg,
     b: Reg,
-    cin: FlagReg,
-    cout: FlagReg,
+    cin: Reg,
+    cout: Reg,
   },
 
   /// 128×128 → 256-bit multiply: low 128 bits → `dst_lo`, high 128 bits → `dst_hi`.
@@ -169,6 +166,15 @@ pub enum MicroOp {
   /// Pop 4 values from the advice tape into `dst0`..`dst3`.
   /// Replaces four consecutive `AdviceLoad` ops with a single row.
   Advice4 { dst0: Reg, dst1: Reg, dst2: Reg, dst3: Reg },
+  // ── 128-bit comparison ─────────────────────────────────────────────────
+  /// Unsigned 128-bit less-than: `dst = (regs[a] < regs[b]) ? 1 : 0`.
+  ///
+  /// Circuit soundness: the row stores `pad` in advice such that
+  /// `a + pad + 1 = b` (when result=1) or `b + pad = a` (when result=0),
+  /// verified via Add LUT carry-chain with carry_out = 0.
+  /// Algebraic constraint enforces result ∈ {0, 1}.
+  CmpLt { a: Reg, b: Reg, dst: Reg },
+
   // ── Zero-check (GF(2^128) algebraic) ──────────────────────────────────
   /// Constraint 1 of the zero-check pair:
   ///   `acc * inv + result + 1 = 0` in GF(2^128).
@@ -226,6 +232,7 @@ impl MicroOp {
       Self::Advice4 { .. } => 30,
       Self::CheckZeroInv { .. } => 31,
       Self::CheckZeroMul { .. } => 32,
+      Self::CmpLt { .. } => 33,
     }
   }
 }

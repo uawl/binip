@@ -211,14 +211,24 @@ pub fn decomp_mask(tag: u32) -> DecompMask {
       flags: false,
       advice: false,
     },
-    // RangeCheck: in0=value, in1=bits (not decomposed; bits is a small constant)
+    // RangeCheck: in0=value, in1=mask, advice=pad, out=mask
+    // Decompose in0, advice (for Add LUT carry chain) and out.
     15 => DecompMask {
       in0: true,
       in1: false,
       in2: false,
       out: true,
       flags: false,
-      advice: false,
+      advice: true,
+    },
+    // CmpLt: in0=a, in1=b, advice=pad
+    33 => DecompMask {
+      in0: true,
+      in1: true,
+      in2: false,
+      out: false,
+      flags: false,
+      advice: true,
     },
     _ => DecompMask {
       in0: false,
@@ -233,7 +243,7 @@ pub fn decomp_mask(tag: u32) -> DecompMask {
 
 /// Returns true if the given tag requires any byte decomposition.
 pub fn needs_decomp(tag: u32) -> bool {
-  matches!(tag, 0 | 1 | 2 | 8 | 12 | 13 | 14 | 15)
+  matches!(tag, 0 | 1 | 2 | 8 | 12 | 13 | 14 | 15 | 33)
 }
 
 // ── Reconstruction ───────────────────────────────────────────────────────────
@@ -519,7 +529,7 @@ mod tests {
   #[test]
   fn mask_range_check() {
     let m = decomp_mask(15);
-    assert!(m.in0 && !m.in1 && !m.in2 && m.out && !m.flags && !m.advice);
+    assert!(m.in0 && !m.in1 && !m.in2 && m.out && !m.flags && m.advice);
   }
 
   // ── encode_decomp ─────────────────────────────────────────────────

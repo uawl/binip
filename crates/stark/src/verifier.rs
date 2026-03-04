@@ -2,18 +2,32 @@
 //!
 //! # Verification checklist (mirrors V1.md §검증자 체크리스트)
 //!
-//! 1. **Type cert** — re-hash the Proof Tree shape, compare to `type_cert.root_hash`.
-//! 2. **Constraint sum** — must be zero (valid trace ⟹ all constraints satisfied).
-//! 3. **PCS commitment** — absorb into a fresh transcript, derive β.
+//! 1. **Constraint sum** — must be zero (valid trace ⟹ all constraints satisfied).
+//! 2. **PCS commitment** — absorb into a fresh transcript, derive β.
+//! 3. **Boundary PCS** — if boundaries exist, verify commitment + sumcheck + opening.
 //! 4. **Shard verification** — verify each shard sumcheck with forked transcripts.
 //! 5. **Recursive verification** — verify all aggregation levels.
 //! 6. **PCS opening** — verify the opening proof at the challenge point.
 //! 7. **Root claim consistency** — recursive root_claim == shard total_sum.
+//!
+//! # Succinctness
+//!
+//! The verifier does **not** receive the full proof tree. All structural
+//! and value-level properties are covered by:
+//!
+//! - Per-row opcode constraints + lookup arguments (micro-op correctness).
+//! - R/W lookup argument (register value continuity across rows).
+//! - Boundary sumcheck + PCS (EVM-level state continuity at Seq/Branch
+//!   junctions: PC, stack depth, gas, memory size, storage count,
+//!   jumpdest hash).
+//!
+//! The [`TypeCert`] committed in the Fiat-Shamir transcript binds the
+//! prover to a specific execution shape.  The `has_seq_boundaries` flag
+//! is also transcript-bound, so the verifier can decide whether to
+//! expect a [`BoundaryPcsProof`] without walking the tree.
 
 use circuit::lookup;
 use circuit::mpt;
-use circuit::state_constraint::extract_boundaries;
-use evm_types::ProofNode;
 use field::{FieldElem, GF2_128};
 use transcript::{Blake3Transcript, Transcript};
 
@@ -22,23 +36,11 @@ use crate::proof::{Proof, StarkParams};
 /// Errors during proof verification.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
-  #[error("type check failed: {0}")]
-  TypeCheck(#[from] evm_types::TypeError),
-
-  #[error("type cert root hash mismatch")]
-  TypeCertMismatch,
-
-  #[error("type cert state hash mismatch")]
-  StateCertMismatch,
-
   #[error("constraint sum is non-zero")]
   ConstraintSumNonZero,
 
   #[error("boundary constraint sum is non-zero")]
   BoundaryConstraintSumNonZero,
-
-  #[error("consistency check failed: {0}")]
-  ConsistencyCheck(String),
 
   #[error("shard verification failed: {0}")]
   ShardVerify(String),
@@ -61,16 +63,25 @@ pub enum VerifyError {
   #[error("reconstruction sum is non-zero")]
   ReconstructionSumNonZero,
 
+  #[error("reconstruction sumcheck verification failed")]
+  ReconstructionSumcheckFailed,
+
+  #[error("reconstruction sumcheck claimed non-zero sum")]
+  ReconstructionSumcheckNonZero,
+
+  #[error("reconstruction PCS opening verification failed")]
+  ReconstructionPcsOpenFailed,
+
   #[error("lookup verification failed")]
   LookupVerifyFailed,
 
   #[error("Phase C storage proof verification failed: {0}")]
   StorageProofFailed(#[from] mpt::StorageProofError),
 
-  #[error("boundary PCS proof missing (Seq junctions exist)")]
+  #[error("boundary PCS proof missing (has_seq_boundaries = true)")]
   MissingBoundaryPcs,
 
-  #[error("boundary PCS proof present but no Seq junctions")]
+  #[error("boundary PCS proof present but has_seq_boundaries = false")]
   UnexpectedBoundaryPcs,
 
   #[error("boundary sumcheck verification failed")]
@@ -89,43 +100,24 @@ pub enum VerifyError {
   },
 }
 
-/// Verify a top-level STARK proof.
+/// Verify a top-level STARK proof (succinct).
+///
+/// The verifier does **not** receive the full proof tree.  All O(n)
+/// checks (type-check, consistency check, boundary extraction) have
+/// been moved to the prover side.  The verifier only performs
+/// O(√n · log n) cryptographic checks.
 ///
 /// # Arguments
 ///
 /// * `proof`  – the proof to verify.
-/// * `tree`   – the Proof Tree (structural, non-ZK) for type checking.
 /// * `params` – the same parameters used during proving.
-///
-/// The verifier does NOT need the witness (execution trace).
-pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(), VerifyError> {
-  // ── 1. Type cert ──────────────────────────────────────────────────────
-  let cert = evm_types::build_cert(tree)?;
-  if cert.root_hash != proof.type_cert.root_hash {
-    return Err(VerifyError::TypeCertMismatch);
-  }
-  if cert.state_hash != proof.type_cert.state_hash {
-    return Err(VerifyError::StateCertMismatch);
-  }
-
-  // ── 1b. Native consistency check (ordering invariants) ────────────────
-  let errors = evm_types::consistency_check_all(tree);
-  if !errors.is_empty() {
-    return Err(VerifyError::ConsistencyCheck(
-      errors
-        .iter()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join("; "),
-    ));
-  }
-
-  // ── 2. Constraint sum must be zero ────────────────────────────────────
+pub fn verify(proof: &Proof, params: &StarkParams) -> Result<(), VerifyError> {
+  // ── 1. Constraint sum must be zero ────────────────────────────────────
   if !proof.constraint_sum.is_zero() {
     return Err(VerifyError::ConstraintSumNonZero);
   }
 
-  // ── 2a. Constraint sum must equal shard total sum (H-3 binding) ───────
+  // ── 1a. Constraint sum must equal shard total sum (H-3 binding) ───────
   if proof.constraint_sum != proof.shard_batch.total_sum {
     return Err(VerifyError::ConstraintSumShardMismatch {
       constraint: proof.constraint_sum,
@@ -133,26 +125,25 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
     });
   }
 
-  // ── 2b. Boundary constraint sum must be zero ──────────────────────────
+  // ── 1b. Boundary constraint sum must be zero ──────────────────────────
   if !proof.boundary_constraint_sum.is_zero() {
     return Err(VerifyError::BoundaryConstraintSumNonZero);
   }
 
-  // ── 3. Rebuild transcript and derive β ────────────────────────────────
+  // ── 2. Rebuild transcript and derive β ────────────────────────────────
   let mut transcript = Blake3Transcript::new();
   transcript.absorb_bytes(&proof.type_cert.root_hash);
   transcript.absorb_bytes(&proof.type_cert.state_hash);
+  transcript.absorb_bytes(&[proof.has_seq_boundaries as u8]);
   let beta = transcript.squeeze_challenge();
   if beta != proof.beta {
     return Err(VerifyError::BetaMismatch);
   }
 
-  // ── 3a. Boundary PCS verification (H-1 binding) ──────────────────────
-  // Must come BEFORE γ squeeze to match prover transcript ordering.
-  let boundary_rows = extract_boundaries(tree);
-  let has_boundaries = !boundary_rows.is_empty();
-
-  match (&proof.boundary_pcs, has_boundaries) {
+  // ── 3. Boundary PCS verification (H-1 binding) ───────────────────────
+  // The `has_seq_boundaries` flag is transcript-bound, so the prover
+  // cannot omit the boundary PCS when boundaries exist.
+  match (&proof.boundary_pcs, proof.has_seq_boundaries) {
     (Some(bnd), true) => {
       // Absorb boundary PCS commitment root (mirrors prover ordering)
       transcript.absorb_bytes(&bnd.commit.root);
@@ -187,7 +178,7 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
     (Some(_), false) => return Err(VerifyError::UnexpectedBoundaryPcs),
   }
 
-  // ── 3b. Derive γ and verify reconstruction + lookups ──────────────────
+  // ── 4. Derive γ and verify reconstruction + lookups ───────────────────
   let gamma = transcript.squeeze_challenge();
   if gamma != proof.gamma {
     return Err(VerifyError::GammaMismatch);
@@ -195,6 +186,41 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
   if !proof.reconstruction_sum.is_zero() {
     return Err(VerifyError::ReconstructionSumNonZero);
   }
+
+  // ── 4a. Reconstruction PCS verification (C-2 binding) ────────────────
+  {
+    let rec = &proof.reconstruction_pcs;
+
+    // Absorb reconstruction PCS commitment root (mirrors prover ordering)
+    transcript.absorb_bytes(&rec.commit.root);
+
+    // Verify claimed sum is zero
+    if !rec.sumcheck.claimed_sum.is_zero() {
+      return Err(VerifyError::ReconstructionSumcheckNonZero);
+    }
+
+    // Verify reconstruction sumcheck
+    let mut rec_sc_t = transcript.fork("reconstruction_sc", 0);
+    let rec_challenges =
+      sumcheck::verify(&rec.sumcheck, rec.open_eval, &mut rec_sc_t)
+        .ok_or(VerifyError::ReconstructionSumcheckFailed)?;
+
+    // Verify reconstruction PCS opening
+    let rec_pcs_params = pcs::PcsParams { n_vars: rec.n_vars, n_queries: 40 };
+    let mut rec_pcs_t = transcript.fork("reconstruction_pcs_open", 0);
+    let rec_ok = pcs::verify(
+      &rec.commit,
+      &rec_challenges,
+      rec.open_eval,
+      &rec.pcs_open,
+      &rec_pcs_params,
+      &mut rec_pcs_t,
+    );
+    if !rec_ok {
+      return Err(VerifyError::ReconstructionPcsOpenFailed);
+    }
+  }
+
   if lookup::verify_lookups_par(
     &proof.lookup_proofs,
     &proof.lookup_commits,
@@ -205,9 +231,7 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
     return Err(VerifyError::LookupVerifyFailed);
   }
 
-  // ── 3c. Phase C: Storage state root binding ───────────────────────────
-  // verify_lookups_par returned RwSummaries; re-derive them to feed Phase C.
-  // We re-call with a cloned transcript to get the actual summaries.
+  // ── 4a. Phase C: Storage state root binding ───────────────────────────
   {
     let rw_summaries = lookup::verify_lookups_par(
       &proof.lookup_proofs,
@@ -229,9 +253,6 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
   let shard_transcript = transcript.clone();
 
   // ── 5. Shard + Recursive verification ────────────────────────────────
-  // The recursive verifier checks shard claim consistency at each level,
-  // so separate shard verification (which requires the witness MLE) is
-  // not needed by the verifier — only the prover has the witness.
   recursive::verify_recursive(
     &proof.recursive_proof,
     &proof.shard_batch,
@@ -240,7 +261,6 @@ pub fn verify(proof: &Proof, tree: &ProofNode, params: &StarkParams) -> Result<(
   )?;
 
   // ── 6. Root claim consistency ─────────────────────────────────────────
-  // The recursive root claim should equal the total shard sum.
   if proof.recursive_proof.root_claim != proof.shard_batch.total_sum {
     return Err(VerifyError::RootClaimMismatch {
       recursive: proof.recursive_proof.root_claim,
@@ -271,6 +291,7 @@ mod tests {
   use crate::prover;
   use evm_types::proof_tree::LeafProof;
   use evm_types::state::EvmState;
+  use evm_types::ProofNode;
   use vm::Row;
 
   fn xor_row(a: u128, b: u128) -> Row {
@@ -323,7 +344,7 @@ mod tests {
     let (rows, tree) = make_trace_and_tree();
     let params = StarkParams::for_n_vars(2);
     let proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
-    verify(&proof, &tree, &params).unwrap();
+    verify(&proof, &params).unwrap();
   }
 
   #[test]
@@ -332,18 +353,8 @@ mod tests {
     let params = StarkParams::for_n_vars(2);
     let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
     proof.constraint_sum = GF2_128::from(1u64); // tamper
-    let err = verify(&proof, &tree, &params).unwrap_err();
+    let err = verify(&proof, &params).unwrap_err();
     assert!(matches!(err, VerifyError::ConstraintSumNonZero));
-  }
-
-  #[test]
-  fn verify_rejects_bad_type_cert() {
-    let (rows, tree) = make_trace_and_tree();
-    let params = StarkParams::for_n_vars(2);
-    let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
-    proof.type_cert.root_hash = [0xFFu8; 32]; // tamper
-    let err = verify(&proof, &tree, &params).unwrap_err();
-    assert!(matches!(err, VerifyError::TypeCertMismatch));
   }
 
   #[test]
@@ -352,7 +363,7 @@ mod tests {
     let params = StarkParams::for_n_vars(2);
     let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
     proof.recursive_proof.root_claim = proof.recursive_proof.root_claim + GF2_128::from(1u64);
-    let err = verify(&proof, &tree, &params).unwrap_err();
+    let err = verify(&proof, &params).unwrap_err();
     // Could be recursive verify error or root claim mismatch
     assert!(
       matches!(err, VerifyError::RecursiveVerify(_))

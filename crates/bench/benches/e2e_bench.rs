@@ -179,10 +179,10 @@ fn bench_verify(c: &mut Criterion) {
     let (proof, params) = prove_cpu(&witness).unwrap();
     group.bench_with_input(
       BenchmarkId::from_parameter(n),
-      &(proof, witness.tree, params),
-      |b, (proof, tree, params)| {
+      &(proof, params),
+      |b, (proof, params)| {
         b.iter(|| {
-          let _ = e2e::verify(black_box(proof), black_box(tree), black_box(params));
+          let _ = e2e::verify(black_box(proof), black_box(params));
         });
       },
     );
@@ -203,7 +203,7 @@ fn bench_prove_and_verify(c: &mut Criterion) {
       b.iter(|| {
         let witness = build_witness(black_box(steps)).unwrap();
         let (proof, params) = prove_cpu(&witness).unwrap();
-        let _ = e2e::verify(&proof, &witness.tree, &params);
+        let _ = e2e::verify(&proof, &params);
       });
     });
   }

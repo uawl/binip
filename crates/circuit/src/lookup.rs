@@ -30,7 +30,7 @@
 //! | 1   | Mul128     | Mul        | Byte×byte schoolbook products           |
 //! | 2   | And128     | And        | Byte-level bitwise AND                  |
 //! | 8   | Chi128     | And        | AND component of Keccak χ               |
-//! | 15  | RangeCheck | Range      | Byte decomposition for `v < 2^bits`     |
+//! | 15  | RangeCheck | Add        | Carry-chain `v + pad = mask`, carry=0   |
 
 use field::{FieldElem, GF2_128};
 use logup::LookupTable;
@@ -216,6 +216,7 @@ pub fn collect_witnesses(rows: &[Row]) -> LookupWitness {
         emit_mul_accum(&mut w, row);
       }
       15 => emit_range_check(&mut w, row),
+      33 => emit_cmp_lt(&mut w, row),
       _ => {}
     }
   }
@@ -284,6 +285,7 @@ pub fn collect_witnesses_par(rows: &[Row]) -> LookupWitness {
             emit_mul_accum(&mut w, row);
           }
           15 => emit_range_check(&mut w, row),
+          33 => emit_cmp_lt(&mut w, row),
           _ => {}
         }
       }
@@ -358,21 +360,80 @@ fn emit_decomp_ranges(w: &mut LookupWitness, row: &Row) {
   }
 }
 
-/// RangeCheck (tag 15): decompose the lower bytes into Range LUT entries.
+/// RangeCheck (tag 15): prove `v + pad = mask` via byte-level Add LUT.
 ///
-/// `bits == 1` is handled algebraically in [`verify_deterministic_checks`].
-/// `bits >= 128` or `bits == 0` need no proof (always valid for u128).
+/// Row layout: in0 = v, in1 = mask = 2^bits − 1, advice = pad = mask − v,
+/// out = mask.  The carry chain proves integer addition; an extra entry
+/// forces carry_out = 0, so `v + pad = mask` without overflow, implying
+/// `v ≤ mask`, i.e., `v < 2^bits`.
 fn emit_range_check(w: &mut LookupWitness, row: &Row) {
-  let val = row.in0;
-  let bits = row.in1 as u32;
-  if bits <= 1 || bits >= 128 {
-    return;
+  let v = row.in0;
+  let pad = row.advice;
+  let mask = row.out; // = in1 = 2^bits - 1
+
+  let v_bs = bytes_of(v);
+  let p_bs = bytes_of(pad);
+  let m_bs = bytes_of(mask);
+
+  let mut carry: u8 = 0;
+  for k in 0..16 {
+    // Step 1: v[k] + pad[k] → (partial, c1)
+    let sum1 = v_bs[k] as u16 + p_bs[k] as u16;
+    let p = (sum1 & 0xFF) as u8;
+    let c1 = (sum1 >> 8) as u8;
+    w.add_op.push(lut::encode_add(v_bs[k], p_bs[k], p, c1));
+
+    // Step 2: partial + carry_in → (result_byte, c2)
+    let sum2 = p as u16 + carry as u16;
+    let s = (sum2 & 0xFF) as u8;
+    let c2 = (sum2 >> 8) as u8;
+    w.add_op.push(lut::encode_add(p, carry, s, c2));
+
+    debug_assert_eq!(s, m_bs[k]);
+    carry = c1 ^ c2;
   }
-  let bs = bytes_of(val);
-  let n_bytes = ((bits + 7) / 8) as usize; // ceil(bits / 8)
-  for i in 0..n_bytes.min(16) {
-    w.range.push(lut::encode_range(bs[i]));
+
+  // Extra entry: force carry_out = 0.
+  // encode_add(0, 0, 0, 0) is valid (0+0=0).
+  // encode_add(1, 0, 0, 0) would mean 1+0=0, which is NOT in the table.
+  w.add_op.push(lut::encode_add(carry, 0, 0, 0));
+}
+
+/// CmpLt (tag 33): prove unsigned 128-bit less-than via Add LUT.
+///
+/// Row: in0 = a, in1 = b, out = result ∈ {0,1}, advice = pad.
+/// - result = 1: proves `a + pad + 1 = b` (carry_out = 0) → pad = b−a−1 ≥ 0 → a < b.
+/// - result = 0: proves `b + pad = a`     (carry_out = 0) → pad = a−b   ≥ 0 → a ≥ b.
+fn emit_cmp_lt(w: &mut LookupWitness, row: &Row) {
+  let a = row.in0;
+  let b = row.in1;
+  let result = row.out;
+  let pad = row.advice;
+
+  let (x_bs, y_bs, expected_bs, initial_carry) = if result == 1 {
+    (bytes_of(a), bytes_of(pad), bytes_of(b), 1u8)
+  } else {
+    (bytes_of(b), bytes_of(pad), bytes_of(a), 0u8)
+  };
+
+  let mut carry = initial_carry;
+  for k in 0..16 {
+    let sum1 = x_bs[k] as u16 + y_bs[k] as u16;
+    let p = (sum1 & 0xFF) as u8;
+    let c1 = (sum1 >> 8) as u8;
+    w.add_op.push(lut::encode_add(x_bs[k], y_bs[k], p, c1));
+
+    let sum2 = p as u16 + carry as u16;
+    let s = (sum2 & 0xFF) as u8;
+    let c2 = (sum2 >> 8) as u8;
+    w.add_op.push(lut::encode_add(p, carry, s, c2));
+
+    debug_assert_eq!(s, expected_bs[k]);
+    carry = c1 ^ c2;
   }
+
+  // carry_out must be 0
+  w.add_op.push(lut::encode_add(carry, 0, 0, 0));
 }
 
 /// Mul128 (tag 1): schoolbook byte×byte products via Mul LUT.
@@ -870,8 +931,10 @@ pub fn sort_and_verify_rw(
 
 /// Verify conditions that don't need lookups:
 ///
-/// - **RangeCheck bits=1**: boolean constraint `v*(v+1) = 0` in GF(2^128).
-/// - **RangeCheck bits>1**: upper bytes of value must be zero.
+/// - **Mul128**: full 256-bit product matches out||flags.
+///
+/// RangeCheck soundness is now fully enforced by the Add LUT carry
+/// chain + carry_out = 0 entry + the algebraic `out = in1` constraint.
 pub fn verify_deterministic_checks(rows: &[Row]) -> bool {
   for row in rows {
     match row.op as u32 {
@@ -880,21 +943,6 @@ pub fn verify_deterministic_checks(rows: &[Row]) -> bool {
         let (expected_lo, expected_hi) = widening_mul(row.in0, row.in1);
         if row.out != expected_lo || row.flags != expected_hi {
           return false;
-        }
-      }
-      // RangeCheck: boolean constraint or upper-byte zeros.
-      15 => {
-        let val = row.in0;
-        let bits = row.in1 as u32;
-        if bits == 1 {
-          let v = GF2_128::new(val as u64, (val >> 64) as u64);
-          if !(v * (v + GF2_128::one())).is_zero() {
-            return false;
-          }
-        } else if bits > 1 && bits < 128 {
-          if val >= (1u128 << bits) {
-            return false;
-          }
         }
       }
       _ => {}
@@ -1636,35 +1684,50 @@ mod tests {
 
   // ── RangeCheck ──────────────────────────────────────────────────────
 
+  /// Helper: build a valid RangeCheck row for given value and bit width.
+  fn range_row(val: u128, bits: u32) -> Row {
+    let mask = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+    let pad = mask - val;
+    Row { pc: 0, op: 15, in0: val, in1: mask, in2: 0, out: mask, flags: 0, advice: pad }
+  }
+
   #[test]
   fn range_check_8bit() {
     let rows = vec![
-      make_row(15, 0, 8, 0, 0, 0),
-      make_row(15, 42, 8, 0, 42, 0),
-      make_row(15, 255, 8, 0, 255, 0),
-      make_row(15, 0, 8, 0, 0, 0), // pad to pow2
+      range_row(0, 8),
+      range_row(42, 8),
+      range_row(255, 8),
+      range_row(0, 8), // pad to pow2
     ];
     assert!(run_lookup(&rows));
   }
 
   #[test]
   fn range_check_1bit_boolean() {
-    let rows = vec![make_row(15, 0, 1, 0, 0, 0), make_row(15, 1, 1, 0, 1, 0)];
-    // bits=1 → no LUT (algebraic), but deterministic check should pass.
-    assert!(verify_deterministic_checks(&rows));
+    // bits=1: mask=1, proves v ∈ {0,1} via Add LUT.
+    let rows = vec![range_row(0, 1), range_row(1, 1)];
+    assert!(run_lookup(&rows));
   }
 
   #[test]
+  #[should_panic]
   fn range_check_1bit_fails_for_2() {
-    let rows = vec![make_row(15, 2, 1, 0, 2, 0)];
-    assert!(!verify_deterministic_checks(&rows));
+    // v=2. mask=1, pad=1-2 underflows → carry_out=1 → LUT entry invalid.
+    let mask: u128 = 1;
+    let pad = mask.wrapping_sub(2); // wrapping: u128::MAX
+    let row = Row { pc: 0, op: 15, in0: 2, in1: mask, in2: 0, out: mask, flags: 0, advice: pad };
+    run_lookup(&[row]);
   }
 
   #[test]
+  #[should_panic]
   fn range_check_upper_bytes_fail() {
-    // value = 256 with bits=8 → should fail deterministic check
-    let rows = vec![make_row(15, 256, 8, 0, 256, 0)];
-    assert!(!verify_deterministic_checks(&rows));
+    // value=256 with bits=8 → mask=255, pad wraps, carry_out=1 → fails.
+    let mask: u128 = 255;
+    let val: u128 = 256;
+    let pad = mask.wrapping_sub(val);
+    let row = Row { pc: 0, op: 15, in0: val, in1: mask, in2: 0, out: mask, flags: 0, advice: pad };
+    run_lookup(&[row]);
   }
 
   // ── And128 ──────────────────────────────────────────────────────────
@@ -1792,7 +1855,7 @@ mod tests {
       // Mul128
       mul_row(6, 7),
       // RangeCheck bits=8
-      make_row(15, 42, 8, 0, 42, 0),
+      range_row(42, 8),
       // Xor128 (tag 3 — no lookup needed, just padding)
       make_row(3, 5, 3, 0, 6, 0),
     ];
@@ -1836,7 +1899,7 @@ mod tests {
       make_row(2, 0xFF, 0x0F, 0, 0x0F, 0),
       make_row(0, 100, 200, 0, 300, 0),
       mul_row(6, 7),
-      make_row(15, 42, 8, 0, 42, 0),
+      range_row(42, 8),
       make_row(3, 5, 3, 0, 6, 0),
     ];
     assert!(run_lookup_par(&rows));

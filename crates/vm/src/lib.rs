@@ -9,7 +9,7 @@ pub mod schedule;
 pub use advice::AdviceTape;
 pub use compile::{Compiled, compile, compile_push};
 pub use exec::{Vm, VmError};
-pub use isa::{FlagReg, MicroOp, Reg};
+pub use isa::{MicroOp, Reg};
 pub use reg::RegisterFile;
 pub use row::Row;
 pub use schedule::{Schedule, ScheduleError, Workgroup, schedule};
@@ -25,16 +25,17 @@ mod tests {
     let mut vm = Vm::new(AdviceTape::default());
     vm.regs.write(0, 3u128);
     vm.regs.write(1, 5u128);
+    // cin=3 (pre-zero), cout=3 (carry written here)
     vm.run(&[MicroOp::Add128 {
       dst: 2,
       a: 0,
       b: 1,
-      cin: 0,
-      cout: 0,
+      cin: 3,
+      cout: 3,
     }])
     .unwrap();
     assert_eq!(vm.regs.read(2), 8u128);
-    assert!(!vm.regs.flag(0));
+    assert_eq!(vm.regs.read(3), 0u128); // no carry
     assert_eq!(vm.trace.len(), 1);
   }
 
@@ -43,16 +44,17 @@ mod tests {
     let mut vm = Vm::new(AdviceTape::default());
     vm.regs.write(0, u128::MAX);
     vm.regs.write(1, 1u128);
+    // cin=3 (zero), cout=4
     vm.run(&[MicroOp::Add128 {
       dst: 2,
       a: 0,
       b: 1,
-      cin: 0,
-      cout: 1,
+      cin: 3,
+      cout: 4,
     }])
     .unwrap();
     assert_eq!(vm.regs.read(2), 0u128);
-    assert!(vm.regs.flag(1));
+    assert_eq!(vm.regs.read(4), 1u128); // carry out
   }
 
   #[test]
@@ -62,26 +64,27 @@ mod tests {
     vm.regs.write(1, 1u128); // lo b
     vm.regs.write(2, 0u128); // hi a
     vm.regs.write(3, 0u128); // hi b
+    // Use regs 14,15 as carry (initially zero)
     vm.run(&[
       MicroOp::Add128 {
         dst: 4,
         a: 0,
         b: 1,
-        cin: 0,
-        cout: 1,
+        cin: 14,
+        cout: 15,
       },
       MicroOp::Add128 {
         dst: 5,
         a: 2,
         b: 3,
-        cin: 1,
-        cout: 2,
+        cin: 15,
+        cout: 14,
       },
     ])
     .unwrap();
     assert_eq!(vm.regs.read(4), 0u128);
     assert_eq!(vm.regs.read(5), 1u128);
-    assert!(!vm.regs.flag(2));
+    assert_eq!(vm.regs.read(14), 0u128); // no final carry
   }
 
   // ── Mul128 ──────────────────────────────────────────────────────────────────

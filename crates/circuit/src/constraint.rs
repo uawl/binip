@@ -26,8 +26,8 @@ pub enum ConstraintError {
   UnknownTag(u32),
 }
 
-/// Total number of opcode tags this module handles (0..=32).
-pub const NUM_TAGS: u32 = 33;
+/// Total number of opcode tags this module handles (0..=33).
+pub const NUM_TAGS: u32 = 34;
 
 /// Evaluate the constraint polynomial for opcode `tag` on a row whose
 /// columns are given as 8 [`GF2_128`] values (same order as [`encoder::COL_*`]).
@@ -146,10 +146,16 @@ pub fn eval_constraint(tag: u32, cols: &[GF2_128; 8]) -> Result<GF2_128, Constra
     14 => Ok(GF2_128::zero()),
 
     // ── Check (tag 15): RangeCheck ──────────────────────────────────────
-    // Verify in0 < 2^bits.  At the field level the prover provides a
-    // witness decomposition; here we just enforce:
-    //   out = in0  (the range-checked value passes through unchanged)
-    15 => Ok(out + in0),
+    // Proves in0 < 2^bits via addition-based range proof.
+    //
+    // Row layout:
+    //   in0 = v (value),  in1 = mask = 2^bits − 1,
+    //   advice = pad = mask − v,  out = mask.
+    //
+    // Algebraic constraint: out = in1 (both equal the mask).
+    // Integer soundness (v + pad = mask, carry = 0) is enforced
+    // by byte-level Add LUT entries in `lookup::emit_range_check`.
+    15 => Ok(out + in1),
 
     // ── Memory (tag 16): Load ───────────────────────────────────────────
     // out = memory[addr].  Like advice, the value is witness-provided.
@@ -227,6 +233,17 @@ pub fn eval_constraint(tag: u32, cols: &[GF2_128; 8]) -> Result<GF2_128, Constra
     // GF(2^128) is a field: no zero divisors, so this forces
     // acc = 0 or result = 0.
     32 => Ok(in0 * in1),
+
+    // ── Comparison (tag 33): CmpLt ───────────────────────────────
+    // Unsigned 128-bit less-than: result ∈ {0, 1}.
+    //
+    // Algebraic constraint: `out * (out + 1) = 0` (boolean check).
+    // Integer soundness proved by Add LUT carry chain: see
+    // `lookup::emit_cmp_lt`.
+    33 => {
+      let one = GF2_128::from(1u64);
+      Ok(out * (out + one))
+    }
 
     _ => Err(ConstraintError::UnknownTag(tag)),
   }
@@ -461,15 +478,19 @@ mod tests {
 
   #[test]
   fn range_check_1bit_accepts_both_values() {
-    // Tag 15: out + in0 = 0.  For 1-bit range check, both 0 and 1 pass.
+    // Tag 15: out + in1 = 0.  For 1-bit range check, mask=1:
+    //   in0=v, in1=mask=1, advice=pad, out=mask=1.
+    //   Constraint: out + in1 = 1 + 1 = 0 (GF XOR). ✓
     let mut cols_zero = zero_cols();
-    cols_zero[2] = f(0); // in0 = 0
-    cols_zero[5] = f(0); // out = 0
+    cols_zero[2] = f(0); // in0 = 0 (value)
+    cols_zero[3] = f(1); // in1 = 1 (mask)
+    cols_zero[5] = f(1); // out = 1 (mask)
     assert_eq!(eval_constraint(15, &cols_zero).unwrap(), GF2_128::zero());
 
     let mut cols_one = zero_cols();
-    cols_one[2] = f(1); // in0 = 1
-    cols_one[5] = f(1); // out = 1
+    cols_one[2] = f(1); // in0 = 1 (value)
+    cols_one[3] = f(1); // in1 = 1 (mask)
+    cols_one[5] = f(1); // out = 1 (mask)
     assert_eq!(eval_constraint(15, &cols_one).unwrap(), GF2_128::zero());
   }
 
@@ -477,7 +498,7 @@ mod tests {
   fn comparison_gap_wrong_iszero_passes_constraints() {
     // ISZERO(5) should return 0, but a malicious prover claims 1.
     // AdviceLoad row: out=1, advice=1 → tag 11 passes.
-    // RangeCheck row: in0=1, out=1 → tag 15 passes.
+    // RangeCheck row: in1=mask=1, out=mask=1 → tag 15 passes.
     // Mov row: in0=1, out=1 → tag 10 passes.
     // The circuit accepts the wrong result.
     for wrong_result in [0u64, 1u64] {
@@ -487,10 +508,11 @@ mod tests {
       adv[5] = v;
       adv[7] = v;
       assert_eq!(eval_constraint(11, &adv).unwrap(), GF2_128::zero());
-      // RangeCheck (1-bit)
+      // RangeCheck (1-bit): in1=mask=1, out=mask=1
       let mut rc = zero_cols();
-      rc[2] = v;
-      rc[5] = v;
+      rc[2] = v;     // in0 = v (value, not checked by algebraic constraint)
+      rc[3] = f(1);  // in1 = mask = 1
+      rc[5] = f(1);  // out = mask = 1
       assert_eq!(eval_constraint(15, &rc).unwrap(), GF2_128::zero());
       // Mov
       let mut mv = zero_cols();

@@ -39,12 +39,39 @@ pub struct BoundaryPcsProof {
   pub n_vars: u32,
 }
 
+/// Cryptographic binding for the reconstruction-constraint MLE.
+///
+/// Proves that the byte-decomposition columns faithfully reconstruct
+/// the main trace operands, binding the STARK and LUT witnesses.
+/// Without this, a malicious prover could self-report
+/// `reconstruction_sum = 0` without actually satisfying the constraint.
+#[derive(Debug, Clone)]
+pub struct ReconstructionPcsProof {
+  /// PCS commitment over the blinded reconstruction MLE.
+  pub commit: Commitment,
+  /// Sumcheck proof that `Σ reconstruction_blinded(x) = 0`.
+  pub sumcheck: SumcheckProof,
+  /// PCS opening at the sumcheck challenge point.
+  pub pcs_open: OpenProof,
+  /// Evaluation of the reconstruction MLE at the challenge point.
+  pub open_eval: GF2_128,
+  /// Number of MLE variables used for the reconstruction PCS.
+  pub n_vars: u32,
+}
+
 /// Top-level ZK-STARK proof.
 #[derive(Debug, Clone)]
 pub struct Proof {
   // ── structural layer ──────────────────────────────────────────────────
   /// Type-derivation certificate (Proof Tree shape commitment).
   pub type_cert: TypeCert,
+
+  /// Whether the proof tree contains Seq/Branch boundaries.
+  ///
+  /// Absorbed into the Fiat-Shamir transcript so the verifier knows
+  /// whether to expect a [`BoundaryPcsProof`] without receiving the
+  /// full proof tree.
+  pub has_seq_boundaries: bool,
 
   // ── PCS layer ─────────────────────────────────────────────────────────
   /// PCS commitment over the constraint MLE evaluations.
@@ -78,6 +105,12 @@ pub struct Proof {
   /// This proves that committed byte-decomposition columns match the
   /// main trace operands, binding the STARK and LUT witnesses together.
   pub reconstruction_sum: GF2_128,
+
+  /// PCS + sumcheck binding for the reconstruction MLE.
+  ///
+  /// Cryptographically proves `reconstruction_sum` is honest — without
+  /// this, a malicious prover could simply set the sum to zero.
+  pub reconstruction_pcs: ReconstructionPcsProof,
 
   /// Per-table LogUp proofs for byte-level lookup arguments.
   pub lookup_proofs: LookupProofs,

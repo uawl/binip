@@ -122,11 +122,12 @@ impl Vm {
       } => {
         let va = self.regs.read(*a);
         let vb = self.regs.read(*b);
-        let c_in = self.regs.flag(*cin) as u128;
+        let c_in = self.regs.read(*cin) & 1;
         let (s1, c1) = va.overflowing_add(vb);
         let (result, c2) = s1.overflowing_add(c_in);
+        let carry_out = (c1 | c2) as u128;
         self.regs.write(*dst, result);
-        self.regs.set_flag(*cout, c1 | c2);
+        self.regs.write(*cout, carry_out);
         Row {
           pc,
           op: op.tag() as u128,
@@ -134,7 +135,7 @@ impl Vm {
           in1: vb,
           in2: 0,
           out: result,
-          flags: (c1 | c2) as u128,
+          flags: carry_out,
           advice: 0,
         }
       }
@@ -323,7 +324,7 @@ impl Vm {
           in2: 0,
           out: *val,
           flags: 0,
-          advice: 0,
+          advice: *val,
         }
       }
 
@@ -477,6 +478,34 @@ impl Vm {
         }
       }
 
+      // ── CmpLt ───────────────────────────────────────────────────────────
+      // Unsigned 128-bit less-than with Add-LUT soundness.
+      //
+      // Row layout: in0 = a, in1 = b, out = result (0 or 1), advice = pad.
+      //   result = 1 → pad = b − a − 1, and a + pad + 1 = b (no carry)
+      //   result = 0 → pad = a − b,     and b + pad     = a (no carry)
+      MicroOp::CmpLt { a, b, dst } => {
+        let va = self.regs.read(*a);
+        let vb = self.regs.read(*b);
+        let result = if va < vb { 1u128 } else { 0u128 };
+        let pad = if result == 1 {
+          vb - va - 1
+        } else {
+          va - vb
+        };
+        self.regs.write(*dst, result);
+        Row {
+          pc,
+          op: op.tag() as u128,
+          in0: va,
+          in1: vb,
+          in2: 0,
+          out: result,
+          flags: 0,
+          advice: pad,
+        }
+      }
+
       // ── CheckDiv ──────────────────────────────────────────────────────────
       MicroOp::CheckDiv {
         quot,
@@ -559,22 +588,28 @@ impl Vm {
       }
 
       // ── RangeCheck ────────────────────────────────────────────────────────
+      // Proves v < 2^bits via addition:
+      //   mask = 2^bits − 1
+      //   pad  = mask − v          (advice)
+      //   v + pad = mask           (Add LUT, carry_out = 0)
+      //   out = in1 = mask         (algebraic constraint)
       MicroOp::RangeCheck { r, bits } => {
         let vr = self.regs.read(*r);
         let b = *bits;
-        if b < 128 && vr >= (1u128 << b) {
+        let mask = if b >= 128 { u128::MAX } else { (1u128 << b) - 1 };
+        if vr > mask {
           return Err(VmError::AdviceCheckFailed(self.pc, "value out of range"));
         }
-        // b >= 128 always passes for u128
+        let pad = mask - vr;
         Row {
           pc,
           op: op.tag() as u128,
           in0: vr,
-          in1: b as u128,
+          in1: mask,
           in2: 0,
-          out: vr,
+          out: mask,
           flags: 0,
-          advice: 0,
+          advice: pad,
         }
       }
 
