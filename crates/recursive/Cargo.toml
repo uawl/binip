@@ -11,3 +11,4 @@ shard      = { path = "../shard" }
 transcript = { path = "../transcript" }
 rayon      = "1"
 thiserror  = { workspace = true }
+bincode    = { workspace = true }

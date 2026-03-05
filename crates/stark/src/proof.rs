@@ -25,7 +25,7 @@ use circuit::mpt::StorageProof;
 ///
 /// When Seq junctions exist in the proof tree, this sub-proof ensures
 /// that the boundary MLE was honestly committed and sums to zero.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct BoundaryPcsProof {
   /// PCS commitment over the blinded boundary MLE.
   pub commit: Commitment,
@@ -45,7 +45,7 @@ pub struct BoundaryPcsProof {
 /// the main trace operands, binding the STARK and LUT witnesses.
 /// Without this, a malicious prover could self-report
 /// `reconstruction_sum = 0` without actually satisfying the constraint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct ReconstructionPcsProof {
   /// PCS commitment over the blinded reconstruction MLE.
   pub commit: Commitment,
@@ -60,7 +60,7 @@ pub struct ReconstructionPcsProof {
 }
 
 /// Top-level ZK-STARK proof.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct Proof {
   // ── structural layer ──────────────────────────────────────────────────
   /// Type-derivation certificate (Proof Tree shape commitment).
@@ -144,6 +144,90 @@ pub struct Proof {
   // ── config ────────────────────────────────────────────────────────────
   /// The recursion configuration used during proving.
   pub config: RecursiveConfig,
+}
+
+// ─── Compressed Proof ──────────────────────────────────────────────────────
+
+/// Recursively compressed ZK-STARK proof.
+///
+/// The full [`Proof`] contains all shard proofs, recursive level proofs,
+/// multiple PCS openings, and lookup proofs (often >1 MiB). The
+/// compression step verifies the full proof internally, hashes all
+/// intermediate data into a binding digest, and produces a single
+/// aggregation sumcheck that reduces everything to one claim.
+///
+/// # Size budget
+///
+/// | Field                    | Size (bytes)        |
+/// |--------------------------|---------------------|
+/// | `type_cert`              | 68                  |
+/// | `batch_commit`           | 36                  |
+/// | `config`                 | 12                  |
+/// | `inner_digest`           | 32                  |
+/// | `compression_sumcheck`   | ~n_claims × 48      |
+/// | `root_eval`, challenges  | ~16 × n_vars        |
+/// | `pcs_open` (reduced)     | ~n_queries × n_vars × 80 |
+/// | `storage_roots`          | 64 (if present)     |
+///
+/// With n_queries=20 and ~10 aggregation claims, typically 20–60 KiB.
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
+pub struct CompressedProof {
+  // ── public inputs ─────────────────────────────────────────────────────
+  /// Type-derivation certificate (structural shape commitment).
+  pub type_cert: TypeCert,
+  /// Whether boundaries exist — determines transcript construction.
+  pub has_seq_boundaries: bool,
+  /// The main PCS Merkle root.  Binds the committed trace polynomial.
+  pub batch_commit: Commitment,
+  /// Recursion/shard configuration (needed for verification).
+  pub config: RecursiveConfig,
+
+  // ── transcript reconstruction ─────────────────────────────────────────
+  /// Boundary PCS commitment root (if `has_seq_boundaries`).
+  /// Needed to rebuild the Fiat-Shamir transcript state for PCS verification.
+  pub boundary_commit_root: Option<[u8; 32]>,
+  /// Reconstruction PCS commitment root.
+  /// Needed to rebuild the Fiat-Shamir transcript state for PCS verification.
+  pub reconstruction_commit_root: [u8; 32],
+
+  // ── binding digest ────────────────────────────────────────────────────
+  /// Blake3 hash of the full serialised inner [`Proof`].
+  ///
+  /// This cryptographically binds the compressed proof to a specific
+  /// inner proof.  Any change to the inner proof (shard proofs,
+  /// recursive proofs, lookups, PCS openings) changes this digest.
+  pub inner_digest: [u8; 32],
+
+  // ── compression layer ─────────────────────────────────────────────────
+  /// Aggregation sumcheck: proves the verification claims (evaluations,
+  /// root claim consistency, lookup sums) reduce correctly.
+  ///
+  /// The aggregation MLE contains all intermediate claims that the
+  /// verifier would check.  A single sumcheck proves their aggregate.
+  pub compression_sumcheck: SumcheckProof,
+
+  /// Evaluation claims collected from the inner proof, in deterministic
+  /// order.  The verifier recomputes the aggregation MLE from these
+  /// plus the public-input-derived challenges and checks the sumcheck.
+  pub inner_claims: Vec<GF2_128>,
+
+  // ── single PCS opening (reduced queries) ──────────────────────────────
+  /// PCS opening at the same evaluation point as the inner proof.
+  ///
+  /// Uses fewer queries than the inner proof (20 vs 40) to save space.
+  /// The moderate reduction is safe for the compression layer because
+  /// it is cryptographically bound to the inner digest.
+  pub pcs_open: OpenProof,
+  /// The evaluation point for the PCS opening.
+  pub open_point: Vec<GF2_128>,
+  /// Claimed evaluation at `open_point`.
+  pub open_eval: GF2_128,
+
+  // ── storage layer (public output) ─────────────────────────────────────
+  /// Pre-execution storage state root (if persistent storage is used).
+  pub pre_state_root: Option<[u8; 32]>,
+  /// Post-execution storage state root (if persistent storage is used).
+  pub post_state_root: Option<[u8; 32]>,
 }
 
 /// Parameters for proof generation and verification.

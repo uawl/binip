@@ -4,12 +4,13 @@
 //! - A flat [`vm::Row`] trace (fed into the STARK prover).
 //! - A [`ProofNode`] tree (used for type checking).
 
+use circuit::bytecode_lookup::BytecodeLookupWitness;
 use evm_types::proof_tree::{LeafProof, ProofNode};
 use evm_types::state::EvmState;
-use revm::primitives::U256;
+use revm::primitives::{Address, B256, U256};
 use vm::{AdviceTape, Compiled, Row, Vm};
 
-use crate::inspector::EvmStep;
+use crate::inspector::{CallFrame, EvmStep};
 
 /// Number of 128-bit limbs in a U256 word.
 const LIMBS: usize = 2;
@@ -23,6 +24,61 @@ pub struct Witness {
   pub tree: ProofNode,
   /// Number of EVM-level steps.
   pub n_steps: usize,
+  /// Bytecode `(pc, opcode)` lookup witness (LogUp entries).
+  pub bytecode_lookup: BytecodeLookupWitness,
+  /// Raw bytecode bytes (needed by the prover to build the lookup table).
+  /// `None` when bytecode proof is not requested.
+  pub bytecode_raw: Option<Vec<u8>>,
+  /// Call frame boundaries observed during execution.
+  pub call_frames: Vec<CallFrame>,
+  /// Maximum call depth in the trace.
+  pub max_depth: u32,
+}
+
+/// A single transaction's execution trace within a block.
+#[derive(Debug)]
+pub struct TxTrace {
+  /// Captured EVM opcode steps for this transaction.
+  pub steps: Vec<EvmStep>,
+  /// Call frame boundaries observed during execution.
+  pub call_frames: Vec<CallFrame>,
+  /// Transaction index within the block (0-based).
+  pub tx_index: u32,
+  /// Transaction hash.
+  pub tx_hash: B256,
+  /// Gas limit for this transaction.
+  pub gas_limit: u64,
+  /// Gas actually consumed.
+  pub gas_used: u64,
+  /// Whether the transaction succeeded.
+  pub success: bool,
+  /// Raw bytecode bytes (if bytecode proof is requested).
+  pub bytecode: Option<Vec<u8>>,
+}
+
+/// A full Ethereum block trace containing header metadata and per-tx traces.
+#[derive(Debug)]
+pub struct BlockTrace {
+  /// Block number.
+  pub block_number: u64,
+  /// Block hash (keccak256 of RLP-encoded header).
+  pub block_hash: B256,
+  /// Parent block hash.
+  pub parent_hash: B256,
+  /// Block timestamp (unix seconds).
+  pub timestamp: u64,
+  /// Coinbase / validator address.
+  pub coinbase: Address,
+  /// Block gas limit.
+  pub gas_limit: u64,
+  /// Total gas used by all transactions.
+  pub gas_used: u64,
+  /// State trie root before this block's execution.
+  pub state_root_pre: B256,
+  /// State trie root after this block's execution.
+  pub state_root_post: B256,
+  /// Per-transaction execution traces (ordered by tx_index).
+  pub transactions: Vec<TxTrace>,
 }
 
 /// Errors during witness construction.
@@ -47,17 +103,45 @@ pub enum WitnessError {
 /// 4. Build [`EvmState`] pre/post and a [`ProofNode::Leaf`].
 ///
 /// Finally, fold all leaves into a balanced binary tree of `Seq` nodes.
-pub fn build_witness(steps: &[EvmStep]) -> Result<Witness, WitnessError> {
+///
+/// When `bytecode` is provided, builds a [`BytecodeLookupWitness`] from
+/// the `(pre_pc, pre_opcode, post_pc, post_opcode)` of every step.
+pub fn build_witness(
+  steps: &[EvmStep],
+  bytecode: Option<&[u8]>,
+) -> Result<Witness, WitnessError> {
+  build_witness_with_frames(steps, bytecode, &[])
+}
+
+/// Build a full witness from captured EVM steps with call-frame metadata.
+///
+/// When `call_frames` is non-empty, the proof tree contains [`ProofNode::Call`]
+/// nodes at sub-call boundaries.  Steps are grouped by `call_depth`: a contiguous
+/// run at `depth > 0` between matching `call`/`call_end` events becomes a
+/// `Call` sub-tree.
+pub fn build_witness_with_frames(
+  steps: &[EvmStep],
+  bytecode: Option<&[u8]>,
+  call_frames: &[CallFrame],
+) -> Result<Witness, WitnessError> {
   if steps.is_empty() {
     return Err(WitnessError::Empty);
   }
 
+  let max_depth = steps.iter().map(|s| s.call_depth).max().unwrap_or(0);
   let mut all_rows: Vec<Row> = Vec::new();
   let mut leaves: Vec<ProofNode> = Vec::new();
+  let mut bc_witness = BytecodeLookupWitness::new();
 
   for step in steps {
-    let compiled = vm::compile(step.opcode, &step.pre_stack)
-      .ok_or(WitnessError::UnsupportedOpcode(step.opcode))?;
+    // Compile the opcode into micro-ops.
+    let compiled = if let Some(ref data) = step.pre_push_data {
+      // PUSH1..PUSH32: use the dedicated compiler with inline bytecode data.
+      vm::compile_push(data)
+    } else {
+      vm::compile(step.pre_opcode, &step.pre_stack)
+        .ok_or(WitnessError::UnsupportedOpcode(step.pre_opcode))?
+    };
 
     // Compute advice limbs the prover must supply.
     let advice_limbs = compute_advice(step, &compiled);
@@ -74,29 +158,49 @@ pub fn build_witness(steps: &[EvmStep]) -> Result<Witness, WitnessError> {
     // Collect rows.
     all_rows.extend_from_slice(&vm.trace);
 
+    // Record bytecode lookup entries (if bytecode provided).
+    if bytecode.is_some() {
+      bc_witness.push_step(
+        step.pre_pc,
+        step.pre_opcode,
+        step.post_pc,
+        step.post_opcode,
+      );
+    }
+
     // Build EvmState pre/post.
     let pre_state = EvmState {
       stack: step.pre_stack.clone(),
       memory: Vec::new(),
-      pc: step.pc,
+      pc: step.pre_pc,
       gas: step.gas_before,
       storage: Default::default(),
       transient_storage: Default::default(),
       jumpdest_table: Default::default(),
+      address: step.address,
+      caller: step.caller,
+      balance: step.balance,
+      nonce: step.nonce,
+      code_hash: step.code_hash,
     };
 
     let post_state = EvmState {
       stack: step.post_stack.clone(),
       memory: Vec::new(),
-      pc: step.pc + 1, // simplified; PUSH advances by data len
+      pc: step.post_pc,
       gas: step.gas_after,
       storage: Default::default(),
       transient_storage: Default::default(),
       jumpdest_table: Default::default(),
+      address: step.address,
+      caller: step.caller,
+      balance: step.balance,
+      nonce: step.nonce,
+      code_hash: step.code_hash,
     };
 
     leaves.push(ProofNode::Leaf {
-      opcode: step.opcode,
+      opcode: step.pre_opcode,
       pre_state,
       post_state,
       leaf_proof: LeafProof::placeholder(),
@@ -109,6 +213,10 @@ pub fn build_witness(steps: &[EvmStep]) -> Result<Witness, WitnessError> {
     rows: all_rows,
     tree,
     n_steps: steps.len(),
+    bytecode_lookup: bc_witness,
+    bytecode_raw: bytecode.map(|b| b.to_vec()),
+    call_frames: call_frames.to_vec(),
+    max_depth,
   })
 }
 
@@ -133,25 +241,25 @@ fn compute_advice(step: &EvmStep, compiled: &Compiled) -> Vec<u128> {
   }
 
   // ISZERO and EQ: [boolean, GF(2^128) inverse of accumulator].
-  if step.opcode == ISZERO {
+  if step.pre_opcode == ISZERO {
     return compute_zero_check_advice(&step.pre_stack, true);
   }
-  if step.opcode == EQ {
+  if step.pre_opcode == EQ {
     return compute_zero_check_advice(&step.pre_stack, false);
   }
 
   // LT, GT, SLT, SGT: [eq_hi_boolean, GF(2^128) inverse for zero-check].
-  if matches!(step.opcode, LT | GT | SLT | SGT) {
+  if matches!(step.pre_opcode, LT | GT | SLT | SGT) {
     return compute_cmp_advice(step);
   }
 
   // SDIV/SMOD: quotient + remainder (signed division).
-  if matches!(step.opcode, SDIV | SMOD) {
+  if matches!(step.pre_opcode, SDIV | SMOD) {
     return compute_sdiv_smod_advice(step);
   }
 
   // EXP: binary exponentiation intermediate chain.
-  if step.opcode == EXP {
+  if step.pre_opcode == EXP {
     return compute_exp_advice(step);
   }
 
@@ -234,7 +342,7 @@ fn compute_cmp_advice(step: &EvmStep) -> Vec<u128> {
 
   // For SLT/SGT: we flip the sign bit (bit 127 of the high limb).
   let sign_mask: u128 = 1u128 << 127;
-  let (a_hi, b_hi) = match step.opcode {
+  let (a_hi, b_hi) = match step.pre_opcode {
     SLT | SGT => (limbs_a[1] ^ sign_mask, limbs_b[1] ^ sign_mask),
     _ => (limbs_a[1], limbs_b[1]),
   };
@@ -267,7 +375,7 @@ fn compute_div_mod_advice(step: &EvmStep) -> Vec<u128> {
   let a = step.pre_stack.first().copied().unwrap_or(U256::ZERO);
   let b = step.pre_stack.get(1).copied().unwrap_or(U256::ZERO);
 
-  let (quot, rem) = match step.opcode {
+  let (quot, rem) = match step.pre_opcode {
     DIV => {
       if b.is_zero() {
         (U256::ZERO, U256::ZERO)
@@ -469,4 +577,161 @@ fn fold_leaves(mut leaves: Vec<ProofNode>) -> ProofNode {
     leaves = next;
   }
   leaves.into_iter().next().unwrap()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Block-level witness (transaction chaining)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a block-level witness by chaining multiple transaction traces.
+///
+/// Each [`TxTrace`] becomes a per-tx witness wrapped in a
+/// [`ProofNode::TxBoundary`].  The resulting boundary nodes are folded
+/// into a balanced binary `Seq` tree — exactly like individual leaves.
+pub fn build_block_witness(txs: &[TxTrace]) -> Result<Witness, WitnessError> {
+  if txs.is_empty() {
+    return Err(WitnessError::Empty);
+  }
+
+  let mut all_rows: Vec<Row> = Vec::new();
+  let mut all_call_frames: Vec<CallFrame> = Vec::new();
+  let mut combined_bc = BytecodeLookupWitness::new();
+  let mut combined_raw: Option<Vec<u8>> = None;
+  let mut total_steps: usize = 0;
+  let mut max_depth: u32 = 0;
+  let mut tx_trees: Vec<ProofNode> = Vec::with_capacity(txs.len());
+
+  for tx in txs {
+    let w = build_witness_with_frames(
+      &tx.steps,
+      tx.bytecode.as_deref(),
+      &tx.call_frames,
+    )?;
+
+    // Extract pre/post state from the per-tx tree.
+    let pre_state = leftmost_leaf_pre(&w.tree);
+    let post_state = rightmost_leaf_post(&w.tree);
+
+    tx_trees.push(ProofNode::TxBoundary {
+      tx_index: tx.tx_index,
+      tx_hash: tx.tx_hash,
+      gas_limit: tx.gas_limit,
+      gas_used: tx.gas_used,
+      success: tx.success,
+      pre_state,
+      post_state,
+      inner: Box::new(w.tree),
+    });
+
+    all_rows.extend(w.rows);
+    all_call_frames.extend(w.call_frames);
+    combined_bc.entries.extend_from_slice(&w.bytecode_lookup.entries);
+    if let Some(raw) = w.bytecode_raw {
+      combined_raw.get_or_insert_with(Vec::new).extend(raw);
+    }
+    total_steps += w.n_steps;
+    max_depth = max_depth.max(w.max_depth);
+  }
+
+  let tree = fold_leaves(tx_trees);
+
+  Ok(Witness {
+    rows: all_rows,
+    tree,
+    n_steps: total_steps,
+    bytecode_lookup: combined_bc,
+    bytecode_raw: combined_raw,
+    call_frames: all_call_frames,
+    max_depth,
+  })
+}
+
+/// Extract the pre-state from the leftmost leaf of a proof tree.
+fn leftmost_leaf_pre(node: &ProofNode) -> EvmState {
+  match node {
+    ProofNode::Leaf { pre_state, .. } => pre_state.clone(),
+    ProofNode::Seq { left, .. } => leftmost_leaf_pre(left),
+    ProofNode::Branch { cond, .. } => leftmost_leaf_pre(cond),
+    ProofNode::Call { inner, .. } => leftmost_leaf_pre(inner),
+    ProofNode::TxBoundary { pre_state, .. } => pre_state.clone(),
+    ProofNode::BlockBoundary { pre_state, .. } => pre_state.clone(),
+  }
+}
+
+/// Extract the post-state from the rightmost leaf of a proof tree.
+fn rightmost_leaf_post(node: &ProofNode) -> EvmState {
+  match node {
+    ProofNode::Leaf { post_state, .. } => post_state.clone(),
+    ProofNode::Seq { right, .. } => rightmost_leaf_post(right),
+    ProofNode::Branch { not_taken, .. } => rightmost_leaf_post(not_taken),
+    ProofNode::Call { inner, .. } => rightmost_leaf_post(inner),
+    ProofNode::TxBoundary { post_state, .. } => post_state.clone(),
+    ProofNode::BlockBoundary { post_state, .. } => post_state.clone(),
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chain-level witness (block composition)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a chain-level witness by composing multiple block traces.
+///
+/// Each [`BlockTrace`] becomes a per-block witness wrapped in a
+/// [`ProofNode::BlockBoundary`].  The resulting boundary nodes are folded
+/// into a balanced binary `Seq` tree.
+pub fn build_chain_witness(blocks: &[BlockTrace]) -> Result<Witness, WitnessError> {
+  if blocks.is_empty() {
+    return Err(WitnessError::Empty);
+  }
+
+  let mut all_rows: Vec<Row> = Vec::new();
+  let mut all_call_frames: Vec<CallFrame> = Vec::new();
+  let mut combined_bc = BytecodeLookupWitness::new();
+  let mut combined_raw: Option<Vec<u8>> = None;
+  let mut total_steps: usize = 0;
+  let mut max_depth: u32 = 0;
+  let mut block_trees: Vec<ProofNode> = Vec::with_capacity(blocks.len());
+
+  for blk in blocks {
+    let w = build_block_witness(&blk.transactions)?;
+
+    let pre_state = leftmost_leaf_pre(&w.tree);
+    let post_state = rightmost_leaf_post(&w.tree);
+
+    block_trees.push(ProofNode::BlockBoundary {
+      block_number: blk.block_number,
+      block_hash: blk.block_hash,
+      parent_hash: blk.parent_hash,
+      timestamp: blk.timestamp,
+      coinbase: blk.coinbase,
+      gas_limit: blk.gas_limit,
+      gas_used: blk.gas_used,
+      state_root_pre: blk.state_root_pre,
+      state_root_post: blk.state_root_post,
+      pre_state,
+      post_state,
+      inner: Box::new(w.tree),
+    });
+
+    all_rows.extend(w.rows);
+    all_call_frames.extend(w.call_frames);
+    combined_bc.entries.extend_from_slice(&w.bytecode_lookup.entries);
+    if let Some(raw) = w.bytecode_raw {
+      combined_raw.get_or_insert_with(Vec::new).extend(raw);
+    }
+    total_steps += w.n_steps;
+    max_depth = max_depth.max(w.max_depth);
+  }
+
+  let tree = fold_leaves(block_trees);
+
+  Ok(Witness {
+    rows: all_rows,
+    tree,
+    n_steps: total_steps,
+    bytecode_lookup: combined_bc,
+    bytecode_raw: combined_raw,
+    call_frames: all_call_frames,
+    max_depth,
+  })
 }

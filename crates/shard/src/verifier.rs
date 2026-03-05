@@ -6,10 +6,10 @@
 
 use field::GF2_128;
 use poly::MlePoly;
-use transcript::Blake3Transcript;
+use transcript::{Blake3Transcript, Transcript};
 
 use crate::config::RecursiveConfig;
-use crate::proof::{ShardProof, ShardProofBatch};
+use crate::proof::{hash_partition, hash_shard_evals, ShardProof, ShardProofBatch};
 use crate::prover::split_mle;
 
 /// Result of verifying a single shard.
@@ -27,6 +27,11 @@ pub struct ShardVerifyResult {
 /// sub-MLE at the challenge point.  In production this comes from a PCS
 /// opening; in tests it can be computed directly.
 ///
+/// The `shard_commitment` in the proof is absorbed into the forked
+/// transcript, mirroring the prover's ordering.  The caller is responsible
+/// for verifying that `shard_commitment` matches the expected data (e.g.
+/// via [`verify_all`] or external PCS).
+///
 /// Returns `Some(ShardVerifyResult)` on success, `None` on failure.
 pub fn verify_shard(
   proof: &ShardProof,
@@ -34,6 +39,7 @@ pub fn verify_shard(
   root_transcript: &Blake3Transcript,
 ) -> Option<ShardVerifyResult> {
   let mut t = root_transcript.fork("shard", proof.shard_idx);
+  t.absorb_bytes(&proof.shard_commitment);
   let challenges = sumcheck::verify(&proof.sumcheck, oracle_eval, &mut t)?;
   Some(ShardVerifyResult {
     shard_idx: proof.shard_idx,
@@ -49,7 +55,10 @@ pub fn verify_shard(
 ///
 /// Checks:
 /// 1. `batch.total_sum == poly.sum()`
-/// 2. Each shard proof verifies with the correct oracle evaluation.
+/// 2. `shard_proofs[i].shard_idx == i` (ordering).
+/// 3. Each shard's `shard_commitment` matches `hash_shard_evals(i, sub_mle)`.
+/// 4. `batch.partition_root == hash_partition(all shard_commitments)`.
+/// 5. Each shard proof verifies with the correct oracle evaluation.
 ///
 /// Returns `Some(Vec<ShardVerifyResult>)` on success, `None` on failure.
 pub fn verify_all(
@@ -69,13 +78,31 @@ pub fn verify_all(
     return None;
   }
 
+  // Verify partition_root over all shard commitments.
+  let shard_commits: Vec<_> = batch.shard_proofs.iter().map(|p| p.shard_commitment).collect();
+  if batch.partition_root != hash_partition(&shard_commits) {
+    return None;
+  }
+
   let mut results = Vec::with_capacity(batch.shard_proofs.len());
 
-  for (proof, sub) in batch.shard_proofs.iter().zip(&sub_mles) {
+  for (i, (proof, sub)) in batch.shard_proofs.iter().zip(&sub_mles).enumerate() {
+    // Check shard_idx ordering.
+    if proof.shard_idx != i as u32 {
+      return None;
+    }
+
+    // Verify shard boundary commitment.
+    let expected_commitment = hash_shard_evals(i as u32, &sub.evals);
+    if proof.shard_commitment != expected_commitment {
+      return None;
+    }
+
     // Compute oracle eval: evaluate the sub-MLE at the challenge point.
     // We first extract challenges by running the verifier with final_eval
     // (same approach as the sumcheck tests).
     let mut t_tmp = root_transcript.fork("shard", proof.shard_idx);
+    t_tmp.absorb_bytes(&proof.shard_commitment);
     let challenges = sumcheck::verify(&proof.sumcheck, proof.sumcheck.final_eval, &mut t_tmp)?;
 
     let oracle_eval = sub.evaluate(&challenges);
@@ -154,8 +181,9 @@ mod tests {
     let root_t = Blake3Transcript::new();
     let proof = crate::prover::prove_shard(0, sub.clone(), &root_t);
 
-    // Compute oracle eval
+    // Compute oracle eval — must absorb shard_commitment to match prover's transcript.
     let mut t_tmp = root_t.fork("shard", 0);
+    t_tmp.absorb_bytes(&proof.shard_commitment);
     let challenges =
       sumcheck::verify(&proof.sumcheck, proof.sumcheck.final_eval, &mut t_tmp).unwrap();
     let oracle = sub.evaluate(&challenges);
@@ -198,5 +226,41 @@ mod tests {
     let results = verify_all(&batch, &poly, &cfg, &root_t);
     assert!(results.is_some());
     assert_eq!(results.unwrap().len(), 1);
+  }
+
+  #[test]
+  fn reject_swapped_shard_order() {
+    let evals: Vec<GF2_128> = (1u64..=16).map(g).collect();
+    let poly = MlePoly::new(evals);
+    let cfg = test_config();
+    let root_t = Blake3Transcript::new();
+    let mut batch = prove_all(&poly, &cfg, &root_t);
+    // Swap shard 0 and shard 1 — shard_idx ordering check should reject.
+    batch.shard_proofs.swap(0, 1);
+    assert!(verify_all(&batch, &poly, &cfg, &root_t).is_none());
+  }
+
+  #[test]
+  fn reject_tampered_shard_commitment() {
+    let evals: Vec<GF2_128> = (1u64..=16).map(g).collect();
+    let poly = MlePoly::new(evals);
+    let cfg = test_config();
+    let root_t = Blake3Transcript::new();
+    let mut batch = prove_all(&poly, &cfg, &root_t);
+    // Tamper with shard 0's boundary commitment.
+    batch.shard_proofs[0].shard_commitment[0] ^= 0xff;
+    assert!(verify_all(&batch, &poly, &cfg, &root_t).is_none());
+  }
+
+  #[test]
+  fn reject_tampered_partition_root() {
+    let evals: Vec<GF2_128> = (1u64..=16).map(g).collect();
+    let poly = MlePoly::new(evals);
+    let cfg = test_config();
+    let root_t = Blake3Transcript::new();
+    let mut batch = prove_all(&poly, &cfg, &root_t);
+    // Tamper with the partition root.
+    batch.partition_root[0] ^= 0xff;
+    assert!(verify_all(&batch, &poly, &cfg, &root_t).is_none());
   }
 }

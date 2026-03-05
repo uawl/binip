@@ -7,7 +7,7 @@ use sumcheck::SumcheckProof;
 ///
 /// Each node takes `fan_in` child claims and produces a sumcheck proof
 /// that the sum of those claims is correct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct LevelProof {
   /// Recursion level (0 = first aggregation above shards).
   pub level: u32,
@@ -20,7 +20,7 @@ pub struct LevelProof {
 }
 
 /// Complete recursive proof from shards to root.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct RecursiveProof {
   /// Level proofs, outer index = level (0 .. depth-1).
   /// `levels[l]` contains the proofs at recursion level `l`.

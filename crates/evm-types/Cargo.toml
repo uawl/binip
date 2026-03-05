@@ -7,3 +7,4 @@ edition = "2024"
 revm      = { workspace = true }
 thiserror = { workspace = true }
 blake3    = { workspace = true }
+bincode   = { workspace = true }

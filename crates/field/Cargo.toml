@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 rand = { workspace = true }
 bytemuck = { workspace = true }
+bincode = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

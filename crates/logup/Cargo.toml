@@ -11,6 +11,7 @@ poly       = { path = "../poly" }
 sumcheck   = { path = "../sumcheck" }
 transcript = { path = "../transcript" }
 rand       = { workspace = true }
+bincode    = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

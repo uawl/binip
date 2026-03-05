@@ -38,6 +38,10 @@ use rayon::prelude::*;
 use transcript::{Blake3Transcript, Transcript};
 use vm::Row;
 
+use crate::bytecode_lookup::{
+  prove_bytecode_lookup, verify_bytecode_lookup, BytecodeLookupCommitment, BytecodeLookupProof,
+  BytecodeLookupWitness,
+};
 use crate::decomp;
 
 pub use logup::{LogUpClaims, LogUpProof};
@@ -45,7 +49,7 @@ pub use logup::{LogUpClaims, LogUpProof};
 // ── R/W Log types ────────────────────────────────────────────────────────────
 
 /// A single memory read/write operation recorded from the execution trace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub struct RwEntry {
   /// Address or key of the access (low 128 bits).
   pub addr: u128,
@@ -75,7 +79,7 @@ pub enum MemType {
 /// The recursive proof layer (Phase B) uses these summaries to chain
 /// adjacent shards; Phase C binds `initial_value` / `final_value` to
 /// Merkle roots for persistent storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub struct RwSummary {
   pub addr: u128,
   pub initial_value: u128,
@@ -96,7 +100,7 @@ pub struct RwLog {
 }
 
 /// LogUp proof for a single R/W log permutation argument.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct RwProof {
   /// LogUp proof: execution-order entries ⊆ sorted entries.
   pub logup: LogUpProof,
@@ -114,7 +118,7 @@ pub struct RwProof {
 }
 
 /// Per-address summaries extracted from the R/W log.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, bincode::Encode, bincode::Decode)]
 pub struct RwSummaries {
   pub mem: Vec<RwSummary>,
   pub emem: Vec<RwSummary>,
@@ -137,10 +141,15 @@ pub struct LookupWitness {
   pub mul_op: Vec<GF2_128>,
   /// R/W logs for memory consistency (Phase A).
   pub rw: RwLog,
+  /// Bytecode `(pc, opcode)` lookup witness.
+  pub bytecode: BytecodeLookupWitness,
+  /// Raw bytecode bytes (needed by the prover to build the table).
+  /// Set by the caller; `None` if no bytecode proof is needed.
+  pub bytecode_raw: Option<Vec<u8>>,
 }
 
 /// LogUp proofs, one per active LUT table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct LookupProofs {
   pub range: Option<(LogUpProof, LookupTable)>,
   pub and_op: Option<(LogUpProof, LookupTable)>,
@@ -156,6 +165,8 @@ pub struct LookupProofs {
   /// Extracted during proving; the verifier re-derives from sorted entries
   /// and checks they match.
   pub rw_summaries: RwSummaries,
+  /// Bytecode `(pc, opcode)` LogUp proof.
+  pub bytecode: Option<BytecodeLookupProof>,
 }
 
 /// Succinct witness commitments for the lookup tables.
@@ -163,7 +174,7 @@ pub struct LookupProofs {
 /// Replaces [`LookupWitness`] in the proof: O(1) instead of O(n).
 /// Each active table stores a 32-byte blake3 digest of the padded
 /// witness and its padded length (needed for transcript replay).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct LookupCommitments {
   pub range: Option<([u8; 32], usize)>,
   pub and_op: Option<([u8; 32], usize)>,
@@ -174,6 +185,8 @@ pub struct LookupCommitments {
   pub rw_emem: Option<([u8; 32], usize)>,
   pub rw_storage: Option<([u8; 32], usize)>,
   pub rw_transient: Option<([u8; 32], usize)>,
+  /// Bytecode lookup witness commitment.
+  pub bytecode: Option<BytecodeLookupCommitment>,
 }
 
 #[inline]
@@ -191,6 +204,8 @@ pub fn collect_witnesses(rows: &[Row]) -> LookupWitness {
     add_op: Vec::new(),
     mul_op: Vec::new(),
     rw: RwLog::default(),
+    bytecode: BytecodeLookupWitness::new(),
+    bytecode_raw: None,
   };
   for (i, row) in rows.iter().enumerate() {
     emit_decomp_ranges(&mut w, row);
@@ -260,6 +275,8 @@ pub fn collect_witnesses_par(rows: &[Row]) -> LookupWitness {
         add_op: Vec::with_capacity(n * 8),
         mul_op: Vec::with_capacity(n * 8),
         rw: RwLog::default(),
+        bytecode: BytecodeLookupWitness::new(),
+        bytecode_raw: None,
       };
       for (j, row) in chunk.iter().enumerate() {
         emit_decomp_ranges(&mut w, row);
@@ -314,6 +331,8 @@ pub fn collect_witnesses_par(rows: &[Row]) -> LookupWitness {
       storage: Vec::with_capacity(total_storage),
       transient: Vec::with_capacity(total_transient),
     },
+    bytecode: BytecodeLookupWitness::new(),
+    bytecode_raw: None,
   };
   for w in chunks {
     merged.range.extend(w.range);
@@ -1267,6 +1286,7 @@ pub fn prove_lookups(w: &mut LookupWitness, transcript: &mut Blake3Transcript) -
     rw_storage: rw_storage.map(|(p, _)| p),
     rw_transient: rw_transient.map(|(p, _)| p),
     rw_summaries,
+    bytecode: None,
   }
 }
 
@@ -1312,6 +1332,7 @@ pub fn prove_lookups_committed(
 
   // R/W log proofs
   let mut t_rw = transcript.fork("rw:logs", 4);
+  let mut t_bytecode = transcript.fork("lut:bytecode", 5);
   let rw_mem = prove_rw_single(&mut w.rw.mem, MemType::VmMem, b"rw:mem", &mut t_rw);
   let rw_emem = prove_rw_single(&mut w.rw.emem, MemType::EvmMem, b"rw:emem", &mut t_rw);
   let rw_storage = prove_rw_single(&mut w.rw.storage, MemType::Storage, b"rw:storage", &mut t_rw);
@@ -1321,6 +1342,13 @@ pub fn prove_lookups_committed(
     b"rw:transient",
     &mut t_rw,
   );
+
+  // Bytecode LogUp proof.
+  let bytecode_res = if let Some(ref bytecode) = w.bytecode_raw {
+    prove_bytecode_lookup(&mut w.bytecode, bytecode, &mut t_bytecode)
+  } else {
+    None
+  };
 
   let proofs = LookupProofs {
     range: range_res.as_ref().map(|(p, t, _, _)| (p.clone(), t.clone())),
@@ -1337,6 +1365,7 @@ pub fn prove_lookups_committed(
       storage: rw_storage.as_ref().map_or(vec![], |(_, s)| s.clone()),
       transient: rw_transient.as_ref().map_or(vec![], |(_, s)| s.clone()),
     },
+    bytecode: bytecode_res.as_ref().map(|(p, _)| p.clone()),
   };
 
   let commits = LookupCommitments {
@@ -1348,6 +1377,7 @@ pub fn prove_lookups_committed(
     rw_emem: rw_emem.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
     rw_storage: rw_storage.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
     rw_transient: rw_transient.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+    bytecode: bytecode_res.map(|(_, c)| c),
   };
 
   (proofs, commits)
@@ -1369,6 +1399,7 @@ pub fn prove_lookups_par(
   let mut t_and = transcript.fork("lut:and", 1);
   let mut t_add = transcript.fork("lut:add", 2);
   let mut t_mul = transcript.fork("lut:mul", 3);
+  let mut t_bytecode = transcript.fork("lut:bytecode", 5);
 
   let ((range_res, and_res), (add_res, mul_res)) = rayon::join(
     || {
@@ -1413,6 +1444,13 @@ pub fn prove_lookups_par(
     },
   );
 
+  // Bytecode LogUp proof (uses its own forked transcript).
+  let bytecode_res = if let Some(ref bytecode) = w.bytecode_raw {
+    prove_bytecode_lookup(&mut w.bytecode, bytecode, &mut t_bytecode)
+  } else {
+    None
+  };
+
   // R/W log proofs (sequential — sorting is not parallelizable here because
   // prove_rw_single mutates entries in-place).
   let mut t_rw = transcript.fork("rw:logs", 4);
@@ -1443,6 +1481,7 @@ pub fn prove_lookups_par(
       storage: rw_storage.as_ref().map_or(vec![], |(_, s)| s.clone()),
       transient: rw_transient.as_ref().map_or(vec![], |(_, s)| s.clone()),
     },
+    bytecode: bytecode_res.as_ref().map(|(p, _)| p.clone()),
   };
 
   let commits = LookupCommitments {
@@ -1454,6 +1493,7 @@ pub fn prove_lookups_par(
     rw_emem: rw_emem.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
     rw_storage: rw_storage.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
     rw_transient: rw_transient.map(|(p, _)| (rw_exec_digest(&p), p.n_entries)),
+    bytecode: bytecode_res.map(|(_, c)| c),
   };
 
   (proofs, commits)
@@ -1557,6 +1597,7 @@ pub fn verify_lookups_par(
   let mut t_and = transcript.fork("lut:and", 1);
   let mut t_add = transcript.fork("lut:add", 2);
   let mut t_mul = transcript.fork("lut:mul", 3);
+  let mut t_bytecode = transcript.fork("lut:bytecode", 5);
 
   // Check presence consistency first (proof ↔ commit non-emptiness).
   if proofs.range.is_none() != commits.range.is_none() {
@@ -1582,6 +1623,10 @@ pub fn verify_lookups_par(
     return None;
   }
   if proofs.rw_transient.is_none() != commits.rw_transient.is_none() {
+    return None;
+  }
+  // Bytecode presence consistency
+  if proofs.bytecode.is_none() != commits.bytecode.is_none() {
     return None;
   }
 
@@ -1647,6 +1692,13 @@ pub fn verify_lookups_par(
   } else {
     vec![]
   };
+
+  // Bytecode LogUp verification.
+  if let (Some(proof), Some(commit)) = (&proofs.bytecode, &commits.bytecode) {
+    if !verify_bytecode_lookup(proof, commit, &mut t_bytecode) {
+      return None;
+    }
+  }
 
   Some(RwSummaries { mem, emem, storage, transient })
 }

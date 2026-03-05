@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use revm::primitives::U256;
+use revm::primitives::{Address, B256, U256};
 
 /// Concrete EVM execution state at a single step boundary.
 ///
@@ -35,6 +35,16 @@ pub struct EvmState {
   /// Shared across all states in the same execution context.  The type
   /// checker uses this table to validate JUMP / JUMPI targets.
   pub jumpdest_table: BTreeSet<u32>,
+  /// Address of the contract whose bytecode is executing.
+  pub address: Address,
+  /// Caller of the current execution context (msg.sender).
+  pub caller: Address,
+  /// Account balance of the executing contract (in wei).
+  pub balance: U256,
+  /// Account nonce of the executing contract.
+  pub nonce: u64,
+  /// Code hash of the executing contract's bytecode (keccak256).
+  pub code_hash: B256,
 }
 
 impl EvmState {
@@ -47,6 +57,11 @@ impl EvmState {
       storage: HashMap::new(),
       transient_storage: HashMap::new(),
       jumpdest_table: BTreeSet::new(),
+      address: Address::ZERO,
+      caller: Address::ZERO,
+      balance: U256::ZERO,
+      nonce: 0,
+      code_hash: B256::ZERO,
     }
   }
 
@@ -60,6 +75,11 @@ impl EvmState {
       storage: HashMap::new(),
       transient_storage: HashMap::new(),
       jumpdest_table: BTreeSet::new(),
+      address: Address::ZERO,
+      caller: Address::ZERO,
+      balance: U256::ZERO,
+      nonce: 0,
+      code_hash: B256::ZERO,
     }
   }
 
@@ -73,6 +93,11 @@ impl EvmState {
       storage: HashMap::new(),
       transient_storage: HashMap::new(),
       jumpdest_table: jumpdests,
+      address: Address::ZERO,
+      caller: Address::ZERO,
+      balance: U256::ZERO,
+      nonce: 0,
+      code_hash: B256::ZERO,
     }
   }
 }

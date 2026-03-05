@@ -8,8 +8,8 @@ name = "e2e_bench"
 harness = false
 
 [[bin]]
-name = "profile_cpu"
-path = "src/profile_cpu.rs"
+name = "profile"
+path = "src/profile.rs"
 
 [dependencies]
 e2e        = { path = "../e2e" }
@@ -21,3 +21,4 @@ criterion  = { version = "0.5", features = ["html_reports"] }
 rayon      = { version = "1.11.0" }
 mimalloc   = { version = "0.1", default-features = false, features = ["extended"] }
 libmimalloc-sys = { version = "0.1" }
+bincode.workspace = true

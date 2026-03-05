@@ -10,8 +10,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::hint::black_box;
 
-use e2e::{EvmStep, build_witness, prove_cpu, prove_cpu_par, verify};
-use revm::primitives::U256;
+use e2e::{EvmStep, build_witness, compress, prove_cpu_par, verify, verify_compressed};
+use revm::primitives::{Address, B256, U256};
 
 /// Enable large (2 MiB) OS pages for all mimalloc allocations.
 fn enable_large_pages() {
@@ -33,7 +33,7 @@ fn enable_large_pages() {
 /// Each step stores only the operands it touches (≤3 elements), so
 /// total memory is O(n) regardless of trace length.
 fn mixed_trace(n: usize) -> Vec<EvmStep> {
-  use revm::bytecode::opcode::{ADD, AND, PUSH0, SUB};
+  use revm::bytecode::opcode::{ADD, AND, PUSH32, SUB};
   let bin_ops = [ADD, SUB, AND];
   let mut steps = Vec::with_capacity(n);
 
@@ -42,25 +42,39 @@ fn mixed_trace(n: usize) -> Vec<EvmStep> {
   let top1 = U256::from(101u64);
   let mut bin_idx = 0usize;
   let mut last_gas = 1_000_000_000u64;
+  let mut pc = 0u32;
 
   for i in 0..n {
     if i % 2 == 0 {
-      // ── PUSH0: depth 2 → 3 ────────────────────────────────────
+      // ── PUSH32: depth 2 → 3 ────────────────────────────────────
+      let next_pc = pc + 1 + 32;
+      let next_op = if i + 1 < n { bin_ops[bin_idx % 3] } else { PUSH32 };
       steps.push(EvmStep {
-        opcode: PUSH0,
-        pc: i as u32,
+        pre_opcode: PUSH32,
+        post_opcode: next_op,
+        pre_pc: pc,
+        post_pc: next_pc,
         gas_before: last_gas,
-        gas_after: last_gas - 2,
+        gas_after: last_gas - 3,
         pre_stack: vec![top0, top1],
-        post_stack: vec![U256::ZERO, top0, top1],
+        post_stack: vec![U256::from_le_bytes([0xAA; 32]), top0, top1],
+        pre_push_data: Some(vec![0xAA; 32]),
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       });
-      last_gas -= 2;
+      last_gas -= 3;
+      pc = next_pc;
     } else {
       // ── Binary op: depth 3 → 2 ────────────────────────────────
-      // Operands are the top two: [U256::ZERO, top0] from previous PUSH0.
+      // Operands are the top two: [U256::ZERO, top0] from previous PUSH32.
       let op = bin_ops[bin_idx % 3];
       bin_idx += 1;
-      let a = U256::ZERO;
+      let a = U256::from_le_bytes([0xAA; 32]);
       let b = top0;
       let result = match op {
         ADD => a.overflowing_add(b).0,
@@ -68,17 +82,29 @@ fn mixed_trace(n: usize) -> Vec<EvmStep> {
         AND => a & b,
         _ => unreachable!(),
       };
+      let next_pc = pc + 1;
       steps.push(EvmStep {
-        opcode: op,
-        pc: i as u32,
+        pre_opcode: op,
+        post_opcode: PUSH32,
+        pre_pc: pc,
+        post_pc: next_pc,
         gas_before: last_gas,
         gas_after: last_gas - 3,
         pre_stack: vec![a, b, top1],
         post_stack: vec![result, top1],
+        pre_push_data: None,
+        post_push_data: Some(vec![0xAA; 32]),
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       });
       // Update running state.
       top0 = result;
       last_gas -= 3;
+      pc = next_pc;
     }
   }
   steps
@@ -89,12 +115,9 @@ fn mixed_trace(n: usize) -> Vec<EvmStep> {
 /// Alternates PUSH0 → MUL (or DIV/EXP) so that every other step uses advice.
 /// Stack depth oscillates: 2 → PUSH0 → 3 → MUL → 2.
 fn advice_trace(n: usize) -> Vec<EvmStep> {
-  use revm::bytecode::opcode::{MUL, PUSH0};
+  use revm::bytecode::opcode::{EXP, PUSH0};
   let mut steps = Vec::with_capacity(n);
 
-  // Stack: depth 2 → PUSH0 → depth 3 → MUL → depth 2
-  // MUL(0, x) = 0, so after first cycle all MULs are MUL(0,0) = 0.
-  // This is fine for profiling — exercises Advice2 + CheckMul path.
   let mut s0 = U256::from(7u64);
   let s1 = U256::from(3u64);
   let mut last_gas = 1_000_000_000u64;
@@ -102,13 +125,24 @@ fn advice_trace(n: usize) -> Vec<EvmStep> {
   for i in 0..n {
     if i % 2 == 0 {
       let cost = 2u64;
+      let next_op = if i + 1 < n { EXP } else { PUSH0 };
       steps.push(EvmStep {
-        opcode: PUSH0,
-        pc: i as u32,
+        pre_opcode: PUSH0,
+        post_opcode: next_op,
+        pre_pc: i as u32,
+        post_pc: i as u32 + 1,
         gas_before: last_gas,
         gas_after: last_gas - cost,
         pre_stack: vec![s0, s1],
         post_stack: vec![U256::ZERO, s0, s1],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       });
       last_gas -= cost;
     } else {
@@ -116,13 +150,24 @@ fn advice_trace(n: usize) -> Vec<EvmStep> {
       let b = s0;
       let result = a.overflowing_mul(b).0;
       let cost = 5u64;
+      let next_op = if i + 1 < n { PUSH0 } else { EXP };
       steps.push(EvmStep {
-        opcode: MUL,
-        pc: i as u32,
+        pre_opcode: EXP,
+        post_opcode: next_op,
+        pre_pc: i as u32,
+        post_pc: i as u32 + 1,
         gas_before: last_gas,
         gas_after: last_gas - cost,
         pre_stack: vec![a, b, s1],
         post_stack: vec![result, s1],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       });
       s0 = result;
       last_gas -= cost;
@@ -132,7 +177,7 @@ fn advice_trace(n: usize) -> Vec<EvmStep> {
 }
 
 fn bench_trace(label: &str, steps: &[EvmStep]) {
-  let witness = build_witness(steps).unwrap();
+  let witness = build_witness(steps, None).unwrap();
   eprintln!(
     "[{}] {} steps → {} rows",
     label,
@@ -141,20 +186,39 @@ fn bench_trace(label: &str, steps: &[EvmStep]) {
   );
 
   let t0 = std::time::Instant::now();
-  let _ = black_box(prove_cpu_par(black_box(&witness))).unwrap();
+  let (proof, params) = black_box(prove_cpu_par(black_box(&witness))).unwrap();
   let t1 = std::time::Instant::now();
 
-  let (proof, params) = black_box(prove_cpu(black_box(&witness))).unwrap();
+  let res = verify(&proof, &params);
   let t2 = std::time::Instant::now();
 
-  let res = verify(&proof, &params);
-  let t3 = std::time::Instant::now();
+  let proof_vec = bincode::encode_to_vec(&proof, bincode::config::standard()).unwrap();
+  eprintln!("[{}] proof size: {:.2} KiB", label, proof_vec.len() as f64 / 1024.0);
 
-  eprintln!("[{}] parallel {:.2?}  seq {:.2?}", label, t1 - t0, t2 - t1);
+  // Recursive compression
+  let t3 = std::time::Instant::now();
+  let compressed = compress(&proof, &params).unwrap();
+  let t4 = std::time::Instant::now();
+  let comp_vec = bincode::encode_to_vec(&compressed, bincode::config::standard()).unwrap();
+  eprintln!("[{}] compressed size: {:.2} KiB ({:.1}x reduction)",
+    label, comp_vec.len() as f64 / 1024.0,
+    proof_vec.len() as f64 / comp_vec.len() as f64);
+
+  let t5 = std::time::Instant::now();
+  let comp_res = verify_compressed(&compressed);
+  let t6 = std::time::Instant::now();
+
+  eprintln!("[{}] parallel {:.2?}", label, t1 - t0);
+  eprintln!("[{}] compress {:.2?}", label, t4 - t3);
   if let Err(err) = res {
     eprintln!("[{}] verification FAILED: {:?}", label, err);
   } else {
     eprintln!("[{}] verification ok in {:.2?}", label, t3 - t2);
+  }
+  if let Err(err) = comp_res {
+    eprintln!("[{}] compressed verification FAILED: {:?}", label, err);
+  } else {
+    eprintln!("[{}] compressed verification ok in {:.2?}", label, t6 - t5);
   }
 }
 

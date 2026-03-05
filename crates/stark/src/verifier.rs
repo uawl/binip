@@ -93,6 +93,9 @@ pub enum VerifyError {
   #[error("boundary PCS opening verification failed")]
   BoundaryPcsOpenFailed,
 
+  #[error("open point mismatch: verifier-derived point differs from proof")]
+  OpenPointMismatch,
+
   #[error("constraint sum {constraint:?} != shard total sum {shard_total:?}")]
   ConstraintSumShardMismatch {
     constraint: GF2_128,
@@ -268,11 +271,22 @@ pub fn verify(proof: &Proof, params: &StarkParams) -> Result<(), VerifyError> {
     });
   }
 
-  // ── 7. PCS opening verification ───────────────────────────────────────
+  // ── 7. Independently derive the PCS opening point (H-3 fix) ──────────
+  let derived_open_point = crate::prover::derive_open_point(
+    &proof.shard_batch,
+    &proof.recursive_proof,
+    &params.config,
+    &shard_transcript,
+  );
+  if derived_open_point != proof.open_point {
+    return Err(VerifyError::OpenPointMismatch);
+  }
+
+  // ── 8. PCS opening verification ───────────────────────────────────────
   let mut pcs_transcript = transcript.clone();
   let pcs_ok = pcs::verify(
     &proof.batch_commit,
-    &proof.open_point,
+    &derived_open_point,
     proof.open_eval,
     &proof.pcs_open,
     &params.pcs_params,
@@ -343,7 +357,7 @@ mod tests {
   fn prove_then_verify() {
     let (rows, tree) = make_trace_and_tree();
     let params = StarkParams::for_n_vars(2);
-    let proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
+    let proof = prover::prove_cpu(&rows, &tree, &params, None).unwrap();
     verify(&proof, &params).unwrap();
   }
 
@@ -351,7 +365,7 @@ mod tests {
   fn verify_rejects_nonzero_constraint_sum() {
     let (rows, tree) = make_trace_and_tree();
     let params = StarkParams::for_n_vars(2);
-    let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
+    let mut proof = prover::prove_cpu(&rows, &tree, &params, None).unwrap();
     proof.constraint_sum = GF2_128::from(1u64); // tamper
     let err = verify(&proof, &params).unwrap_err();
     assert!(matches!(err, VerifyError::ConstraintSumNonZero));
@@ -361,7 +375,7 @@ mod tests {
   fn verify_rejects_tampered_root_claim() {
     let (rows, tree) = make_trace_and_tree();
     let params = StarkParams::for_n_vars(2);
-    let mut proof = prover::prove_cpu(&rows, &tree, &params).unwrap();
+    let mut proof = prover::prove_cpu(&rows, &tree, &params, None).unwrap();
     proof.recursive_proof.root_claim = proof.recursive_proof.root_claim + GF2_128::from(1u64);
     let err = verify(&proof, &params).unwrap_err();
     // Could be recursive verify error or root claim mismatch
@@ -369,5 +383,18 @@ mod tests {
       matches!(err, VerifyError::RecursiveVerify(_))
         || matches!(err, VerifyError::RootClaimMismatch { .. })
     );
+  }
+
+  #[test]
+  fn verify_rejects_tampered_open_point() {
+    let (rows, tree) = make_trace_and_tree();
+    let params = StarkParams::for_n_vars(2);
+    let mut proof = prover::prove_cpu(&rows, &tree, &params, None).unwrap();
+    // Tamper with one coordinate of the open point
+    if let Some(p) = proof.open_point.first_mut() {
+      *p = *p + GF2_128::from(1u64);
+    }
+    let err = verify(&proof, &params).unwrap_err();
+    assert!(matches!(err, VerifyError::OpenPointMismatch));
   }
 }

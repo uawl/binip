@@ -61,7 +61,7 @@ fn default_hash(depth: usize) -> [u8; 32] {
 // ─── SMT Inclusion Proof ─────────────────────────────────────────────────────
 
 /// Inclusion proof for a single key in a 128-bit sparse Merkle tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct SmtProof {
   /// Sibling hashes from leaf (level 0) up to the root (level SMT_DEPTH).
   /// `siblings[i]` is the sibling at level `i`.
@@ -111,7 +111,7 @@ impl SmtProof {
 /// `RwSummaries.storage`), provides SMT inclusion proofs showing:
 /// - `initial_value` exists at `addr` in the pre-state tree.
 /// - `final_value` exists at `addr` in the post-state tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct StorageProof {
   /// SMT root of storage state before execution.
   pub pre_root: [u8; 32],

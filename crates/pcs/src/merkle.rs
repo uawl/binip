@@ -103,7 +103,7 @@ impl MerkleTree {
 
 // ─── MerkleProof ─────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct MerkleProof {
   pub idx: usize,
   /// Sibling hashes from leaf level up to (but not including) the root.

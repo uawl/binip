@@ -19,10 +19,11 @@
 //! | storage count | `left_stor + right_stor = 0` |
 //! | jumpdest hash | `left_jd_hash + right_jd_hash = 0` |
 //!
-//! Each Seq boundary yields 2 rows (8 columns each):
+//! Each Seq boundary yields 3 rows (8 columns each):
 //!
 //! - **Row type 0**: `[left_pc, right_pc, left_depth, right_depth, left_gas_lo, right_gas_lo, left_gas_hi, right_gas_hi]`
 //! - **Row type 1**: `[left_mem, right_mem, left_stor, right_stor, left_jd_hash, right_jd_hash, 0, 0]`
+//! - **Row type 2**: `[left_acct_hash, right_acct_hash, left_nonce, right_nonce, 0, 0, 0, 0]`
 //!
 //! The constraint is the same for both rows:
 //!
@@ -151,6 +152,15 @@ fn walk_boundaries(node: &ProofNode, rows: &mut Vec<BoundaryRow>) {
       let not_taken_post = rightmost_post(not_taken);
       emit_boundary_rows(taken_post, not_taken_post, rows);
     }
+    ProofNode::Call { inner, .. } => {
+      walk_boundaries(inner, rows);
+    }
+    ProofNode::TxBoundary { inner, .. } => {
+      walk_boundaries(inner, rows);
+    }
+    ProofNode::BlockBoundary { inner, .. } => {
+      walk_boundaries(inner, rows);
+    }
   }
 }
 
@@ -192,6 +202,23 @@ fn emit_boundary_rows(left: &EvmState, right: &EvmState, rows: &mut Vec<Boundary
       GF2_128::zero(),
     ],
   });
+
+  // Row 2: account state — balance hash, nonce, code_hash hash, address hash
+  let left_acct = account_hash(left);
+  let right_acct = account_hash(right);
+
+  rows.push(BoundaryRow {
+    cols: [
+      left_acct,
+      right_acct,
+      f(left.nonce as u32),
+      f(right.nonce as u32),
+      GF2_128::zero(),
+      GF2_128::zero(),
+      GF2_128::zero(),
+      GF2_128::zero(),
+    ],
+  });
 }
 
 /// Hash a jumpdest table into a GF(2^128) element for concise comparison.
@@ -211,12 +238,32 @@ fn jumpdest_hash(table: &std::collections::BTreeSet<u32>) -> GF2_128 {
   GF2_128::new(lo, hi)
 }
 
+/// Hash account-level fields (balance, nonce, code_hash, address) into GF(2^128).
+///
+/// Provides a compact equality check for the entire account identity at
+/// Seq / Call boundaries.
+fn account_hash(state: &EvmState) -> GF2_128 {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&state.balance.to_le_bytes::<32>());
+  hasher.update(&state.nonce.to_le_bytes());
+  hasher.update(state.code_hash.as_slice());
+  hasher.update(state.address.as_slice());
+  let hash = hasher.finalize();
+  let bytes = hash.as_bytes();
+  let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+  let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+  GF2_128::new(lo, hi)
+}
+
 /// Leftmost pre-state in a subtree.
 fn leftmost_pre(node: &ProofNode) -> &EvmState {
   match node {
     ProofNode::Leaf { pre_state, .. } => pre_state,
     ProofNode::Seq { left, .. } => leftmost_pre(left),
     ProofNode::Branch { cond, .. } => leftmost_pre(cond),
+    ProofNode::Call { pre_state, .. } => pre_state,
+    ProofNode::TxBoundary { pre_state, .. } => pre_state,
+    ProofNode::BlockBoundary { pre_state, .. } => pre_state,
   }
 }
 
@@ -226,6 +273,9 @@ fn rightmost_post(node: &ProofNode) -> &EvmState {
     ProofNode::Leaf { post_state, .. } => post_state,
     ProofNode::Seq { right, .. } => rightmost_post(right),
     ProofNode::Branch { taken, .. } => rightmost_post(taken),
+    ProofNode::Call { post_state, .. } => post_state,
+    ProofNode::TxBoundary { post_state, .. } => post_state,
+    ProofNode::BlockBoundary { post_state, .. } => post_state,
   }
 }
 
@@ -283,7 +333,7 @@ mod tests {
       right: Box::new(right),
     };
     let rows = extract_boundaries(&seq);
-    assert_eq!(rows.len(), 2); // 2 rows per Seq boundary
+    assert_eq!(rows.len(), 3); // 3 rows per Seq boundary
   }
 
   #[test]
@@ -397,7 +447,7 @@ mod tests {
     };
 
     let rows = extract_boundaries(&outer);
-    assert_eq!(rows.len(), 4); // 2 Seq boundaries × 2 rows each
+    assert_eq!(rows.len(), 6); // 2 Seq boundaries × 3 rows each
 
     let table = BoundaryTraceTable::from_rows(&rows);
     let beta = GF2_128::from(999u64);

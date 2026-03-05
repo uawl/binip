@@ -15,6 +15,7 @@ evm-types  = { path = "../evm-types" }
 blake3     = { workspace = true }
 rayon      = "1"
 thiserror  = { workspace = true }
+bincode    = { workspace = true }
 
 [dev-dependencies]
 revm      = { workspace = true }

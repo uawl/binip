@@ -190,6 +190,75 @@ pub fn type_check(node: &ProofNode) -> Result<(EvmStateType, EvmStateType), Type
 
       Ok((pre_cond, post_t))
     }
+
+    ProofNode::Call {
+      opcode,
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      // The outer CALL opcode must be valid.
+      let op = *opcode;
+      let effect = stack_effect(op).ok_or(TypeError::UnknownOpcode { opcode: op })?;
+
+      let pre_depth = pre_state.stack.len();
+      if pre_depth < effect.min_stack as usize {
+        return Err(TypeError::StackUnderflow {
+          opcode: op,
+          needed: effect.min_stack as usize,
+          available: pre_depth,
+        });
+      }
+
+      let delta = effect.delta();
+      let expected = (pre_depth as i32 + delta) as usize;
+      let actual = post_state.stack.len();
+      if expected != actual {
+        return Err(TypeError::LeafDepthMismatch {
+          opcode: op,
+          pre_depth,
+          delta,
+          expected,
+          actual,
+        });
+      }
+
+      // Type-check the inner sub-call tree.
+      let _ = type_check(inner)?;
+
+      let pre_ty = EvmStateType::from(pre_state);
+      let post_ty = EvmStateType::from(post_state);
+      Ok((pre_ty, post_ty))
+    }
+
+    ProofNode::TxBoundary {
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      // Type-check the inner transaction execution tree.
+      let _ = type_check(inner)?;
+
+      // Transaction boundary: pre/post are the outer states.
+      // Stack should be empty at tx boundaries (fresh EVM context).
+      let pre_ty = EvmStateType::from(pre_state);
+      let post_ty = EvmStateType::from(post_state);
+      Ok((pre_ty, post_ty))
+    }
+
+    ProofNode::BlockBoundary {
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      let _ = type_check(inner)?;
+      let pre_ty = EvmStateType::from(pre_state);
+      let post_ty = EvmStateType::from(post_state);
+      Ok((pre_ty, post_ty))
+    }
   }
 }
 
@@ -257,6 +326,59 @@ fn write_shape(node: &ProofNode, buf: &mut Vec<u8>) {
       write_shape(taken, buf);
       write_shape(not_taken, buf);
     }
+    ProofNode::Call {
+      opcode,
+      pre_state,
+      post_state,
+      callee,
+      inner,
+      ..
+    } => {
+      buf.push(0x03); // tag: Call
+      buf.push(*opcode);
+      buf.extend_from_slice(callee.as_slice());
+      buf.extend_from_slice(&(pre_state.stack.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&(post_state.stack.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&pre_state.pc.to_le_bytes());
+      buf.extend_from_slice(&post_state.pc.to_le_bytes());
+      write_shape(inner, buf);
+    }
+    ProofNode::TxBoundary {
+      tx_index,
+      tx_hash,
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      buf.push(0x04); // tag: TxBoundary
+      buf.extend_from_slice(&tx_index.to_le_bytes());
+      buf.extend_from_slice(tx_hash.as_slice());
+      buf.extend_from_slice(&(pre_state.stack.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&(post_state.stack.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&pre_state.pc.to_le_bytes());
+      buf.extend_from_slice(&post_state.pc.to_le_bytes());
+      write_shape(inner, buf);
+    }
+    ProofNode::BlockBoundary {
+      block_number,
+      block_hash,
+      parent_hash,
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      buf.push(0x05); // tag: BlockBoundary
+      buf.extend_from_slice(&block_number.to_le_bytes());
+      buf.extend_from_slice(block_hash.as_slice());
+      buf.extend_from_slice(parent_hash.as_slice());
+      buf.extend_from_slice(&(pre_state.stack.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&(post_state.stack.len() as u32).to_le_bytes());
+      buf.extend_from_slice(&pre_state.pc.to_le_bytes());
+      buf.extend_from_slice(&post_state.pc.to_le_bytes());
+      write_shape(inner, buf);
+    }
   }
 }
 
@@ -304,6 +426,59 @@ fn write_state(node: &ProofNode, buf: &mut Vec<u8>) {
       write_state(taken, buf);
       write_state(not_taken, buf);
     }
+    ProofNode::Call {
+      opcode,
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      buf.push(0x03);
+      buf.push(*opcode);
+      write_evm_state(pre_state, buf);
+      write_evm_state(post_state, buf);
+      write_state(inner, buf);
+    }
+    ProofNode::TxBoundary {
+      tx_index,
+      tx_hash,
+      gas_used,
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      buf.push(0x04);
+      buf.extend_from_slice(&tx_index.to_le_bytes());
+      buf.extend_from_slice(tx_hash.as_slice());
+      buf.extend_from_slice(&gas_used.to_le_bytes());
+      write_evm_state(pre_state, buf);
+      write_evm_state(post_state, buf);
+      write_state(inner, buf);
+    }
+    ProofNode::BlockBoundary {
+      block_number,
+      block_hash,
+      parent_hash,
+      gas_used,
+      state_root_pre,
+      state_root_post,
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      buf.push(0x05);
+      buf.extend_from_slice(&block_number.to_le_bytes());
+      buf.extend_from_slice(block_hash.as_slice());
+      buf.extend_from_slice(parent_hash.as_slice());
+      buf.extend_from_slice(&gas_used.to_le_bytes());
+      buf.extend_from_slice(state_root_pre.as_slice());
+      buf.extend_from_slice(state_root_post.as_slice());
+      write_evm_state(pre_state, buf);
+      write_evm_state(post_state, buf);
+      write_state(inner, buf);
+    }
   }
 }
 
@@ -337,4 +512,11 @@ fn write_evm_state(state: &crate::state::EvmState, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&k.to_le_bytes::<32>());
     buf.extend_from_slice(&v.to_le_bytes::<32>());
   }
+  // Account state: balance, nonce, code_hash
+  buf.extend_from_slice(&state.balance.to_le_bytes::<32>());
+  buf.extend_from_slice(&state.nonce.to_le_bytes());
+  buf.extend_from_slice(state.code_hash.as_slice());
+  // Address + caller
+  buf.extend_from_slice(state.address.as_slice());
+  buf.extend_from_slice(state.caller.as_slice());
 }

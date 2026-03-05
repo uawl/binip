@@ -54,7 +54,7 @@ pub struct PcsParams {
 // ─── public types ────────────────────────────────────────────────────────────
 
 /// The Merkle-root commitment returned by `commit`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct Commitment {
   pub root: Hash,
   pub n_vars: u32,
@@ -76,7 +76,7 @@ pub struct PcsState {
 /// folded together. One element can be derived from the previous round's
 /// fold result (or is given explicitly at round 0), so we store the other
 /// one as `sibling` plus a Merkle proof for the pair hash.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct RoundQuery {
   /// The left element of the pair at this round.
   pub left: GF2_128,
@@ -87,14 +87,14 @@ pub struct RoundQuery {
 }
 
 /// A query path through all fold rounds for one queried position.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct QueryPath {
   /// One `RoundQuery` per fold round (n_vars entries).
   pub rounds: Vec<RoundQuery>,
 }
 
 /// The full opening proof produced by `open`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct OpenProof {
   /// Merkle roots of each intermediate folded table (rounds 1..n-1).
   /// Length = n_vars - 1.  Round 0 uses the commitment root.
@@ -574,7 +574,7 @@ pub struct BatchBaseFold {
 pub type BatchTensorPCS = BatchBaseFold;
 
 /// Merkle-root commitment for a batch of MLEs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct BatchCommitment {
   pub root: Hash,
   pub n_vars: u32,
@@ -605,7 +605,7 @@ pub struct BatchOpenQuery {
 /// At round 0 the batch Merkle tree commits all entries' pairs together
 /// as "super-pair" leaves.  The verifier needs every entry's pair to
 /// reconstruct the leaf hash.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct BatchRound0Query {
   /// All entries' pairs at this position.  Length = n_entries.
   pub pairs: Vec<(GF2_128, GF2_128)>,
@@ -618,7 +618,7 @@ pub struct BatchRound0Query {
 /// Each query folds its entry's evaluations with the query's own evaluation
 /// point (like single-point PCS), producing per-query intermediate Merkle
 /// trees for rounds 1 through n-1.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct BatchEvalProof {
   /// Intermediate Merkle roots for this query's fold chain.
   /// `round_roots[j]` is the root for the entry's table after `j+1` folds.
@@ -633,7 +633,7 @@ pub struct BatchEvalProof {
 }
 
 /// Batch opening proof.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct BatchOpenProof {
   /// Shared round-0 data (one per sampled position).
   pub round0: Vec<BatchRound0Query>,

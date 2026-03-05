@@ -10,7 +10,7 @@
 /// `2^shard_vars` consecutive evaluations (a sub-MLE).
 ///
 /// At each recursion level, `fan_in` proofs are aggregated into one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub struct RecursiveConfig {
   /// Total number of MLE variables (e.g. 20 → 2^20 evaluations).
   pub total_vars: u32,

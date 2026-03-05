@@ -14,7 +14,7 @@
 //! use e2e::{execute, build_witness, prove_cpu, verify};
 //!
 //! let steps = execute(&bytecode, &input)?;
-//! let witness = build_witness(&steps)?;
+//! let witness = build_witness(&steps, None)?;
 //! let proof = prove_cpu(&witness)?;
 //! verify(&proof, &params)?;
 //! ```
@@ -22,11 +22,11 @@
 mod inspector;
 mod witness;
 
-pub use inspector::{EvmStep, TracingInspector};
-pub use witness::{Witness, WitnessError, build_witness};
+pub use inspector::{CallFrame, EvmStep, TracingInspector};
+pub use witness::{BlockTrace, TxTrace, Witness, WitnessError, build_block_witness, build_chain_witness, build_witness, build_witness_with_frames};
 
 use shard::RecursiveConfig;
-use stark::{Proof, StarkParams};
+use stark::{CompressedProof, Proof, StarkParams};
 
 /// Errors from the E2E pipeline.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +39,12 @@ pub enum E2eError {
 
   #[error("proof verification failed: {0}")]
   Verify(#[from] stark::VerifyError),
+
+  #[error("proof compression failed: {0}")]
+  Compress(#[from] stark::CompressError),
+
+  #[error("compressed proof verification failed: {0}")]
+  CompressedVerify(#[from] stark::compress::CompressVerifyError),
 }
 
 /// Optional tuning knobs exposed to callers.
@@ -74,10 +80,19 @@ fn params_for_with_config(witness: &Witness, cfg: &ProveConfig) -> StarkParams {
   params
 }
 
+/// Extract bytecode context from a witness for the stark prover.
+fn bytecode_ctx(
+  w: &Witness,
+) -> Option<(circuit::bytecode_lookup::BytecodeLookupWitness, Vec<u8>)> {
+  w.bytecode_raw
+    .as_ref()
+    .map(|raw| (w.bytecode_lookup.clone(), raw.clone()))
+}
+
 /// Generate a ZK-STARK proof from a witness (CPU path).
 pub fn prove_cpu(witness: &Witness) -> Result<(Proof, StarkParams), E2eError> {
   let params = params_for(witness);
-  let proof = stark::prove_cpu(&witness.rows, &witness.tree, &params)?;
+  let proof = stark::prove_cpu(&witness.rows, &witness.tree, &params, bytecode_ctx(witness))?;
   Ok((proof, params))
 }
 
@@ -87,7 +102,7 @@ pub fn prove_cpu_with(
   cfg: &ProveConfig,
 ) -> Result<(Proof, StarkParams), E2eError> {
   let params = params_for_with_config(witness, cfg);
-  let proof = stark::prove_cpu(&witness.rows, &witness.tree, &params)?;
+  let proof = stark::prove_cpu(&witness.rows, &witness.tree, &params, bytecode_ctx(witness))?;
   Ok((proof, params))
 }
 
@@ -97,7 +112,8 @@ pub fn prove_cpu_with(
 /// but scales across CPU cores.
 pub fn prove_cpu_par(witness: &Witness) -> Result<(Proof, StarkParams), E2eError> {
   let params = params_for(witness);
-  let proof = stark::prove_cpu_par(&witness.rows, &witness.tree, &params)?;
+  let proof =
+    stark::prove_cpu_par(&witness.rows, &witness.tree, &params, bytecode_ctx(witness))?;
   Ok((proof, params))
 }
 
@@ -107,7 +123,8 @@ pub fn prove_cpu_par_with(
   cfg: &ProveConfig,
 ) -> Result<(Proof, StarkParams), E2eError> {
   let params = params_for_with_config(witness, cfg);
-  let proof = stark::prove_cpu_par(&witness.rows, &witness.tree, &params)?;
+  let proof =
+    stark::prove_cpu_par(&witness.rows, &witness.tree, &params, bytecode_ctx(witness))?;
   Ok((proof, params))
 }
 
@@ -117,9 +134,23 @@ pub fn verify(proof: &Proof, params: &StarkParams) -> Result<(), E2eError> {
   Ok(())
 }
 
+/// Compress a full proof into a recursively compressed proof.
+///
+/// The compression step verifies the inner proof, hashes all intermediate
+/// data into a binding digest, and produces a single aggregation sumcheck
+/// that reduces everything to one PCS opening with fewer queries.
+pub fn compress(proof: &Proof, params: &StarkParams) -> Result<CompressedProof, E2eError> {
+  Ok(stark::compress(proof, params)?)
+}
+
+/// Verify a compressed proof (faster than full verification).
+pub fn verify_compressed(compressed: &CompressedProof) -> Result<(), E2eError> {
+  Ok(stark::verify_compressed(compressed)?)
+}
+
 /// Execute EVM bytecode, generate witness, prove (CPU), and verify — all in one call.
 pub fn prove_and_verify(steps: &[EvmStep]) -> Result<Proof, E2eError> {
-  let witness = build_witness(steps)?;
+  let witness = build_witness(steps, None)?;
   let (proof, params) = prove_cpu(&witness)?;
   verify(&proof, &params)?;
   Ok(proof)
@@ -130,7 +161,7 @@ pub fn prove_and_verify_with(
   steps: &[EvmStep],
   cfg: &ProveConfig,
 ) -> Result<Proof, E2eError> {
-  let witness = build_witness(steps)?;
+  let witness = build_witness(steps, None)?;
   let (proof, params) = prove_cpu_with(&witness, cfg)?;
   verify(&proof, &params)?;
   Ok(proof)
@@ -140,20 +171,35 @@ pub fn prove_and_verify_with(
 mod tests {
   use super::*;
   use evm_types::ProofNode;
-  use revm::primitives::U256;
+  use revm::primitives::{Address, B256, U256};
 
   /// Helper: create a synthetic EvmStep with correct static gas consumption.
   fn step(opcode: u8, pc: u32, pre: &[U256], post: &[U256]) -> EvmStep {
     let cost = evm_types::opcode::gas_cost(opcode)
       .map(|g| g.static_gas)
       .unwrap_or(0);
+    let post_pc = if (0x60..=0x7f).contains(&opcode) {
+      pc + 1 + (opcode as u32 - 0x5f)
+    } else {
+      pc + 1
+    };
     EvmStep {
-      opcode,
-      pc,
+      pre_opcode: opcode,
+      post_opcode: opcode, // synthetic: same opcode
+      pre_pc: pc,
+      post_pc,
       gas_before: 100_000,
       gas_after: 100_000 - cost,
       pre_stack: pre.to_vec(),
       post_stack: post.to_vec(),
+      pre_push_data: None,
+      post_push_data: None,
+      call_depth: 0,
+      address: Address::ZERO,
+      caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
     }
   }
 
@@ -161,7 +207,7 @@ mod tests {
 
   #[test]
   fn witness_empty_returns_error() {
-    let result = build_witness(&[]);
+    let result = build_witness(&[], None);
     assert!(result.is_err());
   }
 
@@ -173,7 +219,7 @@ mod tests {
     let result = U256::from(8u64);
 
     let steps = vec![step(ADD, 0, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     // ADD compiles to Const(carry=0) + 2 Add128 micro-ops (one per limb).
@@ -190,7 +236,7 @@ mod tests {
     let result = U256::from(7u64);
 
     let steps = vec![step(SUB, 1, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     assert!(!witness.rows.is_empty());
@@ -204,7 +250,7 @@ mod tests {
     let result = U256::from(0x0F00u64);
 
     let steps = vec![step(AND, 2, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     // AND compiles to 2 And128 micro-ops.
@@ -215,7 +261,7 @@ mod tests {
   fn witness_push_zero() {
     use revm::bytecode::opcode::PUSH0;
     let steps = vec![step(PUSH0, 0, &[], &[U256::ZERO])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     // PUSH0 compiles to 2 Const ops.
@@ -230,7 +276,7 @@ mod tests {
       step(POP, 0, &[U256::from(42u64)], &[]),
       step(JUMPDEST, 1, &[], &[]),
     ];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 2);
     // Both are noop → 0 rows each. But we still build the tree.
@@ -246,7 +292,7 @@ mod tests {
     let result = U256::from(1u64);
 
     let steps = vec![step(LT, 0, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     assert!(!witness.rows.is_empty());
@@ -261,7 +307,7 @@ mod tests {
     let result = U256::from(1024u64);
 
     let steps = vec![step(EXP, 0, &[base, exp], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     // EXP binary exponentiation: 2 Mov (copy base) +
@@ -278,7 +324,7 @@ mod tests {
     let result = U256::from(14u64);
 
     let steps = vec![step(DIV, 0, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     // DIV: 1 Advice4(quot+rem) + 1 CheckDiv + 2 Mov = 4
@@ -289,7 +335,7 @@ mod tests {
   fn witness_stop() {
     use revm::bytecode::opcode::STOP;
     let steps = vec![step(STOP, 0, &[], &[])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     // STOP compiles to Done → 1 row.
@@ -304,7 +350,7 @@ mod tests {
     let result = U256::from(42u64);
 
     let steps = vec![step(MUL, 0, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 1);
     assert!(!witness.rows.is_empty());
@@ -324,7 +370,7 @@ mod tests {
       ),
       step(STOP, 1, &[], &[]),
     ];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 2);
     // Tree should be Seq(Leaf, Leaf).
@@ -349,7 +395,7 @@ mod tests {
       ),
       step(STOP, 2, &[], &[]),
     ];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
 
     assert_eq!(witness.n_steps, 3);
     // 3 leaves → Seq(Seq(Leaf, Leaf), Leaf)
@@ -366,7 +412,7 @@ mod tests {
   fn witness_unsupported_opcode() {
     // 0xFE is INVALID but mapped to compile_stop. Use something truly unknown.
     let steps = vec![step(0xC0, 0, &[], &[])];
-    let result = build_witness(&steps);
+    let result = build_witness(&steps, None);
     assert!(result.is_err());
   }
 
@@ -389,7 +435,7 @@ mod tests {
       &[U256::from(1u64), U256::from(2u64)],
       &[U256::from(3u64)],
     )];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
     verify(&proof, &params).unwrap();
   }
@@ -401,7 +447,7 @@ mod tests {
     let b = U256::from(7u64);
     let result = U256::from(42u64);
     let steps = vec![step(MUL, 0, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
     verify(&proof, &params).unwrap();
   }
@@ -414,7 +460,7 @@ mod tests {
     let b = U256::from(7u64);
     let result = U256::from(0u64);
     let steps = vec![step(EXP, 0, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
     verify(&proof, &params).unwrap();
   }
@@ -431,20 +477,40 @@ mod tests {
     let gas2 = gas1 - mul_cost;
     let steps = vec![
       EvmStep {
-        opcode: PUSH0,
-        pc: 0,
+        pre_opcode: PUSH0,
+        post_opcode: MUL,
+        pre_pc: 0,
+        post_pc: 1,
         gas_before: gas0,
         gas_after: gas1,
         pre_stack: vec![a, b],
         post_stack: vec![U256::ZERO, a, b],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       },
       EvmStep {
-        opcode: MUL,
-        pc: 1,
+        pre_opcode: MUL,
+        post_opcode: MUL,
+        pre_pc: 1,
+        post_pc: 2,
         gas_before: gas1,
         gas_after: gas2,
         pre_stack: vec![U256::ZERO, a, b],
         post_stack: vec![U256::ZERO, b],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       },
     ];
     prove_and_verify(&steps).unwrap();
@@ -462,20 +528,40 @@ mod tests {
     let gas2 = gas1 - div_cost;
     let steps = vec![
       EvmStep {
-        opcode: PUSH0,
-        pc: 0,
+        pre_opcode: PUSH0,
+        post_opcode: DIV,
+        pre_pc: 0,
+        post_pc: 1,
         gas_before: gas0,
         gas_after: gas1,
         pre_stack: vec![a, b],
         post_stack: vec![U256::ZERO, a, b],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       },
       EvmStep {
-        opcode: DIV,
-        pc: 1,
+        pre_opcode: DIV,
+        post_opcode: DIV,
+        pre_pc: 1,
+        post_pc: 2,
         gas_before: gas1,
         gas_after: gas2,
         pre_stack: vec![U256::ZERO, a, b],
         post_stack: vec![U256::ZERO, b],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       },
     ];
     prove_and_verify(&steps).unwrap();
@@ -488,7 +574,7 @@ mod tests {
     let b = U256::from(7u64);
     let result = U256::from(14u64);
     let steps = vec![step(DIV, 0, &[a, b], &[result])];
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
     verify(&proof, &params).unwrap();
   }
@@ -500,20 +586,40 @@ mod tests {
     // Gas must flow: ADD.gas_after == STOP.gas_before
     let steps = vec![
       EvmStep {
-        opcode: ADD,
-        pc: 0,
+        pre_opcode: ADD,
+        post_opcode: STOP,
+        pre_pc: 0,
+        post_pc: 1,
         gas_before: 100_000,
         gas_after: 99_997,
         pre_stack: vec![U256::from(10u64), U256::from(20u64)],
         post_stack: vec![U256::from(30u64)],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       },
       EvmStep {
-        opcode: STOP,
-        pc: 1,
+        pre_opcode: STOP,
+        post_opcode: STOP,
+        pre_pc: 1,
+        post_pc: 1,
         gas_before: 99_997,
         gas_after: 99_997,
         pre_stack: vec![U256::from(30u64)],
         post_stack: vec![U256::from(30u64)],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       },
     ];
     let result = prove_and_verify(&steps);

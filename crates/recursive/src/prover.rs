@@ -89,9 +89,10 @@ fn prove_level(
 
     // Fork transcript for this node with domain separation.
     let mut t = root_transcript.fork("recursive", level * 0x1_0000 + node_idx as u32);
-    // Absorb the level and node index for extra binding.
+    // Absorb the level, node index, and fan_in for extra binding.
     t.absorb_bytes(&level.to_le_bytes());
     t.absorb_bytes(&(node_idx as u32).to_le_bytes());
+    t.absorb_bytes(&fan_in.to_le_bytes());
 
     let sumcheck = sumcheck::prove(agg_mle, &mut t);
 
@@ -226,6 +227,7 @@ pub fn prove_recursive_par(
     let mut t = root_transcript.fork("recursive", level * 0x1_0000 + node_idx as u32);
     t.absorb_bytes(&level.to_le_bytes());
     t.absorb_bytes(&(node_idx as u32).to_le_bytes());
+    t.absorb_bytes(&(fan as u32).to_le_bytes());
 
     let sumcheck = sumcheck::prove(agg_mle, &mut t);
 

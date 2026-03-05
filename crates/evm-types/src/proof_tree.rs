@@ -1,4 +1,5 @@
 use crate::state::EvmState;
+use revm::primitives::{Address, B256};
 
 /// Opaque ZK arithmetic sub-proof for a single EVM opcode step.
 ///
@@ -27,7 +28,7 @@ impl LeafProof {
 /// Produced by [`crate::type_check::build_cert`] after a successful
 /// [`crate::type_check::type_check`]. Commits to the *shape* of the
 /// derivation tree; arithmetic correctness lives in the [`LeafProof`]s.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct TypeCert {
   /// Blake3 Merkle root over the serialised tree shape.
   pub root_hash: [u8; 32],
@@ -86,6 +87,91 @@ pub enum ProofNode {
     taken: Box<ProofNode>,
     not_taken: Box<ProofNode>,
   },
+
+  /// A sub-call or contract creation (CALL / DELEGATECALL / STATICCALL / CREATE / CREATE2).
+  ///
+  /// The parent frame's CALL opcode consumes/produces stack values; the `inner`
+  /// tree proves the callee’s execution trace. `pre_state` and `post_state`
+  /// are the **parent’s** EVM state before and after the call opcode.
+  Call {
+    /// CALL / DELEGATECALL / STATICCALL / CREATE / CREATE2 opcode byte.
+    opcode: u8,
+    /// Address of the contract whose bytecode executes inside the call.
+    callee: Address,
+    /// Caller address (msg.sender inside the callee).
+    caller: Address,
+    /// Parent state before the CALL opcode.
+    pre_state: EvmState,
+    /// Parent state after the CALL opcode returns.
+    post_state: EvmState,
+    /// Sub-call execution proof tree (callee’s trace).
+    inner: Box<ProofNode>,
+    /// Whether the sub-call succeeded.
+    success: bool,
+  },
+
+  /// Transaction boundary within a block.
+  ///
+  /// Wraps one transaction's full execution proof.  Between consecutive
+  /// `TxBoundary` nodes (joined by `Seq`), the verifier checks:
+  /// - Persistent storage continuity (state root transition).
+  /// - Transient storage is reset to empty (EIP-1153).
+  /// - Gas accounting: `gas_used` ≤ `gas_limit`.
+  /// - Nonce increment for the sender.
+  TxBoundary {
+    /// Transaction index within the block (0-based).
+    tx_index: u32,
+    /// Transaction hash (keccak256 of the RLP-encoded signed tx).
+    tx_hash: B256,
+    /// Gas limit for this transaction.
+    gas_limit: u64,
+    /// Gas actually consumed.
+    gas_used: u64,
+    /// Whether the transaction's top-level call succeeded.
+    success: bool,
+    /// EVM state before the first opcode of this transaction.
+    pre_state: EvmState,
+    /// EVM state after the last opcode of this transaction.
+    post_state: EvmState,
+    /// Proof tree for this transaction's execution.
+    inner: Box<ProofNode>,
+  },
+
+  /// Block boundary — wraps all transactions in a single Ethereum block.
+  ///
+  /// The `inner` tree is typically a balanced `Seq` tree of `TxBoundary`
+  /// nodes produced by [`build_block_witness`].  Between consecutive
+  /// `BlockBoundary` nodes (joined by `Seq`) the verifier checks:
+  /// - State root continuity (`state_root_post` of block N == `state_root_pre` of block N+1).
+  /// - Block number increments by exactly 1.
+  /// - Timestamp is non-decreasing.
+  /// - Cumulative `gas_used` ≤ `gas_limit`.
+  BlockBoundary {
+    /// Ethereum block number.
+    block_number: u64,
+    /// keccak256(RLP(block_header)).
+    block_hash: B256,
+    /// Parent block hash (links to previous block proof).
+    parent_hash: B256,
+    /// Unix timestamp of the block.
+    timestamp: u64,
+    /// Miner/validator address (coinbase).
+    coinbase: Address,
+    /// Block-level gas limit.
+    gas_limit: u64,
+    /// Total gas consumed by all transactions in this block.
+    gas_used: u64,
+    /// State trie root *before* executing the first transaction.
+    state_root_pre: B256,
+    /// State trie root *after* executing the last transaction.
+    state_root_post: B256,
+    /// EVM state before the block's first opcode.
+    pre_state: EvmState,
+    /// EVM state after the block's last opcode.
+    post_state: EvmState,
+    /// Proof tree for all transactions in this block.
+    inner: Box<ProofNode>,
+  },
 }
 
 impl ProofNode {
@@ -99,13 +185,16 @@ impl ProofNode {
         taken,
         not_taken,
       } => cond.leaf_count() + taken.leaf_count() + not_taken.leaf_count(),
+      ProofNode::Call { inner, .. } => 1 + inner.leaf_count(),
+      ProofNode::TxBoundary { inner, .. } => inner.leaf_count(),
+      ProofNode::BlockBoundary { inner, .. } => inner.leaf_count(),
     }
   }
 
-  /// Returns the opcode of this node if it is a `Leaf`.
+  /// Returns the opcode of this node if it is a `Leaf` or `Call`.
   pub fn opcode(&self) -> Option<u8> {
     match self {
-      ProofNode::Leaf { opcode, .. } => Some(*opcode),
+      ProofNode::Leaf { opcode, .. } | ProofNode::Call { opcode, .. } => Some(*opcode),
       _ => None,
     }
   }

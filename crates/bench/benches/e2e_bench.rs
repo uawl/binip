@@ -7,7 +7,7 @@
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use e2e::{EvmStep, build_witness, prove_cpu, prove_cpu_par};
-use revm::primitives::U256;
+use revm::primitives::{Address, B256, U256};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step generators
@@ -17,12 +17,22 @@ use revm::primitives::U256;
 fn add_step(pc: u32) -> EvmStep {
   use revm::bytecode::opcode::ADD;
   EvmStep {
-    opcode: ADD,
-    pc,
+    pre_opcode: ADD,
+    post_opcode: ADD,
+    pre_pc: pc,
+    post_pc: pc + 1,
     gas_before: 1_000_000,
     gas_after: 999_997,
     pre_stack: vec![U256::from(pc as u64 + 1), U256::from(pc as u64 + 2)],
     post_stack: vec![U256::from(pc as u64 * 2 + 3)],
+    pre_push_data: None,
+    post_push_data: None,
+    call_depth: 0,
+    address: Address::ZERO,
+    caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
   }
 }
 
@@ -32,12 +42,22 @@ fn div_step(pc: u32) -> EvmStep {
   let a = U256::from(1000u64 + pc as u64);
   let b = U256::from(7u64);
   EvmStep {
-    opcode: DIV,
-    pc,
+    pre_opcode: DIV,
+    post_opcode: DIV,
+    pre_pc: pc,
+    post_pc: pc + 1,
     gas_before: 1_000_000,
     gas_after: 999_995,
     pre_stack: vec![a, b],
     post_stack: vec![a / b],
+    pre_push_data: None,
+    post_push_data: None,
+    call_depth: 0,
+    address: Address::ZERO,
+    caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
   }
 }
 
@@ -47,12 +67,22 @@ fn lt_step(pc: u32) -> EvmStep {
   let a = U256::from(pc as u64);
   let b = U256::from(pc as u64 + 10);
   EvmStep {
-    opcode: LT,
-    pc,
+    pre_opcode: LT,
+    post_opcode: LT,
+    pre_pc: pc,
+    post_pc: pc + 1,
     gas_before: 1_000_000,
     gas_after: 999_997,
     pre_stack: vec![a, b],
     post_stack: vec![U256::from(1u64)],
+    pre_push_data: None,
+    post_push_data: None,
+    call_depth: 0,
+    address: Address::ZERO,
+    caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
   }
 }
 
@@ -81,13 +111,24 @@ fn mixed_trace(n: usize) -> Vec<EvmStep> {
   for i in 0..n {
     if i % 2 == 0 {
       // ── PUSH0: depth 2 → 3 ────────────────────────────────────
+      let next_op = if i + 1 < n { bin_ops[bin_idx % 3] } else { PUSH0 };
       steps.push(EvmStep {
-        opcode: PUSH0,
-        pc: i as u32,
+        pre_opcode: PUSH0,
+        post_opcode: next_op,
+        pre_pc: i as u32,
+        post_pc: i as u32 + 1,
         gas_before: 1_000_000,
         gas_after: 999_998,
         pre_stack: vec![top0, top1],
         post_stack: vec![U256::ZERO, top0, top1],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       });
     } else {
       // ── Binary op: depth 3 → 2 ────────────────────────────────
@@ -102,13 +143,24 @@ fn mixed_trace(n: usize) -> Vec<EvmStep> {
         AND => a & b,
         _ => unreachable!(),
       };
+      let next_op = if i + 1 < n { PUSH0 } else { op };
       steps.push(EvmStep {
-        opcode: op,
-        pc: i as u32,
+        pre_opcode: op,
+        post_opcode: next_op,
+        pre_pc: i as u32,
+        post_pc: i as u32 + 1,
         gas_before: 1_000_000,
         gas_after: 999_997,
         pre_stack: vec![a, b, top1],
         post_stack: vec![result, top1],
+        pre_push_data: None,
+        post_push_data: None,
+        call_depth: 0,
+        address: Address::ZERO,
+        caller: Address::ZERO,
+        balance: U256::ZERO,
+        nonce: 0,
+        code_hash: B256::ZERO,
       });
       // Update running state.
       top0 = result;
@@ -128,7 +180,7 @@ fn bench_build_witness(c: &mut Criterion) {
   for n in [1, 4, 16, 64] {
     let steps = mixed_trace(n);
     group.bench_with_input(BenchmarkId::from_parameter(n), &steps, |b, steps| {
-      b.iter(|| build_witness(black_box(steps)).unwrap());
+      b.iter(|| build_witness(black_box(steps), None).unwrap());
     });
   }
   group.finish();
@@ -139,7 +191,7 @@ fn bench_prove(c: &mut Criterion) {
   let mut group = c.benchmark_group("prove_cpu");
   for n in [1, 4, 16, 64, 256, 1024] {
     let steps = mixed_trace(n);
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
     group.bench_with_input(BenchmarkId::from_parameter(n), &witness, |b, w| {
       b.iter(|| prove_cpu(black_box(w)).unwrap());
     });
@@ -157,7 +209,7 @@ fn bench_prove_shard_par(c: &mut Criterion) {
   let powers_of_4 = (0..=9).map(|i| 1 << (2 * i));
   for n in powers_of_4 {
     let steps = mixed_trace(n);
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
     group.bench_with_input(BenchmarkId::from_parameter(n), &witness, |b, w| {
       b.iter(|| prove_cpu_par(black_box(w)).unwrap());
     });
@@ -175,7 +227,7 @@ fn bench_verify(c: &mut Criterion) {
   let mut group = c.benchmark_group("verify");
   for n in [1, 4, 16, 64] {
     let steps = mixed_trace(n);
-    let witness = build_witness(&steps).unwrap();
+    let witness = build_witness(&steps, None).unwrap();
     let (proof, params) = prove_cpu(&witness).unwrap();
     group.bench_with_input(
       BenchmarkId::from_parameter(n),
@@ -201,7 +253,7 @@ fn bench_prove_and_verify(c: &mut Criterion) {
     let steps = mixed_trace(n);
     group.bench_with_input(BenchmarkId::from_parameter(n), &steps, |b, steps| {
       b.iter(|| {
-        let witness = build_witness(black_box(steps)).unwrap();
+        let witness = build_witness(black_box(steps), None).unwrap();
         let (proof, params) = prove_cpu(&witness).unwrap();
         let _ = e2e::verify(&proof, &params);
       });
@@ -217,19 +269,19 @@ fn bench_opcode_witness(c: &mut Criterion) {
   // ADD (no advice)
   let add_steps: Vec<_> = (0..16).map(add_step).collect();
   group.bench_function("ADD_x16", |b| {
-    b.iter(|| build_witness(black_box(&add_steps)).unwrap());
+    b.iter(|| build_witness(black_box(&add_steps), None).unwrap());
   });
 
   // DIV (16-limb advice)
   let div_steps: Vec<_> = (0..16).map(div_step).collect();
   group.bench_function("DIV_x16", |b| {
-    b.iter(|| build_witness(black_box(&div_steps)).unwrap());
+    b.iter(|| build_witness(black_box(&div_steps), None).unwrap());
   });
 
   // LT (1-limb advice)
   let lt_steps: Vec<_> = (0..16).map(lt_step).collect();
   group.bench_function("LT_x16", |b| {
-    b.iter(|| build_witness(black_box(&lt_steps)).unwrap());
+    b.iter(|| build_witness(black_box(&lt_steps), None).unwrap());
   });
 
   group.finish();

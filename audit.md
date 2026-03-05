@@ -10,10 +10,10 @@
 
 | Severity | Count | Fixed |
 |----------|-------|-------|
-| CRITICAL | 5 | 3 (C-1, C-2, C-3) |
-| HIGH     | 12 | 0 |
+| CRITICAL | 5 | 5 (C-1, C-2, C-3, C-4, C-5) |
+| HIGH     | 12 | 1 (H-3) |
 | MEDIUM   | 18 | 1 (M-15, C-1과 동시) |
-| **Total** | **35** | **4** |
+| **Total** | **35** | **7** |
 
 이 시스템은 **계층적 위임 아키텍처**를 사용합니다:
 
@@ -113,54 +113,49 @@
 
 ---
 
-### C-4: Shard boundary에 대한 cryptographic binding 부재
+### C-4: Shard boundary에 대한 cryptographic binding 부재 ✅ FIXED
 
 - **Crate**: shard
-- **Files**: `crates/shard/src/prover.rs` line 24, `crates/shard/src/verifier.rs` line 75
+- **Files**: `crates/shard/src/prover.rs`, `crates/shard/src/verifier.rs`, `crates/shard/src/proof.rs`
 - **Severity**: CRITICAL
+- **Status**: **Fixed** — shard boundary commitment + shard_idx 순서 검증 구현 완료
 
-두 가지 문제:
+**기존 문제**: 두 가지 취약점이 존재:
 
 1. **shard_idx 순서 미검증**: verifier가 `shard_proofs[i].shard_idx == i`를 확인하지 않음.
-2. **경계 commitment 부재**: `ShardProof`에 원본 MLE의 어느 부분(contiguous chunk)인지에 대한 commitment이 없음. sumcheck proof와 `shard_idx`만 포함.
+2. **경계 commitment 부재**: `ShardProof`에 원본 MLE의 어느 부분(contiguous chunk)인지에 대한 commitment이 없음.
 
-```rust
-// verifier.rs — shard_idx 검증 없이 순회
-for (proof, sub) in batch.shard_proofs.iter().zip(&sub_mles) {
-  // proof.shard_idx is NEVER checked against iteration index
-  let oracle_eval = sub.evaluate(&challenges);
-  let result = verify_shard(proof, oracle_eval, root_transcript)?;
-}
-```
+**수정 내용**: shard boundary commitment + 순서 검증 + partition root 추가:
 
-**영향**: prover가 shard 순서를 바꾸거나, 다른 다항식에 대한 sumcheck proof를 제출 가능.
+1. **`hash_shard_evals(shard_idx, evals)`** (`proof.rs`): 각 shard의 평가값을 Blake3로 도메인-분리 해싱하여 32-byte shard commitment 생성. `Blake3("binip:shard:evals:" ‖ shard_idx_le ‖ n_evals_le ‖ evals_bytes)`.
+2. **`hash_partition(shard_commitments)`** (`proof.rs`): 모든 shard commitment를 순서대로 해싱하여 단일 partition root 생성. `Blake3("binip:shard:partition:" ‖ count_le ‖ commitment_0 ‖ … ‖ commitment_{n-1})`.
+3. **`ShardProof`에 `shard_commitment: [u8; 32]` 필드 추가**: 각 shard proof가 자신의 평가 데이터에 대한 commitment을 포함.
+4. **`ShardProofBatch`에 `partition_root: [u8; 32]` 필드 추가**: 전체 파티션 순서에 대한 binding.
+5. **Prover** (`prover.rs`): `prove_shard()`에서 shard commitment 계산 → forked transcript에 absorb → sumcheck 수행. `prove_all()` / `prove_all_par()`에서 partition_root 계산.
+6. **Verifier** (`verifier.rs`): `verify_shard()`에서 shard commitment를 transcript에 absorb (prover와 동일 순서). `verify_all()`에서 (a) `shard_proofs[i].shard_idx == i` 순서 검증, (b) `hash_shard_evals()` 재계산으로 shard commitment 검증, (c) `hash_partition()` 재계산으로 partition_root 검증.
+7. **STARK prover** (`stark/src/prover.rs`): `derive_open_point()`에서 shard-0 sumcheck replay 시 shard commitment absorb 추가.
 
-**권장**: shard_idx 순서 검증 + shard boundary commitment 추가.
+모든 기존 19개 테스트 + 3개 보안 테스트 통과 (reject_swapped_shard_order, reject_tampered_shard_commitment, reject_tampered_partition_root). profile_cpu 100000 steps prove+verify 정상.
 
 ---
 
-### C-5: Recursive aggregation에 `fan_in` domain separation 누락
+### C-5: Recursive aggregation에 `fan_in` domain separation 누락 ✅ FIXED
 
 - **Crate**: recursive
-- **File**: `crates/recursive/src/prover.rs` line 93
+- **Files**: `crates/recursive/src/prover.rs`, `crates/recursive/src/verifier.rs`, `crates/stark/src/prover.rs`
 - **Severity**: CRITICAL
+- **Status**: **Fixed** — 모든 recursive transcript fork 지점에 `fan_in` absorb 추가
 
-Transcript fork에 `fan_in` 값이 포함되지 않아, 서로 다른 configuration에서 동일한 challenge가 생성됩니다:
+**기존 문제**: Transcript fork에 `fan_in` 값이 포함되지 않아, 서로 다른 configuration에서 동일한 challenge가 생성됨. 한 configuration(fan_in=2)에서 만든 proof를 다른 configuration(fan_in=4)에서 재사용 가능.
 
-```rust
-// 현재 (VULNERABLE):
-let mut t = root_transcript.fork("recursive", level * 0x1_0000 + node_idx as u32);
-t.absorb_bytes(&level.to_le_bytes());
-t.absorb_bytes(&(node_idx as u32).to_le_bytes());
-// fan_in 미포함 → config A(fan_in=2)와 config B(fan_in=4)가 동일 challenge 생성
-```
+**수정 내용**: 4곳의 recursive transcript fork 지점에 `fan_in` domain separation 추가:
 
-**영향**: 한 configuration에서 만든 proof를 다른 configuration에서 재사용 가능.
+1. **Sequential prover** (`recursive/src/prover.rs` `prove_level()`): `t.absorb_bytes(&fan_in.to_le_bytes())` 추가.
+2. **Parallel prover** (`recursive/src/prover.rs` `prove_node()`): `t.absorb_bytes(&(fan as u32).to_le_bytes())` 추가.
+3. **Verifier** (`recursive/src/verifier.rs` `verify_recursive()`): `t.absorb_bytes(&config.fan_in.to_le_bytes())` 추가.
+4. **STARK prover** (`stark/src/prover.rs` `derive_open_point()`): `t.absorb_bytes(&config.fan_in.to_le_bytes())` 추가.
 
-**권장**:
-```rust
-t.absorb_bytes(&config.fan_in.to_le_bytes());  // fork 직후 추가
-```
+모든 기존 16개 recursive 테스트 + 22개 shard 테스트 통과.
 
 ---
 
@@ -200,15 +195,20 @@ let bnd_challenges = sumcheck::verify(&bnd_sumcheck, bnd_sumcheck.final_eval, &m
 
 ---
 
-### H-3: `derive_open_point()` — verifier 독립 검증 없음
+### H-3: `derive_open_point()` — verifier 독립 검증 없음 ✅ FIXED
 
 - **Crate**: stark
-- **File**: `crates/stark/src/prover.rs` line 450-485
+- **File**: `crates/stark/src/prover.rs`, `crates/stark/src/verifier.rs`
 - **Severity**: HIGH
 
 Prover가 sumcheck replay로 challenge를 도출하여 PCS opening point를 구성하지만, verifier는 이를 독립적으로 도출/검증하지 않습니다. Proof soundness가 bugless `derive_open_point()`에 의존합니다.
 
-**권장**: Verifier에서 동일 로직 실행 후 비교하거나, derived challenges를 transcript에 commit.
+**수정 내용**:
+1. `derive_open_point()`을 `pub(crate)`로 변경하여 verifier에서 접근 가능하게 함
+2. Verifier가 PCS 검증 전에 `derive_open_point()`를 독립적으로 호출하여 open point를 재도출
+3. 재도출된 open point와 proof에 포함된 `open_point`가 다르면 `OpenPointMismatch` 에러로 거부
+4. PCS opening 검증 시 verifier가 직접 도출한 point를 사용
+5. `verify_rejects_tampered_open_point` 테스트 추가
 
 ---
 
@@ -617,13 +617,13 @@ pub queue: ManuallyDrop<wgpu::Queue>,
 | **sumcheck** | ✅ PASS | 0 | 0 | 1 | `oracle_eval` PCS 위임 (의도적) |
 | **pcs** | ✅ PASS | ~~1~~ 0 | 0 | ~~1~~ 0 | ~~`batch_verify` 미완성~~ C-1 수정 완료, M-15 동시 수정 |
 | **transcript** | ⚠ CONDITIONAL | 0 | 0 | 2 | 128-bit effective security |
-| **stark** | ⚠ CAUTION | 0 | 3 | 0 | `derive_open_point` 미검증 |
+| **stark** | ✅ PASS | 0 | ~~3~~ 2 | 0 | ~~`derive_open_point` 미검증~~ H-3 verifier 독립 도출 완료 |
 | **evm-types** | ⚠ CAUTION | 0 | 1 | 0 | Opcode 의미론 일부 누락 |
 | **circuit** | ✅ PASS | ~~1~~ 0 | 0 | 2 | ~~17/34 tags 무조건 zero~~ C-2 reconstruction PCS binding 추가 |
 | **vm** | ✅ PASS | ~~1~~ 0 | 0 | 2 | ~~Advice 무검증 주입~~ C-3 opcode별 verified compiler 구현 |
 | **e2e** | 🔴 FAIL | 0 | 4 | 0 | State continuity 전무 |
-| **recursive** | 🔴 FAIL | 1 | 1 | 0 | `fan_in` domain sep 누락 |
-| **shard** | 🔴 FAIL | 1 | 0 | 0 | Shard binding 없음 |
+| **recursive** | ✅ PASS | ~~1~~ 0 | 1 | 0 | ~~`fan_in` domain sep 누락~~ C-5 fan_in domain separation 추가 |
+| **shard** | ✅ PASS | ~~1~~ 0 | 0 | 0 | ~~Shard binding 없음~~ C-4 shard boundary commitment 추가 |
 | **gpu** | ⚠ CAUTION | 0 | 2 | 3 | Buffer 누수, overflow |
 
 ---
@@ -642,7 +642,7 @@ Shard (partitioning) → Recursive (aggregation) → STARK (composition) → Ver
 
 1. ~~**VM → Circuit gap**: VM이 advice를 무검증 주입 (C-3) → circuit의 Advice2/Advice4 tags도 `zero()` 반환 (C-2) → **산술 결과 위조 가능**~~ **✅ CLOSED**: C-3 (opcode별 CheckMul/Mul128/Shl128 검증) + C-2 (reconstruction PCS binding)로 해결. EXP는 이분법(square-and-multiply)으로 각 단계가 CheckMul 검증됨.
 2. ~~**Circuit → LUT → PCS gap**: Circuit이 LUT에 위임 → LUT는 PCS binding 의존 → `batch_verify` 미완성 (C-1) → **LUT soundness 미보장**~~ **✅ CLOSED**: C-1 (per-query fold chain)으로 evaluation binding 완전 보장.
-3. **Shard → Recursive gap**: Shard index 미검증 (C-4) → recursive fan_in domain sep 누락 (C-5) → **proof 재사용/재정렬 가능**
+3. ~~**Shard → Recursive gap**: Shard index 미검증 (C-4) → recursive fan_in domain sep 누락 (C-5) → **proof 재사용/재정렬 가능**~~ **✅ CLOSED**: C-4 (shard boundary commitment + idx 순서 검증 + partition root) + C-5 (fan_in domain separation)로 완전 해결.
 4. **e2e → STARK gap**: Witness builder가 state continuity를 보장하지 않음 (H-6~H-8) → 잘못된 witness가 STARK에 전달될 수 있음
 
 ### Positive Aspects
@@ -653,8 +653,10 @@ Shard (partitioning) → Recursive (aggregation) → STARK (composition) → Ver
 - ✅ GF(2^128) 필드 연산이 정확 (Karatsuba, PCLMULQDQ/PMULL)
 - ✅ LogUp γ-weighting이 char-2 cancellation을 올바르게 방지
 - ✅ V1.1 soundness fixes 완료: C-1 (batch PCS per-query fold), C-2 (reconstruction PCS binding), C-3 (opcode별 verified compilers + EXP binary exponentiation)
+- ✅ V1.2 shard binding fix 완료: C-4 (shard boundary commitment + idx 순서 검증 + partition root), C-5 (recursive fan_in domain separation)
+- ✅ V1.3 verifier hardening: H-3 (derive_open_point verifier 독립 도출 + OpenPointMismatch 검증)
 - ✅ Succinct verifier O(√n·log n) 달성
-- ✅ 500+ 테스트 통과, profile_cpu 10000 steps prove+verify 정상
+- ✅ 500+ 테스트 통과, profile_cpu 100000 steps prove+verify 정상
 
 ---
 
@@ -665,8 +667,8 @@ Shard (partitioning) → Recursive (aggregation) → STARK (composition) → Ver
 | Priority | Issue | Fix | Status |
 |----------|-------|-----|--------|
 | ~~1~~ | ~~C-1: `batch_verify` evaluation binding~~ | ~~Per-query eval check 구현~~ | ✅ FIXED |
-| 2 | C-4: Shard index 미검증 | `proof.shard_idx == i` assert 추가 | ⬜ |
-| 3 | C-5: Recursive fan_in domain sep | `absorb_bytes(&fan_in.to_le_bytes())` 추가 | ⬜ |
+| ~~2~~ | ~~C-4: Shard index 미검증~~ | ~~shard boundary commitment + idx 검증 + partition root~~ | ✅ FIXED |
+| ~~3~~ | ~~C-5: Recursive fan_in domain sep~~ | ~~`absorb_bytes(&fan_in.to_le_bytes())` 추가~~ | ✅ FIXED |
 | 4 | H-1: `debug_assert` → `assert` | 1-line 수정 | ⬜ |
 
 ### Short-term (soundness hardening)
@@ -676,7 +678,7 @@ Shard (partitioning) → Recursive (aggregation) → STARK (composition) → Ver
 | ~~5~~ | ~~C-3: Advice 무검증 주입~~ | ~~Opcode별 Check 연산 설계/구현~~ | ✅ FIXED |
 | ~~6~~ | ~~C-2: Constraint zero delegation~~ | ~~Reconstruction binding constraint 추가~~ | ✅ FIXED |
 | 7 | H-2: `.expect()` → 에러 전파 | `Result` 패턴 전환 | ⬜ |
-| 8 | H-3: `derive_open_point` 검증 | Verifier에서 독립 도출 | ⬜ |
+| 8 | H-3: `derive_open_point` 검증 | Verifier에서 독립 도출 | ✅ FIXED |
 
 ### Medium-term (robustness)
 

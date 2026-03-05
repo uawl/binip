@@ -11,6 +11,7 @@
 //! 7. Assemble into a [`Proof`].
 
 use circuit::TraceTable;
+use circuit::bytecode_lookup::BytecodeLookupWitness;
 use circuit::lookup;
 use circuit::state_constraint::{BoundaryTraceTable, extract_boundaries};
 use evm_types::{ProofNode, TypeCert, build_cert};
@@ -59,7 +60,12 @@ struct Prepared {
 }
 
 /// Steps 1–3: type-check, encode, blind, PCS commit.
-fn prepare(rows: &[Row], tree: &ProofNode, params: &StarkParams) -> Result<Prepared, ProveError> {
+fn prepare(
+  rows: &[Row],
+  tree: &ProofNode,
+  params: &StarkParams,
+  bytecode_ctx: Option<(BytecodeLookupWitness, Vec<u8>)>,
+) -> Result<Prepared, ProveError> {
   if rows.is_empty() {
     return Err(ProveError::EmptyTrace);
   }
@@ -166,6 +172,10 @@ fn prepare(rows: &[Row], tree: &ProofNode, params: &StarkParams) -> Result<Prepa
 
   // 2c. Lookup proofs (byte-level LUT arguments)
   let mut lookup_witness = lookup::collect_witnesses(rows);
+  if let Some((bc_wit, bc_raw)) = bytecode_ctx {
+    lookup_witness.bytecode = bc_wit;
+    lookup_witness.bytecode_raw = Some(bc_raw);
+  }
   let mut lookup_transcript = transcript.clone();
   let (lookup_proofs, lookup_commits) =
     lookup::prove_lookups_committed(&mut lookup_witness, &mut lookup_transcript);
@@ -201,6 +211,7 @@ fn prepare_par(
   rows: &[Row],
   tree: &ProofNode,
   params: &StarkParams,
+  bytecode_ctx: Option<(BytecodeLookupWitness, Vec<u8>)>,
 ) -> Result<Prepared, ProveError> {
   if rows.is_empty() {
     return Err(ProveError::EmptyTrace);
@@ -304,6 +315,10 @@ fn prepare_par(
 
   // 2c. Lookup proofs (byte-level LUT arguments)
   let mut lookup_witness = lookup::collect_witnesses_par(rows);
+  if let Some((bc_wit, bc_raw)) = bytecode_ctx {
+    lookup_witness.bytecode = bc_wit;
+    lookup_witness.bytecode_raw = Some(bc_raw);
+  }
   let mut lookup_transcript = transcript.clone();
   let (lookup_proofs, lookup_commits) =
     lookup::prove_lookups_par(&mut lookup_witness, &mut lookup_transcript);
@@ -410,8 +425,9 @@ pub fn prove_cpu(
   rows: &[Row],
   tree: &ProofNode,
   params: &StarkParams,
+  bytecode_ctx: Option<(BytecodeLookupWitness, Vec<u8>)>,
 ) -> Result<Proof, ProveError> {
-  let prep = prepare(rows, tree, params)?;
+  let prep = prepare(rows, tree, params, bytecode_ctx)?;
 
   // 4. Shard proving (CPU)
   let shard_transcript = prep.transcript.clone();
@@ -450,8 +466,9 @@ pub fn prove_cpu_par(
   rows: &[Row],
   tree: &ProofNode,
   params: &StarkParams,
+  bytecode_ctx: Option<(BytecodeLookupWitness, Vec<u8>)>,
 ) -> Result<Proof, ProveError> {
-  let prep = prepare_par(rows, tree, params)?;
+  let prep = prepare_par(rows, tree, params, bytecode_ctx)?;
   let shard_transcript: Blake3Transcript = prep.transcript.clone();
 
   // ── Phase 1: parallel shard proving ────────────────────────────────────
@@ -523,7 +540,7 @@ pub fn prove_cpu_par(
 ///   node 0, concatenated bottom-up, form the high-variable challenges.
 ///
 /// When `fan_in` is a power of two, `depth * log2(fan_in) == high_vars` exactly.
-fn derive_open_point(
+pub(crate) fn derive_open_point(
   shard_batch: &shard::ShardProofBatch,
   recursive_proof: &recursive::RecursiveProof,
   config: &shard::RecursiveConfig,
@@ -534,10 +551,11 @@ fn derive_open_point(
   let high_vars = total_vars - shard_vars;
 
   // ── Low variables: shard-0 sumcheck challenges ────────────────────────
-  let shard0 = &shard_batch.shard_proofs[0].sumcheck;
+  let shard0_proof = &shard_batch.shard_proofs[0];
   let low_challenges: Vec<GF2_128> = {
     let mut t = shard_transcript.fork("shard", 0);
-    sumcheck::verify(shard0, shard0.final_eval, &mut t)
+    t.absorb_bytes(&shard0_proof.shard_commitment);
+    sumcheck::verify(&shard0_proof.sumcheck, shard0_proof.sumcheck.final_eval, &mut t)
       .expect("shard 0 should be internally consistent")
   };
 
@@ -550,6 +568,7 @@ fn derive_open_point(
       let mut t = shard_transcript.fork("recursive", node0.level * 0x1_0000 + node0.node_idx);
       t.absorb_bytes(&node0.level.to_le_bytes());
       t.absorb_bytes(&node0.node_idx.to_le_bytes());
+      t.absorb_bytes(&config.fan_in.to_le_bytes());
 
       if let Some(challenges) = sumcheck::verify(&node0.sumcheck, node0.sumcheck.final_eval, &mut t)
       {
@@ -639,7 +658,7 @@ mod tests {
   fn prove_produces_valid_proof() {
     let (rows, tree) = make_simple_trace_and_tree();
     let params = StarkParams::for_n_vars(2);
-    let proof = prove_cpu(&rows, &tree, &params).unwrap();
+    let proof = prove_cpu(&rows, &tree, &params, None).unwrap();
     assert!(proof.type_cert.leaf_count > 0);
     assert!(
       proof.constraint_sum.is_zero(),
@@ -651,7 +670,7 @@ mod tests {
   fn prove_rejects_empty_trace() {
     let (_, tree) = make_simple_trace_and_tree();
     let params = StarkParams::for_n_vars(2);
-    let err = prove_cpu(&[], &tree, &params).unwrap_err();
+    let err = prove_cpu(&[], &tree, &params, None).unwrap_err();
     assert!(matches!(err, ProveError::EmptyTrace));
   }
 
@@ -662,7 +681,7 @@ mod tests {
     let post = state_with_depth(5, 1); // Wrong depth for ADD
     let bad_tree = add_leaf(0x01, pre, post);
     let params = StarkParams::for_n_vars(1);
-    let err = prove_cpu(&rows, &bad_tree, &params).unwrap_err();
+    let err = prove_cpu(&rows, &bad_tree, &params, None).unwrap_err();
     assert!(matches!(err, ProveError::TypeCheck(_)));
   }
 
@@ -670,7 +689,7 @@ mod tests {
   fn proof_has_correct_structure() {
     let (rows, tree) = make_simple_trace_and_tree();
     let params = StarkParams::for_n_vars(2);
-    let proof = prove_cpu(&rows, &tree, &params).unwrap();
+    let proof = prove_cpu(&rows, &tree, &params, None).unwrap();
     assert_eq!(proof.batch_commit.n_vars, 2);
     assert_eq!(proof.open_point.len(), params.config.total_vars as usize);
     assert_eq!(
@@ -702,7 +721,7 @@ mod tests {
       .unwrap();
 
     let params = StarkParams::for_n_vars(3);
-    let proof = prove_cpu(&rows, &tree, &params).unwrap();
+    let proof = prove_cpu(&rows, &tree, &params, None).unwrap();
     assert!(proof.constraint_sum.is_zero());
   }
 }

@@ -8,6 +8,7 @@ field      = { path = "../field" }
 transcript = { path = "../transcript" }
 blake3     = { workspace = true }
 rayon      = "1"
+bincode    = { workspace = true }
 
 [dev-dependencies]
 poly       = { path = "../poly" }

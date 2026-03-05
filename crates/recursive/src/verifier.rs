@@ -127,6 +127,7 @@ pub fn verify_recursive(
       let mut t = root_transcript.fork("recursive", level * 0x1_0000 + node_idx as u32);
       t.absorb_bytes(&level.to_le_bytes());
       t.absorb_bytes(&(node_idx as u32).to_le_bytes());
+      t.absorb_bytes(&config.fan_in.to_le_bytes());
 
       let challenges = sumcheck::verify(&lp.sumcheck, lp.sumcheck.final_eval, &mut t);
       let challenges = challenges.ok_or(RecursiveVerifyError::SumcheckFailed {

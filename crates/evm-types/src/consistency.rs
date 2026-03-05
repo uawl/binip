@@ -340,6 +340,22 @@ pub enum ConsistencyError {
     expected: U256,
     actual: U256,
   },
+
+  // ── PUSH ────────────────────────────────────────────────────────────────
+  #[error("PUSH0 result mismatch at pc={pc}: expected 0, got {actual}")]
+  Push0Mismatch { pc: u32, actual: U256 },
+
+  // ── PC advancement ─────────────────────────────────────────────────────
+  #[error(
+    "PC advancement mismatch for opcode 0x{opcode:02x} at pc={pc}: \
+     expected post_pc={expected}, got {actual}"
+  )]
+  PcAdvancementMismatch {
+    opcode: u8,
+    pc: u32,
+    expected: u32,
+    actual: u32,
+  },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -412,6 +428,38 @@ fn check_node(node: &ProofNode) -> Result<(&EvmState, &EvmState), ConsistencyErr
       let post = node_post(taken);
       Ok((pre_c, post))
     }
+
+    ProofNode::Call {
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      // Recursively check the sub-call tree.
+      let _ = check_node(inner)?;
+      Ok((pre_state, post_state))
+    }
+
+    ProofNode::TxBoundary {
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      // Recursively check the transaction's execution tree.
+      let _ = check_node(inner)?;
+      Ok((pre_state, post_state))
+    }
+
+    ProofNode::BlockBoundary {
+      pre_state,
+      post_state,
+      inner,
+      ..
+    } => {
+      let _ = check_node(inner)?;
+      Ok((pre_state, post_state))
+    }
   }
 }
 
@@ -448,6 +496,18 @@ fn collect_errors(node: &ProofNode, errors: &mut Vec<ConsistencyError>) {
       collect_errors(taken, errors);
       collect_errors(not_taken, errors);
     }
+
+    ProofNode::Call { inner, .. } => {
+      collect_errors(inner, errors);
+    }
+
+    ProofNode::TxBoundary { inner, .. } => {
+      collect_errors(inner, errors);
+    }
+
+    ProofNode::BlockBoundary { inner, .. } => {
+      collect_errors(inner, errors);
+    }
   }
 }
 
@@ -461,6 +521,9 @@ fn node_pre(node: &ProofNode) -> &EvmState {
     ProofNode::Leaf { pre_state, .. } => pre_state,
     ProofNode::Seq { left, .. } => node_pre(left),
     ProofNode::Branch { cond, .. } => node_pre(cond),
+    ProofNode::Call { pre_state, .. } => pre_state,
+    ProofNode::TxBoundary { pre_state, .. } => pre_state,
+    ProofNode::BlockBoundary { pre_state, .. } => pre_state,
   }
 }
 
@@ -471,6 +534,9 @@ fn node_post(node: &ProofNode) -> &EvmState {
     ProofNode::Seq { right, .. } => node_post(right),
     // Both branch paths have the same post-type; pick taken.
     ProofNode::Branch { taken, .. } => node_post(taken),
+    ProofNode::Call { post_state, .. } => post_state,
+    ProofNode::TxBoundary { post_state, .. } => post_state,
+    ProofNode::BlockBoundary { post_state, .. } => post_state,
   }
 }
 
@@ -533,7 +599,33 @@ fn check_leaf(op: u8, pre: &EvmState, post: &EvmState) -> Result<(), Consistency
   check_storage_keys_preserved(&pre.storage, &post.storage, false)?;
   check_storage_keys_preserved(&pre.transient_storage, &post.transient_storage, true)?;
 
-  // 5. Opcode-specific value checks
+  // 5. PC advancement check
+  //    JUMP/JUMPI set PC to a dynamic target — skip for those.
+  //    PUSH1..PUSH32 advance by 1 + data_len; all others advance by 1.
+  //    STOP/RETURN/REVERT/SELFDESTRUCT/INVALID terminate — skip.
+  let skip_pc = matches!(
+    op,
+    opcode::JUMP | opcode::JUMPI | opcode::STOP | opcode::RETURN
+      | opcode::REVERT | opcode::SELFDESTRUCT | opcode::INVALID
+  );
+  if !skip_pc {
+    let advance: u32 = if (0x60..=0x7f).contains(&op) {
+      1 + (op as u32 - 0x5f) // PUSH1 → 2, PUSH32 → 33
+    } else {
+      1
+    };
+    let expected_pc = pre.pc + advance;
+    if post.pc != expected_pc {
+      return Err(ConsistencyError::PcAdvancementMismatch {
+        opcode: op,
+        pc: pre.pc,
+        expected: expected_pc,
+        actual: post.pc,
+      });
+    }
+  }
+
+  // 6. Opcode-specific value checks
   check_opcode_semantics(op, pre, post)?;
 
   Ok(())
@@ -950,6 +1042,24 @@ fn check_opcode_semantics(op: u8, pre: &EvmState, post: &EvmState) -> Result<(),
     opcode::POP => {
       // post_stack should equal pre_stack[1..]
       check_stack_passthrough(pc, op, pre, post, 1, 0)?;
+    }
+
+    // ── PUSH0: pushes zero, rest of stack unchanged ─────────────────────
+    opcode::PUSH0 => {
+      if let Some(&result) = post.stack.first() {
+        if result != U256::ZERO {
+          return Err(ConsistencyError::Push0Mismatch { pc, actual: result });
+        }
+      }
+      // post_stack[1..] should equal pre_stack[0..]
+      check_stack_passthrough(pc, op, pre, post, 0, 1)?;
+    }
+
+    // ── PUSH1..PUSH32: pushes an opaque value, rest of stack unchanged ──
+    op if (0x60..=0x7f).contains(&op) => {
+      // We cannot verify the pushed value (it's bytecode-dependent),
+      // but we CAN verify the stack passthrough.
+      check_stack_passthrough(pc, op, pre, post, 0, 1)?;
     }
 
     // Other opcodes: environment-dependent or checked by circuit constraints.

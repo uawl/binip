@@ -13,7 +13,7 @@ pub fn alpha() -> GF2_128 {
 ///
 /// For degree-1 (MLE sumcheck): g[2] = g(0)*(1+α) + g(1)*α (extrapolated).
 /// For degree-2 (GKR): all three values are independently computed by the prover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub struct RoundPoly(pub [GF2_128; 3]);
 
 impl RoundPoly {
@@ -55,7 +55,7 @@ impl RoundPoly {
 }
 
 /// Complete sumcheck proof for an MLE polynomial.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct SumcheckProof {
   /// Σ_{x ∈ {0,1}^n} f(x) — the value the prover claims.
   pub claimed_sum: GF2_128,

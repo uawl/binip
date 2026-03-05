@@ -13,6 +13,7 @@
 //! 4. **MLE**: convert column vectors → `MlePoly` (padded to power-of-2).
 //! 5. Feed the constraint MLE to [`sumcheck::prove`].
 
+pub mod bytecode_lookup;
 pub mod constraint;
 pub mod decomp;
 pub mod encoder;

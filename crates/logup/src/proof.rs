@@ -7,7 +7,7 @@ use field::GF2_128;
 /// Depending on whether h_w and h_t share the same n_vars, the prover
 /// chooses between a shared [`Batch`] commit (shared Merkle tree + column
 /// queries) and separate [`Individual`] commits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub enum PcsBinding {
   /// h_w and h_t committed separately (different n_vars).
   Individual {
@@ -33,7 +33,7 @@ pub enum PcsBinding {
 ///
 /// The γ-weighting prevents characteristic-2 cancellation: even when
 /// `w_j = w_k`, the terms `γ^j/(β+w_j)` and `γ^k/(β+w_k)` are distinct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct LogUpProof {
   /// Random challenge β used to form the logarithmic derivatives.
   pub beta: GF2_128,

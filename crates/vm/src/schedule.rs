@@ -135,6 +135,40 @@ fn annotate(
         children: vec![c, t, n],
       }
     }
+    ProofNode::Call { inner, .. } => {
+      // The Call node itself produces one leaf row (for the CALL opcode),
+      // plus the inner sub-execution rows.
+      let start = *offset;
+      let call_row_size = row_counts[*leaf_idx] as u32;
+      *leaf_idx += 1;
+      *offset += call_row_size;
+      let i = annotate(inner, row_counts, leaf_idx, offset);
+      NodeSpan {
+        start,
+        size: call_row_size + i.size,
+        children: vec![i],
+      }
+    }
+    ProofNode::TxBoundary { inner, .. } => {
+      // TxBoundary is a transparent wrapper — no extra rows of its own.
+      let start = *offset;
+      let i = annotate(inner, row_counts, leaf_idx, offset);
+      NodeSpan {
+        start,
+        size: i.size,
+        children: vec![i],
+      }
+    }
+    ProofNode::BlockBoundary { inner, .. } => {
+      // BlockBoundary is a transparent wrapper — no extra rows of its own.
+      let start = *offset;
+      let i = annotate(inner, row_counts, leaf_idx, offset);
+      NodeSpan {
+        start,
+        size: i.size,
+        children: vec![i],
+      }
+    }
   }
 }
 

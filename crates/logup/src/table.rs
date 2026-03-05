@@ -8,7 +8,7 @@ use field::{FieldElem, GF2_128, batch_inv};
 ///
 /// The table stores `entries` (the distinct values).
 /// Length is padded to a power of two.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct LookupTable {
   /// Table entries `t_0, t_1, …`. Length must be a power of two.
   pub entries: Vec<GF2_128>,

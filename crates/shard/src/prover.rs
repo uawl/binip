@@ -16,10 +16,10 @@
 use field::{FieldElem, GF2_128};
 use poly::MlePoly;
 use rayon::prelude::*;
-use transcript::Blake3Transcript;
+use transcript::{Blake3Transcript, Transcript};
 
 use crate::config::RecursiveConfig;
-use crate::proof::{ShardProof, ShardProofBatch};
+use crate::proof::{hash_partition, hash_shard_evals, ShardProof, ShardProofBatch};
 
 /// Split an MLE into `n_shards` sub-MLEs.
 ///
@@ -48,15 +48,22 @@ pub fn split_mle(poly: &MlePoly, config: &RecursiveConfig) -> Vec<MlePoly> {
 }
 
 /// Prove a single shard: run sumcheck on the sub-MLE with a forked transcript.
+///
+/// The shard's evaluations are hashed into `shard_commitment` and absorbed
+/// into the forked transcript before sumcheck, binding the proof to the
+/// specific contiguous chunk of the original MLE.
 pub fn prove_shard(
   shard_idx: u32,
   sub_mle: MlePoly,
   root_transcript: &Blake3Transcript,
 ) -> ShardProof {
+  let shard_commitment = hash_shard_evals(shard_idx, &sub_mle.evals);
   let mut t = root_transcript.fork("shard", shard_idx);
+  t.absorb_bytes(&shard_commitment);
   let sumcheck = sumcheck::prove(sub_mle, &mut t);
   ShardProof {
     shard_idx,
+    shard_commitment,
     sumcheck,
   }
 }
@@ -82,9 +89,13 @@ pub fn prove_all(
     shard_proofs.push(proof);
   }
 
+  let shard_commits: Vec<_> = shard_proofs.iter().map(|p| p.shard_commitment).collect();
+  let partition_root = hash_partition(&shard_commits);
+
   ShardProofBatch {
     shard_proofs,
     total_sum,
+    partition_root,
   }
 }
 
@@ -119,9 +130,13 @@ pub fn prove_all_par(
     .iter()
     .fold(GF2_128::zero(), |acc, p| acc + p.sumcheck.claimed_sum);
 
+  let shard_commits: Vec<_> = shard_proofs.iter().map(|p| p.shard_commitment).collect();
+  let partition_root = hash_partition(&shard_commits);
+
   ShardProofBatch {
     shard_proofs,
     total_sum,
+    partition_root,
   }
 }
 

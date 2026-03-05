@@ -8,3 +8,4 @@ field      = { path = "../field" }
 poly       = { path = "../poly" }
 rayon      = "1"
 transcript = { path = "../transcript" }
+bincode    = { workspace = true }

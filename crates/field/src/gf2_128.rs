@@ -17,7 +17,7 @@ use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use crate::traits::FieldElem;
 
 /// An element of GF(2^128) = GF(2)[x] / (x^128 + x^7 + x^2 + x + 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, bincode::Encode, bincode::Decode)]
 #[repr(C)]
 pub struct GF2_128 {
   pub lo: u64, // bits 0..63

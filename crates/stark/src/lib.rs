@@ -13,7 +13,9 @@
 pub mod proof;
 pub mod prover;
 pub mod verifier;
+pub mod compress;
 
-pub use proof::{Proof, StarkParams};
+pub use proof::{CompressedProof, Proof, StarkParams};
 pub use prover::{ProveError, prove_cpu, prove_cpu_par};
 pub use verifier::{VerifyError, verify};
+pub use compress::{compress, verify_compressed, CompressError};
